@@ -2439,7 +2439,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       pendingUserMessages: [],
-      pendingRetry: { stableId: "rec_slash", text: "/review" },
+      pendingRetry: { stableId: "rec_slash", text: "/review", files: [] },
     });
     const records = (): Record<string, unknown> =>
       JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
@@ -2452,6 +2452,27 @@ describe("chatStore — send (first-send ordering)", () => {
 
     expect(records()).toEqual({});
     expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
+  it("does not resend a different slash command under a recovered record id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "rec_slash", text: "/review", files: [] },
+    });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({ rec_slash: { conversationId: "conv_existing", text: "/review" } }),
+    );
+
+    await useChatStore.getState().sendSlashCommand("plan", "", "agent_xyz");
+
+    // The recovered command's record is untouched and its identity stays armed.
+    expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
+      "rec_slash",
+    ]);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("rec_slash");
   });
 
   it("records every send once its session id is known, not only the one that created the session", async () => {
@@ -3043,12 +3064,96 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().conversationId).toBe(tempConvId);
   });
 
+  const postedStableIds = (): string[] =>
+    fetchMock.mock.calls
+      .filter(
+        ([u, init]) =>
+          String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string).data.stable_id as string);
+
+  it("send reuses the pending retry identity only for the exact recorded message", async () => {
+    // Decided at the store's send boundary, so a design-mode message, a comment
+    // sent to the agent, or an edited composer draft can never inherit a
+    // recovered id (the server would dedupe the new message away), while the
+    // unchanged message keeps it. Inner whitespace counts: an indentation edit
+    // in a code prompt is a different message.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "sid_exact", text: "exact words", files: [] },
+    });
+
+    await useChatStore.getState().send("exact words, edited", "agent_xyz");
+    await useChatStore.getState().send("exact  words", "agent_xyz");
+    expect(postedStableIds()).toHaveLength(2);
+    expect(postedStableIds()).not.toContain("sid_exact");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_exact");
+
+    await useChatStore.getState().send("exact words", "agent_xyz");
+    expect(postedStableIds()[2]).toBe("sid_exact");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
+  it("send keeps the identity for a failed attachment message resent as restored, not for changed files", async () => {
+    // A failed in-page send hands the same File objects back to the composer;
+    // resending them unchanged is the same message and must dedupe. Any other
+    // set of attachments is a new message.
+    const shot = new File(["png!"], "shot.png", { type: "image/png" });
+    const other = new File(["png?"], "other.png", { type: "image/png" });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        return mockResponse({
+          id: "file_1",
+          name: "shot.png",
+          metadata: { filename: "shot.png", bytes: 4, created_at: 0 },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "sid_files", text: "see this", files: [shot] },
+    });
+
+    await useChatStore.getState().send("see this", "agent_xyz", [shot, other]);
+    expect(postedStableIds()).toHaveLength(1);
+    expect(postedStableIds()[0]).not.toBe("sid_files");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_files");
+
+    await useChatStore.getState().send("see this", "agent_xyz", [shot]);
+    expect(postedStableIds()[1]).toBe("sid_files");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
+  it("a send that already carries its identity leaves an unrelated pending retry alone", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "sid_keep", text: "still waiting in the composer", files: [] },
+    });
+
+    await useChatStore.getState().send("a queued message", "agent_xyz", undefined, {
+      stableId: "sid_queued",
+    });
+
+    expect(postedStableIds()).toEqual(["sid_queued"]);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_keep");
+  });
+
   it("a pinned background send does not consume the visible conversation's retry id", async () => {
     seedSession("conv_target");
     seedSession("conv_visible");
     await useChatStore.getState().switchTo("conv_target");
     await useChatStore.getState().switchTo("conv_visible");
-    useChatStore.setState({ pendingRetry: { stableId: "retry_visible", text: "visible draft" } });
+    useChatStore.setState({
+      pendingRetry: { stableId: "retry_visible", text: "visible draft", files: [] },
+    });
 
     await useChatStore.getState().send("background first message", "agent_xyz", undefined, {
       pinnedConversationId: "conv_target",
@@ -12620,10 +12725,11 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
-  it("enqueueMessage carries a pending retry identity into the queue, once", () => {
+  it("enqueueMessage carries a pending retry identity only for its own message, once", () => {
     // A recovered or restored message submitted mid-turn must keep its send
     // identity, so the flush dedupes on the server and its acknowledgment clears
-    // the same durable record instead of leaving it to be recovered again.
+    // the same durable record instead of leaving it to be recovered again — while
+    // any other message leaves the identity armed.
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -12631,12 +12737,15 @@ describe("chatStore — client-side message queue", () => {
       status: "streaming",
       sessionStatus: "running",
       send: sendSpy,
-      pendingRetry: { stableId: "sid_recovered", text: "resend me" },
+      pendingRetry: { stableId: "sid_recovered", text: "resend me", files: [] },
     });
+    useChatStore.getState().enqueueMessage("something else first", undefined);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_recovered");
     useChatStore.getState().enqueueMessage("resend me", undefined);
     useChatStore.getState().enqueueMessage("a fresh follow-up", undefined);
 
-    const [recovered, fresh] = useChatStore.getState().queuedMessages;
+    const [other, recovered, fresh] = useChatStore.getState().queuedMessages;
+    expect(other!.stableId).not.toBe("sid_recovered");
     expect(recovered!.stableId).toBe("sid_recovered");
     expect(fresh!.stableId).not.toBe("sid_recovered");
     expect(useChatStore.getState().pendingRetry).toBeNull();

@@ -785,13 +785,15 @@ export interface ConversationState {
   /**
    * The message the composer carries for resend after a failed send or a
    * recovery from a previous page: the send identity the server dedupes on,
-   * with the exact text that may reuse it. Kept together and conversation-
-   * scoped, so a composer remounted by a switch away and back still knows
-   * which text the identity belongs to. Consumed by the next `send`,
-   * `sendSlashCommand` or `enqueueMessage`; the composer drops it at submit
-   * when the outgoing text differs.
+   * with the exact text and attachment objects that may reuse it. Conversation-
+   * scoped, so a composer remounted by a switch away and back still knows which
+   * message the identity belongs to. `send`, `sendSlashCommand` and
+   * `enqueueMessage` consume it only for that exact payload
+   * (`pendingRetryIdentity`); any other message posts under a fresh id and
+   * leaves it armed. A recovery from a previous page carries no files: they
+   * are not persisted, so a resend with attachments is a new message.
    */
-  pendingRetry: { stableId: string; text: string } | null;
+  pendingRetry: { stableId: string; text: string; files: File[] } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1769,11 +1771,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
-    // A restored or recovered message keeps its identity through the queue
-    // (the composer already dropped it if the text changed), so the eventual
-    // POST dedupes and its acknowledgment clears the same durable record.
-    if (pendingRetry !== null) setActive({ pendingRetry: null });
-    const stableId = pendingRetry?.stableId ?? randomUUID().replace(/-/g, "");
+    // A restored or recovered message keeps its identity through the queue, so
+    // the eventual POST dedupes and its acknowledgment clears the same durable
+    // record; any other message leaves the identity armed.
+    const retryId = pendingRetryIdentity(pendingRetry, text, files);
+    if (retryId !== null) setActive({ pendingRetry: null });
+    const stableId = retryId ?? randomUUID().replace(/-/g, "");
     setActive((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
@@ -2041,10 +2044,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // screen. `pinnedSetter` routes every write for this send there.
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
-    const retryId =
-      pinnedId === null
-        ? (get().pendingRetry?.stableId ?? null)
-        : (setterForState(pinnedId)?.pendingRetry?.stableId ?? null);
+    // A message that already carries its identity (a queued flush, a steer)
+    // leaves any pending retry to the message it belongs to.
+    const pending =
+      opts?.stableId !== undefined
+        ? null
+        : pinnedId === null
+          ? get().pendingRetry
+          : (setterForState(pinnedId)?.pendingRetry ?? null);
+    const retryId = pendingRetryIdentity(pending, text, files);
     if (retryId !== null) pinnedSetter({ pendingRetry: null });
     const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
@@ -2416,10 +2424,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Durable copy of the command text until the server answers (see `send`).
     // A recovered command resends under its original record id, so the
     // acknowledgment clears that record rather than leaving it to reappear.
-    const retryRecordId =
-      pinnedId === null
-        ? (get().pendingRetry?.stableId ?? null)
-        : (setterForState(pinnedId)?.pendingRetry?.stableId ?? null);
+    const retryRecordId = pendingRetryIdentity(
+      pinnedId === null ? get().pendingRetry : (setterForState(pinnedId)?.pendingRetry ?? null),
+      commandText,
+      undefined,
+    );
     if (retryRecordId !== null) pinnedSetter({ pendingRetry: null });
     const unsentRecordId = retryRecordId ?? randomUUID().replace(/-/g, "");
     let unsentRecorded = false;
@@ -3081,6 +3090,24 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 }
 
 // ── Internal helpers ─────────────────────────────────────
+
+/**
+ * The pending retry's identity when `text` and `files` are exactly the message
+ * it was armed for — the same wire text and the same attachment objects in the
+ * same order — else null. Decided here, at the store's send boundary, so every
+ * caller (composer, design mode, comments, the queue) follows one rule and an
+ * unrelated send never inherits a recovered id the server would dedupe.
+ */
+function pendingRetryIdentity(
+  pending: ConversationState["pendingRetry"],
+  text: string,
+  files: File[] | undefined,
+): string | null {
+  if (pending === null || pending.text !== text) return null;
+  const outgoing = files ?? [];
+  if (outgoing.length !== pending.files.length) return null;
+  return outgoing.every((file, i) => file === pending.files[i]) ? pending.stableId : null;
+}
 
 function queuedSendOptions(
   message: QueuedMessage,

@@ -3236,14 +3236,22 @@ describe("Composer reply quotes", () => {
     );
     render(<Composer {...composerProps()} />);
     expect(textarea()).toHaveValue("typed before the reload");
-    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_reload");
+    // Armed with the exact text (and no files: none are persisted) for the
+    // store to match the resend against.
+    expect(useChatStore.getState().pendingRetry).toEqual({
+      stableId: "sid_reload",
+      text: "typed before the reload",
+      files: [],
+    });
     // Recovery is not acknowledgment: the record stays until the POST is accepted.
     expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
       "sid_reload",
     ]);
   });
 
-  it("keeps a recovered send's identity for an unchanged resend", () => {
+  it("submits a recovered send with exactly the text its identity was armed for", () => {
+    // The store, not the composer, decides whether the identity is reused: the
+    // composer's job is to emit the recorded text verbatim and leave it armed.
     useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
@@ -3259,11 +3267,11 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_keep");
   });
 
-  it("judges an edit against the recovered text after the composer remounts", () => {
+  it("keeps the recovered identity and its text armed across a remount", () => {
     // Switching conversations remounts the composer while the conversation's
-    // store keeps the recovered identity. The text it belongs to has to survive
-    // that remount too, or an edited message would post under the old id and be
-    // deduped away by the server as a repeat of the original.
+    // store keeps the recovered identity with the text it belongs to. Nothing
+    // the composer does on remount or submit may drop or reuse it: the store
+    // judges the edited text against the recorded one at send time.
     useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
@@ -3288,7 +3296,11 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "first wording, edited" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("first wording, edited", undefined);
-    expect(useChatStore.getState().pendingRetry).toBeNull();
+    expect(useChatStore.getState().pendingRetry).toEqual({
+      stableId: "sid_remount",
+      text: "first wording",
+      files: [],
+    });
   });
 
   it("keeps a recovered send's identity for an unchanged resend after a remount", () => {
@@ -3308,7 +3320,7 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_back");
   });
 
-  it("drops a recovered send's identity when a different message is sent, even without typing", () => {
+  it("sends a recalled prompt verbatim and leaves the recovered identity for the store to judge", () => {
     useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
@@ -3324,16 +3336,17 @@ describe("Composer reply quotes", () => {
     render(<Composer {...props} />);
     expect(textarea()).toHaveValue("original words");
     expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_edit");
-    // Recall replaces the text without a keystroke edit; the identity must still go.
+    // Recall replaces the text without a keystroke edit; what reaches the store
+    // is the recalled text, which it will judge against the recorded one.
     textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     expect(textarea()).toHaveValue("a different earlier prompt");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("a different earlier prompt", undefined);
-    expect(useChatStore.getState().pendingRetry).toBeNull();
+    expect(useChatStore.getState().pendingRetry?.text).toBe("original words");
   });
 
-  it("drops a recovered send's identity when only inner whitespace changes", () => {
+  it("sends an inner-whitespace edit verbatim for the store's exact comparison", () => {
     useChatStore.setState({ pendingRetry: null });
     const code = "def f():\n    return 1";
     sessionStorage.setItem(
@@ -3346,7 +3359,7 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "def f():\n  return 1" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("def f():\n  return 1", undefined);
-    expect(useChatStore.getState().pendingRetry).toBeNull();
+    expect(useChatStore.getState().pendingRetry?.text).toBe(code);
   });
 
   it("keeps newer typed text over a recovered send, but re-attaches the identity to identical text", () => {
