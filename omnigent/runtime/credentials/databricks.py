@@ -144,6 +144,37 @@ def _databrickscfg_path() -> Path:
     return DEFAULT_DATABRICKSCFG_PATH
 
 
+def _profile_host_for_sdk(profile: str | None) -> str | None:
+    """Read a named profile's host without ambient env precedence.
+
+    ``databricks-sdk`` loads constructor kwargs, then environment variables,
+    then the selected profile.  Consequently, ``Config(profile="oss")`` still
+    lets an inherited ``DATABRICKS_HOST`` replace the host in ``[oss]``.  Pin
+    the profile's own host as a constructor kwarg so the requested workspace
+    remains authoritative while the SDK continues to resolve that profile's
+    authentication method.
+
+    :param profile: Effective Databricks profile name, or ``None``.
+    :returns: The profile's normalized host, or ``None`` when unavailable.
+    """
+    if profile is None:
+        return None
+    cfg_path = _databrickscfg_path()
+    if not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser()
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return None
+    if profile == DEFAULT_SECTION:
+        host = config.defaults().get("host")
+    else:
+        own = config._sections.get(profile, {})  # type: ignore[attr-defined]
+        host = own.get("host")
+    return _strip_trailing_slash(str(host)) if host else None
+
+
 class _SectionAbsent(Exception):
     """
     Raised by :func:`_read_section` when a NAMED section does not
@@ -308,8 +339,12 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
 
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
+    profile_host = _profile_host_for_sdk(sdk_profile)
     try:
-        cfg = Config(profile=sdk_profile)
+        if profile_host:
+            cfg = Config(profile=sdk_profile, host=profile_host)
+        else:
+            cfg = Config(profile=sdk_profile)
         headers = cfg.authenticate()
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would

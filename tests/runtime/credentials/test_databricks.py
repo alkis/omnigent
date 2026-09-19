@@ -374,6 +374,35 @@ def test_resolves_via_sdk_when_sdk_returns_creds(
     assert creds == WorkspaceCreds(host="https://sdk.example.com", token="sdk-minted-token")
 
 
+def test_named_profile_host_wins_over_ambient_sdk_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An inherited DATABRICKS_HOST must not retarget an explicit profile."""
+    cfg = _write_cfg(
+        tmp_path,
+        ("[oss]\nhost = https://profile.example.com/\nauth_type = databricks-cli\n"),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://ambient.example.com")
+    seen: dict[str, str | None] = {}
+
+    class _FakeConfig:
+        def __init__(self, *, profile: str | None, host: str | None = None) -> None:
+            seen["profile"] = profile
+            seen["host_kwarg"] = host
+            self.host = host or "https://ambient.example.com"
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer profile-token"}
+
+    monkeypatch.setattr("databricks.sdk.config.Config", _FakeConfig)
+
+    creds = resolve_databricks_workspace(profile="oss")
+
+    assert seen == {"profile": "oss", "host_kwarg": "https://profile.example.com"}
+    assert creds == WorkspaceCreds(host="https://profile.example.com", token="profile-token")
+
+
 def test_sdk_failure_falls_through_to_cfg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Autouse fixture already sets Config to raise ValueError. Provide
     # a cfg file with a plain-PAT [dev] section. The resolver must
@@ -402,8 +431,8 @@ def test_sdk_non_bearer_auth_falls_through(
     # through to the cfg-file path rather than returning a malformed
     # token.
     class _NonBearerConfig:
-        def __init__(self, *, profile: str | None) -> None:
-            self.host = "https://sdk.example.com"
+        def __init__(self, *, profile: str | None, host: str | None = None) -> None:
+            self.host = host or "https://sdk.example.com"
 
         def authenticate(self) -> dict[str, str]:
             return {"Authorization": "Basic some-base64-blob"}

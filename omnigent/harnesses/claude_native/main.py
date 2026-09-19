@@ -754,6 +754,19 @@ def _claude_model_display_name(tier: str, model_id: str) -> str:
     return f"{family} {'.'.join(version_parts)}" if version_parts else family
 
 
+def _claude_model_id_display_name(model_id: str) -> str:
+    """Format a raw Claude model id when no probe-supplied label exists."""
+    normalized = model_id.lower().removesuffix("[1m]")
+    tier = next(
+        (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
+        None,
+    )
+    if tier is None:
+        return model_id
+    label = _claude_model_display_name(tier, model_id)
+    return f"{label} (1M context)" if model_id.lower().endswith("[1m]") else label
+
+
 def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
     """Read the model overrides Claude Code applies from managed settings."""
     allowed_env = {
@@ -1300,7 +1313,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v2",
+        "control-picker-v3",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1371,7 +1384,7 @@ async def claude_model_catalog(
             label = (
                 probe.default_label
                 if default_model == probe.default_model and probe.default_label
-                else default_model
+                else _claude_model_id_display_name(default_model)
             )
             out.append(
                 {
@@ -3430,20 +3443,38 @@ def resolve_native_claude_config(
         return resolved
 
     # 1. Spec-driven: reuse the harness routing precedence verbatim. A
-    #    non-None entry decides the config (including a deliberate None for a
-    #    subscription); a None entry means the spec routed to databricks /
-    #    global auth → fall back to the spec's own ucode profile.
+    #    non-None entry decides the config. A None entry may mean legacy
+    #    Databricks auth, whose profile is resolved below.
     if spec is not None:
         entry = _resolve_provider_for_build(
             spec, harness_type="claude-sdk", actual_harness="claude-native"
         )
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-        ucode_config = _ucode_config_for_profile(
-            spec.executor.profile, refresh_models=refresh_models
-        )
-        if ucode_config is not None:
-            return ucode_config
+
+        spec_auth = getattr(spec.executor, "auth", None)
+        executor_config = getattr(spec.executor, "config", {})
+        legacy_profile = getattr(spec.executor, "profile", None) or executor_config.get("profile")
+        if isinstance(spec_auth, DatabricksAuth):
+            ucode_config = _ucode_config_for_profile(
+                spec_auth.profile, refresh_models=refresh_models
+            )
+            if ucode_config is not None:
+                return ucode_config
+        elif spec_auth is None and legacy_profile:
+            ucode_config = _ucode_config_for_profile(
+                str(legacy_profile), refresh_models=refresh_models
+            )
+            if ucode_config is not None:
+                return ucode_config
+        elif spec_auth is None:
+            global_auth = _load_global_auth()
+            if isinstance(global_auth, DatabricksAuth):
+                # A profile-less wrapper inherits the same global Databricks
+                # route used by the pre-launch host picker.
+                return _ucode_config_for_profile(
+                    global_auth.profile, refresh_models=refresh_models
+                )
         # The spec named no provider and no usable ucode profile — fall through to
         # the managed-connect-host broker fallback (step 4) rather than giving up.
     else:
