@@ -85,7 +85,7 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import {
   createSideChat,
-  isDefinitiveSessionLoadError,
+  isDefinitiveRequestError,
   retrySession,
   sessionLoadErrorKind,
 } from "@/lib/sessionsApi";
@@ -1152,7 +1152,7 @@ export function ChatPage() {
   // renders the chat with its history marked unavailable, so a send still works.
   if (urlConvId) {
     if (loadingConversation || activeConversationId !== urlConvId) return <HydratingPlaceholder />;
-    if (conversationLoadError && isDefinitiveSessionLoadError(conversationLoadError)) {
+    if (conversationLoadError && isDefinitiveRequestError(conversationLoadError)) {
       return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
     }
   }
@@ -2519,6 +2519,7 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  const loadingConversation = useChatStore((s) => s.loadingConversation);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -3022,7 +3023,10 @@ function ComposerImpl(
       // draft, then reloaded again), only the identity is missing. Newer typed
       // text wins and leaves the record unrecovered for a later visit; only an
       // acknowledgment removes it.
-      if (!conversationId) return;
+      // Not before history has loaded or definitively failed: the snapshot
+      // acknowledges a record whose message was delivered (its item is in the
+      // transcript), which must not be offered as unsent.
+      if (!conversationId || loadingConversation) return;
       const unsent = peekUnsentMessage(conversationId);
       if (unsent === undefined) return;
       const sameText =
@@ -3068,7 +3072,7 @@ function ComposerImpl(
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+  }, [failedSendDraft, conversationId, settledConversationId, loadingConversation, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.

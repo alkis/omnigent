@@ -28,7 +28,7 @@ import {
   stopSession,
   updateSession,
   ApiError,
-  isDefinitiveSessionLoadError,
+  isDefinitiveRequestError,
   isRetryableSessionLoadError,
   sessionLoadErrorKind,
 } from "./sessionsApi";
@@ -1545,7 +1545,7 @@ describe("session load failure classification", () => {
 
   it.each([500, 502, 503, 408, 429])("retries a transient %s", (status) => {
     expect(isRetryableSessionLoadError(api(status))).toBe(true);
-    expect(isDefinitiveSessionLoadError(api(status))).toBe(false);
+    expect(isDefinitiveRequestError(api(status))).toBe(false);
     expect(sessionLoadErrorKind(api(status))).toBe("transient");
   });
 
@@ -1554,8 +1554,8 @@ describe("session load failure classification", () => {
     expect(isRetryableSessionLoadError(abort)).toBe(false);
     expect(isRetryableSessionLoadError(new SyntaxError("bad json"))).toBe(false);
     // Neither is definitive: the page keeps the chat and marks history unavailable.
-    expect(isDefinitiveSessionLoadError(new TypeError("Failed to fetch"))).toBe(false);
-    expect(isDefinitiveSessionLoadError(abort)).toBe(false);
+    expect(isDefinitiveRequestError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isDefinitiveRequestError(abort)).toBe(false);
   });
 
   it.each([
@@ -1566,7 +1566,7 @@ describe("session load failure classification", () => {
     [400, "invalid"],
   ])("treats %s as definitive (%s)", (status, kind) => {
     expect(isRetryableSessionLoadError(api(status))).toBe(false);
-    expect(isDefinitiveSessionLoadError(api(status))).toBe(true);
+    expect(isDefinitiveRequestError(api(status))).toBe(true);
     expect(sessionLoadErrorKind(api(status))).toBe(kind);
   });
 });

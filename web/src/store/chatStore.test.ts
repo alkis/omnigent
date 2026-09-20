@@ -2434,6 +2434,51 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(Object.keys(records())).toEqual([failedId]);
   });
 
+  it("retires the durable copy on a definitive rejection but keeps it on a transient failure", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    const records = (): string[] =>
+      Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}"));
+    let status = 413;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "no" }, { ok: false, status });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("too large", "agent_xyz");
+    expect(records()).toEqual([]);
+
+    status = 503;
+    await useChatStore.getState().send("try later", "agent_xyz");
+    expect(records()).toHaveLength(1);
+  });
+
+  it("acknowledges a durable record whose item the snapshot already holds", async () => {
+    // The POST landed but its response never reached the browser: the item is
+    // persisted under the send's stable_id, so hydration retires the record
+    // instead of offering an already-delivered message for recovery.
+    const delivered = userMessage("resp_d", "made it");
+    seedSession("conv_ack", [delivered]);
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        [delivered.id]: { conversationId: "conv_ack", text: "made it", stableId: delivered.id },
+        sid_lost: { conversationId: "conv_ack", text: "never landed", stableId: "sid_lost" },
+      }),
+    );
+
+    await useChatStore.getState().switchTo("conv_ack");
+
+    expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
+      "sid_lost",
+    ]);
+  });
+
   it("resends a recovered slash command under its record id and clears it on acknowledgment", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -2533,6 +2578,45 @@ describe("chatStore — send (first-send ordering)", () => {
     await retryConversationHistory("conv_gap");
 
     expect(entry.getState().blocks.map((blk) => blk.ctx.itemId)).toEqual([a.id, b.id, c.id]);
+  });
+
+  it("switching back to an entry whose history never loaded uses the ordered merge", async () => {
+    // A live entry with a failed hydration is revalidated on switch-back. That
+    // must be the hydration merge (older history first), not the reconnect
+    // backfill, which appends unseen items after the live transcript.
+    const older = [
+      assistantMessage("resp_o1", "older one"),
+      assistantMessage("resp_o2", "older two"),
+    ];
+    const live = [
+      userMessage("resp_live", "asked while history was down"),
+      assistantMessage("resp_live", "answered"),
+    ];
+    seedSession("conv_order", [...older, ...live]);
+    seedSession("conv_other", []);
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_order" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_order");
+    const entry = conversationRegistry.peek("conv_order")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    // The exchange streamed live while history was unavailable.
+    entry.setState({ blocks: itemsToBlocks(live) });
+
+    failSnapshot = false;
+    await useChatStore.getState().switchTo("conv_other");
+    await useChatStore.getState().switchTo("conv_order");
+    await vi.waitFor(() => expect(entry.getState().conversationLoadError).toBeNull());
+
+    expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+      [...older, ...live].map((item) => item.id),
+    );
   });
 
   it("a superseded stream open neither releases nor leaks the successor's slot", async () => {
@@ -10206,6 +10290,52 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("reconnecting a stream whose history never loaded uses the ordered merge", async () => {
+    // A live entry with a failed hydration reconnects after a transport drop.
+    // That must run the hydration merge (older history first), not the
+    // reconnect backfill, which appends unseen items after the live transcript.
+    const older = assistantMessage("resp_older", "older history");
+    const live = userMessage("resp_live", "streamed live");
+    seedSession("conv_reconnect_order", [older, live]);
+    const sinks: StreamSink[] = [];
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_reconnect_order" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_reconnect_order");
+    await drainAsync();
+    const entry = conversationRegistry.peek("conv_reconnect_order")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    expect(sinks).toHaveLength(1);
+    // The exchange streamed live while history was unavailable.
+    entry.setState({ blocks: itemsToBlocks([live]) });
+
+    failSnapshot = false;
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    await vi.waitFor(() => expect(entry.getState().conversationLoadError).toBeNull());
+    expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual([older.id, live.id]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+  });
+
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {
     seedSession("conv_mcp_gap", []);
     sessionMcpStartup.set("conv_mcp_gap", { safe: { status: "starting", error: null } });
@@ -13517,6 +13647,41 @@ describe("chatStore — background cross-session flush", () => {
     await vi.waitFor(() =>
       expect(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}")).toEqual({}),
     );
+  });
+
+  it("keeps a durable copy of a fresh queued message across a failed background flush", async () => {
+    // The queue itself is in memory only. Recording the message before the
+    // background POST means a reload during the POST, or after a failure, can
+    // still recover it — with the identity the retry will reuse.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    let failPost = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(String(input)) && init?.method === "POST") {
+        if (failPost) return mockResponse({}, { ok: false, status: 503 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "typed mid-turn", conversationId: "conv_bg" }],
+    });
+    const records = (): Record<string, { text: string; stableId?: string }> =>
+      JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    const [recordId, record] = Object.entries(records())[0]!;
+    expect(record).toMatchObject({ text: "typed mid-turn", stableId: recordId });
+    // Re-queued under the same identity, so the retry does not open a second record.
+    expect(useChatStore.getState().queuedMessages.map((m) => m.stableId)).toEqual([recordId]);
+
+    failPost = false;
+    initChatStore(client);
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(records()).toEqual({});
   });
 
   it("does not flush a non-active conversation that is not idle", async () => {

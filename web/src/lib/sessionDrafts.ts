@@ -207,6 +207,21 @@ export function clearUnsentMessage(recordId: string): void {
   );
 }
 
+/**
+ * The transcript already holds items with these ids: a record keyed by one of
+ * them was delivered (a plain message's record id is its `stable_id`, and the
+ * server persists the item under that id), so it is acknowledged even though
+ * the POST's response never reached this client.
+ */
+export function acknowledgeUnsentMessages(itemIds: Iterable<string>): void {
+  const messages = loadUnsentMessages();
+  const delivered = new Set([...itemIds].filter((id) => id in messages));
+  if (delivered.size === 0) return;
+  saveUnsentMessages(
+    Object.fromEntries(Object.entries(messages).filter(([id]) => !delivered.has(id))),
+  );
+}
+
 export interface RecoverableUnsentMessage extends UnsentMessage {
   /** Storage key — the send's `stableId` for a plain message, a private id for a slash command. */
   recordId: string;

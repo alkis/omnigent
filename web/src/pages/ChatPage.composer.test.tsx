@@ -3249,6 +3249,24 @@ describe("Composer reply quotes", () => {
     ]);
   });
 
+  it("waits for history to load before offering a recovered send", () => {
+    // Hydration acknowledges records whose items the snapshot already holds, so
+    // recovery must not run ahead of it and offer a delivered message as unsent.
+    useChatStore.setState({ pendingRetry: null, loadingConversation: true });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_wait: { conversationId: "conv_test", text: "after history", stableId: "sid_wait" },
+      }),
+    );
+    render(<Composer {...composerProps()} />);
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+    act(() => useChatStore.setState({ loadingConversation: false }));
+    expect(textarea()).toHaveValue("after history");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_wait");
+  });
+
   it("submits a recovered send with exactly the text its identity was armed for", () => {
     // The store, not the composer, decides whether the identity is reused: the
     // composer's job is to emit the recorded text verbatim and leave it armed.

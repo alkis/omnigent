@@ -1507,12 +1507,13 @@ export function isRetryableSessionLoadError(err: unknown): boolean {
 }
 
 /**
- * Whether a session load failure is final for this conversation (4xx other
- * than 408/429): the page should say so instead of rendering the chat. Every
- * other failure — 5xx, network, an abort — leaves the conversation usable with
- * its history temporarily unavailable.
+ * Whether a request failure is the server's final answer (4xx other than
+ * 408/429). For a session load the page says so instead of rendering the chat;
+ * for a send, the message's durable copy is done. Every other failure — 5xx,
+ * network, an abort — is transient or uncertain: history stays temporarily
+ * unavailable, a send's copy is kept.
  */
-export function isDefinitiveSessionLoadError(err: unknown): boolean {
+export function isDefinitiveRequestError(err: unknown): boolean {
   return (
     err instanceof ApiError &&
     err.status >= 400 &&
@@ -1527,7 +1528,7 @@ export type SessionLoadErrorKind =
 
 /** Classify a load failure for the page's heading. */
 export function sessionLoadErrorKind(err: unknown): SessionLoadErrorKind {
-  if (!isDefinitiveSessionLoadError(err)) return "transient";
+  if (!isDefinitiveRequestError(err)) return "transient";
   const status = (err as ApiError).status;
   if (status === 404 || status === 410) return "not_found";
   if (status === 401) return "unauthenticated";

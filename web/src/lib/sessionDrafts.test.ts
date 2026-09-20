@@ -152,6 +152,19 @@ describe("unsent messages", () => {
     expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_other"]);
   });
 
+  it("acknowledges records whose ids the transcript already holds", async () => {
+    sessionStorage.setItem(
+      unsentKey,
+      JSON.stringify({
+        sid_sent: { conversationId: "conv", text: "delivered", stableId: "sid_sent" },
+        sid_lost: { conversationId: "conv", text: "never landed", stableId: "sid_lost" },
+      }),
+    );
+    const { acknowledgeUnsentMessages } = await import("./sessionDrafts");
+    acknowledgeUnsentMessages(["msg_other", "sid_sent"]);
+    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_lost"]);
+  });
+
   it("never offers a record written during this page", async () => {
     const { recordUnsentMessage, peekUnsentMessage } = await import("./sessionDrafts");
     recordUnsentMessage("sid_now", {

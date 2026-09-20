@@ -67,6 +67,7 @@ import {
   createSession,
   getSessionSlim,
   fetchSessionItemsPage,
+  isDefinitiveRequestError,
   isRetryableSessionLoadError,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
@@ -113,7 +114,11 @@ import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
-import { clearUnsentMessage, recordUnsentMessage } from "@/lib/sessionDrafts";
+import {
+  acknowledgeUnsentMessages,
+  clearUnsentMessage,
+  recordUnsentMessage,
+} from "@/lib/sessionDrafts";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -1973,6 +1978,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // re-hydrates from the snapshot on return. On failure re-queue at the
       // head (preserving this conversation's FIFO order) and set a cooldown so
       // the next trigger backs off instead of hammering a failing runner.
+      // Durable until the server answers, as in `send`: a reload during the
+      // POST or after a failure can still recover the message and its identity.
+      const stableId = head.stableId ?? randomUUID().replace(/-/g, "");
+      recordUnsentMessage(stableId, {
+        conversationId,
+        text: head.text,
+        stableId,
+        ...(head.replyDraft ? { replyDraft: head.replyDraft } : {}),
+      });
       void (async () => {
         await waitForPrior();
         // Reuse prior successful uploads so cooldown-paced retries do not
@@ -1984,10 +1998,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ];
         await postEvent(conversationId, {
           type: "message",
-          data: { role: "user", content, stable_id: head.stableId },
+          data: { role: "user", content, stable_id: stableId },
         });
-        // Accepted: a recovered message's durable copy is done (see `send`).
-        if (head.stableId !== undefined) clearUnsentMessage(head.stableId);
+        // Accepted: the durable copy is done.
+        clearUnsentMessage(stableId);
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -2000,7 +2014,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             return {
               queuedMessages: [
                 ...st.queuedMessages.slice(0, at),
-                head,
+                { ...head, stableId },
                 ...st.queuedMessages.slice(at),
               ],
             };
@@ -2281,6 +2295,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const { message, code } = describeSendFailure(err);
+      // A definitive rejection (400/413/415…) is the server's answer too: the
+      // durable copy is done. Transient or uncertain failures keep it.
+      if (isDefinitiveRequestError(err)) clearUnsentMessage(stableId);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
@@ -2648,6 +2665,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
     if (wasLive) {
+      // History never loaded for this entry: retry the ordered hydration merge
+      // rather than the reconnect backfill below, which would append the older
+      // history after whatever streamed live meanwhile.
+      if (entry.getState().conversationLoadError !== null) {
+        void retryConversationHistory(conversationId);
+        return;
+      }
       // An open stream is not proof the entry is current: a session stream
       // routed to the wrong replica stays open and heartbeats while delivering
       // no events, and a reconnect loop that never re-opens holds the
@@ -4187,6 +4211,10 @@ async function hydrateHistoryOnce(
     const [session, page] = await fetchSnapshotWithRetry(id, queryClient, controller, obsolete);
     if (obsolete()) return;
     const items = page.items;
+    // Committed items acknowledge durable records keyed by their id: a send
+    // whose response never arrived but whose item is in the transcript was
+    // delivered, so it must not be offered for recovery again.
+    acknowledgeUnsentMessages(items.map((it) => it.id));
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
@@ -5358,7 +5386,25 @@ export async function startStreamPump(
           ignoredNativeMessageIds,
         );
         if (reconnecting) {
-          await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
+          if (get().conversationLoadError !== null) {
+            // History never loaded: the ordered hydration merge, not the
+            // backfill below, which appends unseen items after live blocks.
+            const entry = conversationRegistry.peek(id);
+            await hydrateConversationHistory(
+              id,
+              set,
+              get,
+              {
+                controller,
+                ignoredNativeMessageIds,
+                entry,
+                generation: entry === undefined ? 0 : (bindGenerationByEntry.get(entry) ?? 0),
+              },
+              false,
+            );
+          } else {
+            await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
+          }
         }
         let reason = await pumpPromise;
 
