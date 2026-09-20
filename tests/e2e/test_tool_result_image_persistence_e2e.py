@@ -201,7 +201,7 @@ def test_tool_result_image_not_persisted_as_inline_base64(
     call_id = "call_readimg1"
 
     png_path = tmp_path / "screenshot.png"
-    png_bytes = _screenshot_like_png(side=64, seed=6434)
+    png_bytes = _screenshot_like_png(side=64, seed=42)
     png_path.write_bytes(png_bytes)
     expected_b64 = base64.b64encode(png_bytes).decode("ascii")
 
