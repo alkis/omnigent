@@ -133,8 +133,10 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     class _SnapshotClient:
         """Fresh pi-native session snapshot (no launch args / external id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
-            del url, timeout
+        async def get(
+            self, url: str, *, params: dict[str, str] | None = None, timeout: float
+        ) -> httpx.Response:
+            del url, params, timeout
             return httpx.Response(
                 200,
                 json={
@@ -246,8 +248,10 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
     class _SnapshotClient:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
-            del url, timeout
+        async def get(
+            self, url: str, *, params: dict[str, str] | None = None, timeout: float
+        ) -> httpx.Response:
+            del url, params, timeout
             return httpx.Response(
                 200,
                 json={
@@ -345,8 +349,10 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
     class _SnapshotClient:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
-            del url, timeout
+        async def get(
+            self, url: str, *, params: dict[str, str] | None = None, timeout: float
+        ) -> httpx.Response:
+            del url, params, timeout
             return httpx.Response(
                 200,
                 json={

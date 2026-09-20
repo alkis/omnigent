@@ -62,7 +62,12 @@ class _Client:
         self._resp = resp
         self._raise_exc = raise_exc
 
-    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+    async def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _Resp:
         if self._raise_exc is not None:
             raise self._raise_exc
         assert self._resp is not None
@@ -81,7 +86,12 @@ class _SequenceClient:
         self._actions = list(actions)
         self.calls = 0
 
-    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+    async def get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _Resp:
         self.calls += 1
         action = self._actions[self.calls - 1]
         if isinstance(action, Exception):

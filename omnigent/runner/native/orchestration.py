@@ -945,6 +945,15 @@ _LAUNCH_CONFIG_FETCH_BACKOFF_BASE_S = 0.5
 _LAUNCH_CONFIG_FETCH_BACKOFF_CAP_S = 4.0
 _LAUNCH_CONFIG_RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 
+# Runner-owned ``GET /v1/sessions/{id}`` reads need stored-row fields only: skip
+# the transcript page, the liveness lookup, and the live-status probe of the very
+# runner making the read. Older servers ignore unknown query params.
+_TRIMMED_SESSION_READ_PARAMS = {
+    "include_items": "false",
+    "include_liveness": "false",
+    "include_live_status": "false",
+}
+
 
 def _launch_config_fetch_is_transient(exc: httpx.HTTPError) -> bool:
     """Whether a launch-config fetch HTTP error is a transient, retryable condition.
@@ -1004,7 +1013,11 @@ async def _fetch_native_launch_snapshot(
     for attempt in range(1, _LAUNCH_CONFIG_FETCH_ATTEMPTS + 1):
         last_attempt = attempt == _LAUNCH_CONFIG_FETCH_ATTEMPTS
         try:
-            resp = await server_client.get(path, timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S)
+            resp = await server_client.get(
+                path,
+                params=_TRIMMED_SESSION_READ_PARAMS,
+                timeout=_LAUNCH_CONFIG_FETCH_TIMEOUT_S,
+            )
         except httpx.HTTPError as exc:
             if last_attempt or not _launch_config_fetch_is_transient(exc):
                 raise RuntimeError(
@@ -6296,6 +6309,7 @@ async def _session_payload_for_host_spawn_check(
     try:
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            params=_TRIMMED_SESSION_READ_PARAMS,
             timeout=10.0,
         )
     except httpx.HTTPError:
@@ -7161,6 +7175,7 @@ async def _load_legacy_claude_launch_metadata(
     try:
         response = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            params=_TRIMMED_SESSION_READ_PARAMS,
             timeout=10.0,
         )
     except httpx.HTTPError:
@@ -9059,6 +9074,7 @@ async def _claude_native_session_wants_rebuild(
     try:
         resp = await server_client.get(
             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            params=_TRIMMED_SESSION_READ_PARAMS,
             timeout=10.0,
         )
     except httpx.HTTPError:
