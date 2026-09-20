@@ -144,35 +144,40 @@ def _databrickscfg_path() -> Path:
     return DEFAULT_DATABRICKSCFG_PATH
 
 
-def _profile_host_for_sdk(profile: str | None) -> str | None:
-    """Read a named profile's host without ambient env precedence.
+def _profile_overrides_for_sdk(profile: str | None) -> dict[str, str]:
+    """Read a named profile's own host/token without ambient env precedence.
 
     ``databricks-sdk`` loads constructor kwargs, then environment variables,
     then the selected profile.  Consequently, ``Config(profile="oss")`` still
-    lets an inherited ``DATABRICKS_HOST`` replace the host in ``[oss]``.  Pin
-    the profile's own host as a constructor kwarg so the requested workspace
-    remains authoritative while the SDK continues to resolve that profile's
-    authentication method.
+    lets an inherited ``DATABRICKS_HOST`` or ``DATABRICKS_TOKEN`` replace the
+    values in ``[oss]``.  Pin the profile's own host — and its static token,
+    when the section defines one — as constructor kwargs so the requested
+    workspace and its credential stay paired.  A profile without a static
+    token keeps the SDK's own auth resolution (OAuth-U2M, CLI, OIDC, ...).
 
     :param profile: Effective Databricks profile name, or ``None``.
-    :returns: The profile's normalized host, or ``None`` when unavailable.
+    :returns: ``Config`` constructor kwargs; empty when unavailable.
     """
     if profile is None:
-        return None
+        return {}
     cfg_path = _databrickscfg_path()
     if not cfg_path.exists():
-        return None
+        return {}
     config = configparser.ConfigParser()
     try:
         config.read(cfg_path)
     except configparser.Error:
-        return None
+        return {}
     if profile == DEFAULT_SECTION:
-        host = config.defaults().get("host")
+        own: dict[str, str] = dict(config.defaults())
     else:
-        own = config._sections.get(profile, {})  # type: ignore[attr-defined]
-        host = own.get("host")
-    return _strip_trailing_slash(str(host)) if host else None
+        own = dict(config._sections.get(profile, {}))  # type: ignore[attr-defined]
+    overrides: dict[str, str] = {}
+    if own.get("host"):
+        overrides["host"] = _strip_trailing_slash(str(own["host"]))
+    if own.get("token"):
+        overrides["token"] = str(own["token"])
+    return overrides
 
 
 class _SectionAbsent(Exception):
@@ -339,12 +344,9 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
 
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
-    profile_host = _profile_host_for_sdk(sdk_profile)
+    profile_overrides = _profile_overrides_for_sdk(sdk_profile)
     try:
-        if profile_host:
-            cfg = Config(profile=sdk_profile, host=profile_host)
-        else:
-            cfg = Config(profile=sdk_profile)
+        cfg = Config(profile=sdk_profile, **profile_overrides)
         headers = cfg.authenticate()
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would
