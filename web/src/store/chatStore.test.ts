@@ -2606,7 +2606,9 @@ describe("chatStore — send (first-send ordering)", () => {
     // must be the hydration merge (older history first), not the reconnect
     // backfill, which appends unseen items after the live transcript.
     const older = [
-      assistantMessage("resp_o1", "older one"),
+      userMessage("resp_o1", "asked while history was down"),
+      assistantMessage("resp_o1", "older answer"),
+      userMessage("resp_o2", "please continue"),
       assistantMessage("resp_o2", "older two"),
     ];
     const live = [
@@ -2629,17 +2631,22 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(entry.getState().conversationLoadError).not.toBeNull();
     // The reply streamed live while history was unavailable; the question's
     // committed item and its consumed event were missed, so its optimistic
-    // bubble is still up, next to one whose POST is still in flight.
+    // bubble is still up — next to in-flight sends whose text collides with
+    // old history (identical, or a suffix of it) and one without an id.
+    const asked = [{ type: "input_text" as const, text: "asked while history was down" }];
     entry.setState({
       blocks: itemsToBlocks([live[1]!]),
       pendingUserMessages: [
+        { tempId: "pend_asked", stableId: live[0]!.id, content: asked, posted: true },
+        { tempId: "pend_dup", stableId: "sid_dup", content: asked, posted: true },
         {
-          tempId: "pend_asked",
-          content: [{ type: "input_text", text: "asked while history was down" }],
+          tempId: "pend_suffix",
+          stableId: "sid_suffix",
+          content: [{ type: "input_text", text: "continue" }],
           posted: true,
         },
         {
-          tempId: "pend_inflight",
+          tempId: "pend_noid",
           content: [{ type: "input_text", text: "not committed yet" }],
           posted: true,
         },
@@ -2654,8 +2661,13 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
       [...older, ...live].map((item) => item.id),
     );
-    // The recovered item acknowledged its bubble; the in-flight one is kept.
-    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_inflight"]);
+    // Only the bubble whose own item is committed is acknowledged: identical or
+    // suffix-matching history and an id-less bubble are not evidence.
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pend_dup",
+      "pend_suffix",
+      "pend_noid",
+    ]);
   });
 
   it("a superseded stream open neither releases nor leaks the successor's slot", async () => {
@@ -3217,6 +3229,8 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await useChatStore.getState().send("exact words", "agent_xyz");
     expect(postedStableIds()[2]).toBe("sid_exact");
     expect(useChatStore.getState().pendingRetry).toBeNull();
+    // The optimistic bubble carries the id its committed item will have.
+    expect(useChatStore.getState().pendingUserMessages.at(-1)?.stableId).toBe("sid_exact");
   });
 
   it("send keeps the identity for a failed attachment message resent as restored, not for changed files", async () => {
@@ -10365,11 +10379,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       pendingUserMessages: [
         {
           tempId: "pend_live",
+          stableId: live.id,
           content: [{ type: "input_text", text: "streamed live" }],
           posted: true,
         },
         {
           tempId: "pend_inflight",
+          stableId: "sid_inflight",
           content: [{ type: "input_text", text: "not committed yet" }],
           posted: true,
         },

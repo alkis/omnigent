@@ -515,6 +515,13 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /**
+   * The send's stable id, which the server uses as the committed item's id
+   * for a stable_id message, so a recovery hydration can acknowledge exactly
+   * this bubble when the snapshot holds its item. Absent on snapshot-replayed
+   * entries.
+   */
+  stableId?: string;
 }
 
 /**
@@ -2146,6 +2153,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               ...s.pendingUserMessages,
               {
                 tempId,
+                stableId,
                 content,
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -4296,11 +4304,13 @@ async function hydrateHistoryOnce(
       //
       // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
       // are authoritative, except a bubble whose message the snapshot shows
-      // committed but the entry never held: its ``session.input.consumed``
-      // fired while the stream was down or history was missing (a reconnect
-      // or Retry after a failed load), so the recovered item is its
-      // acknowledgment. Matched by text, pairwise, so an in-flight bubble the
-      // snapshot does not hold yet is kept.
+      // committed: its ``session.input.consumed`` fired while the stream was
+      // down or history was missing (a reconnect or Retry after a failed
+      // load), so the committed item is its acknowledgment. Matched by the
+      // send's stable id — the committed item's id — never by text: after a
+      // failed load the whole history is new to the entry, and an old
+      // identical message must not acknowledge an in-flight send. A bubble
+      // without an id, or whose item the snapshot does not hold, is kept.
       //
       // Cold load (``hydratePending=true``): the server's ``pending_inputs``
       // is the source of truth for queued-but-unpersisted messages — replay
@@ -4321,15 +4331,12 @@ async function hydrateHistoryOnce(
       });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
-        const recoveredTexts = committedUserTextsOf(missing);
-        candidatePending = state.pendingUserMessages.filter((p) => {
-          const text = messageContentText(p.content);
-          if (text === "") return true;
-          const i = recoveredTexts.findIndex((committed) => committed.endsWith(text));
-          if (i === -1) return true;
-          recoveredTexts.splice(i, 1);
-          return false;
-        });
+        const committedIds = new Set(
+          snapshotBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        );
+        candidatePending = state.pendingUserMessages.filter(
+          (p) => p.stableId === undefined || !committedIds.has(p.stableId),
+        );
       } else {
         const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match
