@@ -573,10 +573,11 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
     requestedSchema: {},
   } as const;
 
-  it("shows the action description and an always-allow choice when advertised", () => {
-    // agy's own TUI prompt describes the action and offers an
-    // always-allow persist entry; the card must surface both instead
-    // of a bare binary Approve/Reject.
+  it("shows the action description and both persist choices when advertised", () => {
+    // agy's own TUI prompt describes the action and offers two
+    // always-allow entries (conversation-scoped, and persisted to its
+    // settings); the card must surface all of it instead of a bare
+    // binary Approve/Reject.
     const submitSpy = vi.fn();
     render(
       <ApprovalCard
@@ -589,14 +590,17 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
     );
 
     expect(screen.getByText("Running pwd command")).toBeDefined();
-    const alwaysButton = screen.getByRole("button", { name: /always allow/i });
-    fireEvent.click(alwaysButton);
+    fireEvent.click(screen.getByTestId("approval-card-agy-session-allow"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "session",
+    });
+    fireEvent.click(screen.getByTestId("approval-card-agy-always-allow"));
     expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
       persist: "always",
     });
   });
 
-  it("offers no always-allow choice when agy's prompt advertises none", () => {
+  it("offers no persist choice when agy's prompt advertises none", () => {
     render(
       <ApprovalCard
         {...baseProps}
@@ -607,6 +611,7 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
       />,
     );
 
+    expect(screen.queryByTestId("approval-card-agy-session-allow")).toBeNull();
     expect(screen.queryByTestId("approval-card-agy-always-allow")).toBeNull();
     expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
   });
@@ -622,6 +627,19 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
     );
 
     expect(screen.getByText(/always allowed/i)).toBeDefined();
+  });
+
+  it("labels a session-scoped accept on the responded pill", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "session" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText(/approved for this session/i)).toBeDefined();
   });
 });
 

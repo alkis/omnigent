@@ -484,23 +484,32 @@ class TestToTuiSelectionKeysPermission:
         assert isinstance(spec, dict)
         return spec
 
-    def test_always_allow_accept_types_option_2_then_enter(self) -> None:
-        """An always-allow accept selects agy's own persist menu entry."""
+    def test_session_persist_accept_types_option_2_then_enter(self) -> None:
+        """A session persist accept selects agy's conversation-scoped entry."""
         result = ElicitationResult.model_validate(
-            {"action": "accept", "_meta": {"persist": "always"}}
+            {"action": "accept", "_meta": {"persist": "session"}}
         )
         keys = to_tui_selection_keys("permission", result, self._persistable_spec())
         assert keys == ["2", "Enter"]
 
-    def test_unadvertised_persist_falls_back_to_plain_approve(self) -> None:
+    def test_always_persist_accept_types_option_3_then_enter(self) -> None:
+        """An always persist accept selects agy's settings-persisted entry."""
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+        keys = to_tui_selection_keys("permission", result, self._persistable_spec())
+        assert keys == ["3", "Enter"]
+
+    @pytest.mark.parametrize("persist", ["session", "always"])
+    def test_unadvertised_persist_falls_back_to_plain_approve(self, persist: str) -> None:
         """A persist verdict against a non-persistable prompt must type "Yes".
 
-        The always-allow menu entry only exists when the spec advertised a
+        The always-allow menu entries only exist when the spec advertised a
         persist pattern; falling back keeps a stale or crafted verdict from
         selecting a different menu entry.
         """
         result = ElicitationResult.model_validate(
-            {"action": "accept", "_meta": {"persist": "always"}}
+            {"action": "accept", "_meta": {"persist": persist}}
         )
         assert to_tui_selection_keys("permission", result, self._spec()) == ["1", "Enter"]
 

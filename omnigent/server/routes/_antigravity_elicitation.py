@@ -192,10 +192,11 @@ def _agy_permission_params(
     * ``action_description`` — the spec's ``actionDescription`` (what agy says
       it wants to do, e.g. "Running pwd command").
     * ``always_allow_pattern`` — the advertised persist pattern when agy's
-      prompt offers an "always allow" choice (see
-      :func:`_suggested_persist_pattern`); the web card renders it as an
-      "Always allow <pattern>" button whose accept verdict carries
-      ``_meta.persist == "always"``.
+      prompt offers its always-allow choices (see
+      :func:`_suggested_persist_pattern`); the web card renders them as
+      "Allow <pattern> for this session" / "Always allow <pattern>" buttons
+      whose accept verdicts carry ``_meta.persist`` of ``"session"`` /
+      ``"always"``.
 
     :param trajectory_id: agy trajectory id string.
     :param step_index: Step index integer (0 when absent).
@@ -372,11 +373,11 @@ def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:
 
     ``accept`` → ``allow: True``; ``decline`` or ``cancel`` → ``allow: False``.
 
-    An always-allow accept (``_meta.persist == "always"``) still delivers the
-    plain ``allow: True`` here: the live-verified RPC variant carries only
-    ``allow``, and the persist side of the verdict rides the TUI channel
-    (:func:`to_tui_selection_keys` selects agy's own always-allow menu entry,
-    which owns recording the pattern).
+    A persist accept (``_meta.persist`` of ``"session"`` or ``"always"``)
+    still delivers the plain ``allow: True`` here: the live-verified RPC
+    variant carries only ``allow``, and the persist side of the verdict rides
+    the TUI channel (:func:`to_tui_selection_keys` selects agy's own
+    always-allow menu entry, which owns recording the pattern).
 
     :param result: Web-submitted elicitation verdict.
     :returns: ``{"permission": {"allow": <bool>}}``
@@ -384,15 +385,18 @@ def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:
     return {"permission": {"allow": result.action == "accept"}}
 
 
-# agy's attended-TUI permission prompt is a numbered list: option 1 is the bare
-# "Yes" (approve once), option 2 is the always-allow entry carrying the spec's
-# advertised ``suggestedPersistPattern`` (options 2/3 are the persist
-# variants), and the LAST option is "No" (4). The web card's Approve drives the
-# always-safe "Yes" (1), its "Always allow <pattern>" choice drives the
-# advertised persist entry (2), and Reject drives "No" (4). These are the
-# digits typed into the pane, each followed by Enter to confirm the selection.
+# agy's attended-TUI permission prompt is a numbered list (live-verified on agy
+# 1.2.7): 1 "Yes, run command"; 2 "Yes, and always allow in this conversation
+# for commands that start with '<pattern>'"; 3 "Yes, and always allow for
+# commands that start with '<pattern>' (Persist to settings.json)"; 4 "No,
+# cancel". The web card's Approve drives the always-safe "Yes" (1), its persist
+# choices drive the conversation-scoped entry (2, ``_meta.persist ==
+# "session"``) or the settings-persisted entry (3, ``_meta.persist ==
+# "always"``), and Reject drives "No" (4). These are the digits typed into the
+# pane, each followed by Enter to confirm the selection.
 _AGY_TUI_PERMISSION_APPROVE_OPTION = "1"
-_AGY_TUI_PERMISSION_ALWAYS_ALLOW_OPTION = "2"
+_AGY_TUI_PERMISSION_SESSION_ALLOW_OPTION = "2"
+_AGY_TUI_PERMISSION_PERSIST_ALLOW_OPTION = "3"
 _AGY_TUI_PERMISSION_REJECT_OPTION = "4"
 _AGY_TUI_CONFIRM_KEY = "Enter"
 
@@ -415,10 +419,12 @@ def to_tui_selection_keys(
     :func:`omnigent.harnesses.antigravity_native.bridge.send_interaction_keys_via_tui`,
     mirroring cursor-native. This is the pure shape-mapper for those keys.
 
-    * **permission** — Approve → option ``"1"`` ("Yes"); an always-allow accept
-      (``_meta.persist == "always"``, offered only when the spec advertises a
-      persist pattern) → option ``"2"`` (agy's own always-allow menu entry);
-      Reject → option ``"4"`` ("No") — each followed by ``Enter``.
+    * **permission** — Approve → option ``"1"`` ("Yes"); a persist accept
+      (offered only when the spec advertises a persist pattern) → agy's own
+      always-allow menu entry: ``_meta.persist == "session"`` → option ``"2"``
+      (always allow in this conversation), ``_meta.persist == "always"`` →
+      option ``"3"`` (persist to settings.json); Reject → option ``"4"``
+      ("No") — each followed by ``Enter``.
     * **ask_question** — type the selected option id(s) ("1".."N") then ``Enter``;
       agy's TUI numbers questions' options the same way its RPC ``selectedOptionIds``
       do. A decline/cancel (or no usable selection) presses ``Escape`` to dismiss.
@@ -435,12 +441,15 @@ def to_tui_selection_keys(
         if result.action != "accept":
             return [_AGY_TUI_PERMISSION_REJECT_OPTION, _AGY_TUI_CONFIRM_KEY]
         persist = result.meta.get("persist") if result.meta is not None else None
-        if persist == "always" and _suggested_persist_pattern(spec) is not None:
-            # The always-allow menu entry exists only when the spec advertised
-            # a persist pattern; an unadvertised persist request falls back to
-            # the plain approve so a stale or crafted verdict can never select
-            # a menu entry agy's prompt does not have.
-            return [_AGY_TUI_PERMISSION_ALWAYS_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]
+        # The always-allow menu entries exist only when the spec advertised a
+        # persist pattern; an unadvertised persist request falls back to the
+        # plain approve so a stale or crafted verdict can never select a menu
+        # entry agy's prompt does not have.
+        if _suggested_persist_pattern(spec) is not None:
+            if persist == "session":
+                return [_AGY_TUI_PERMISSION_SESSION_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]
+            if persist == "always":
+                return [_AGY_TUI_PERMISSION_PERSIST_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]
         return [_AGY_TUI_PERMISSION_APPROVE_OPTION, _AGY_TUI_CONFIRM_KEY]
     if kind == "ask_question":
         return _agy_ask_question_tui_keys(result, spec)
