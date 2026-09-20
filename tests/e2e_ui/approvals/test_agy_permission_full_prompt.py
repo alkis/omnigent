@@ -1,10 +1,10 @@
 """E2E (UI): the Antigravity (agy) permission card must surface the full prompt.
 
-When agy asks for command permission, its own TUI prompt
-offers the full menu — "Yes", the "always allow" persist variants, and "No" —
-and describes the action, but the Omnigent web card renders only the bare
-binary Approve/Reject pair. The persist ("always allow") choices and agy's
-action description are not captured by the UI.
+When agy asks for command permission, its own TUI prompt offers the full menu —
+"Yes", the "always allow" persist variants, and "No" — and describes the action,
+but the Omnigent web card renders only the bare binary Approve/Reject pair. The
+persist ("always allow") choices and agy's action description are not captured
+by the UI.
 
 The journey is driven exactly the way the production bridge drives it: a REAL
 recorded agy WAITING permission step
@@ -39,8 +39,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.antigravity_native_interactions import agy_elicitation_id
-from omnigent.antigravity_native_steps import PendingInteraction, pending_interaction
+from omnigent.harnesses.antigravity_native.interactions import agy_elicitation_id
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction, pending_interaction
 from omnigent.server.routes._antigravity_elicitation import to_elicitation_params
 
 _APPROVAL_CARD = '[data-testid="approval-card"]'
@@ -86,7 +86,7 @@ def _park_agy_permission_elicitation(
 ) -> threading.Thread:
     """POST the production-shaped agy permission elicitation hook (long-poll).
 
-    Mirrors ``omnigent.antigravity_native_reader._post_agy_elicitation_request``
+    Mirrors ``omnigent.harnesses.antigravity_native.reader._post_agy_elicitation_request``
     byte-for-byte: ``{"elicitation_id": <agy_elicitation_id(...)>, "params":
     <to_elicitation_params(pending).model_dump()>}``.
     """
