@@ -2168,6 +2168,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // not parked on a dialog.
         blockedOn: null,
       }));
+    } else {
+      // Navigate-first: the bubble was created before this send had an id.
+      // Stamp it now so a recovery hydration can acknowledge it by its item.
+      pinnedSetter((s) => ({
+        pendingUserMessages: s.pendingUserMessages.map((p) =>
+          p.tempId === reuseTempId ? { ...p, stableId } : p,
+        ),
+      }));
     }
 
     // Pin the destination before joining the send chain: a stalled prior

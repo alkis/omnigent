@@ -3283,6 +3283,48 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_keep");
   });
 
+  it("stamps a navigate-first send's identity on its pre-created bubble so hydration can acknowledge it", async () => {
+    // The landing composer creates the optimistic bubble before send() has an
+    // id (`reusePendingTempId`). Without the id, a recovery hydration could
+    // never acknowledge that bubble: the first prompt would render twice.
+    seedSession("conv_nf", []);
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_nf" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_nf");
+    const entry = conversationRegistry.peek("conv_nf")!;
+    entry.setState({
+      pendingUserMessages: [
+        { tempId: "pend_first", content: [{ type: "input_text", text: "first prompt" }] },
+        {
+          tempId: "pend_other",
+          stableId: "sid_other",
+          content: [{ type: "input_text", text: "later" }],
+          posted: true,
+        },
+      ],
+    });
+
+    await useChatStore.getState().send("first prompt", "agent_xyz", undefined, {
+      pinnedConversationId: "conv_nf",
+      reusePendingTempId: "pend_first",
+    });
+    const first = entry.getState().pendingUserMessages.find((p) => p.tempId === "pend_first")!;
+    expect(first.stableId).toBe(postedStableIds().at(-1));
+
+    // Its committed item lands in the snapshot while the consumed event was missed.
+    seedSession("conv_nf", [{ ...userMessage("resp_first", "first prompt"), id: first.stableId! }]);
+    failSnapshot = false;
+    await retryConversationHistory("conv_nf");
+
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_other"]);
+  });
+
   it("a pinned background send does not consume the visible conversation's retry id", async () => {
     seedSession("conv_target");
     seedSession("conv_visible");
