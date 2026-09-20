@@ -3042,14 +3042,18 @@ function ComposerImpl(
         const copy = getSessionDraft(conversationId);
         if (copy?.recoveredFrom === undefined) return;
         if (hasUnsentMessage(copy.recoveredFrom)) {
-          // Already restored (this effect re-runs as the identity it arms lands).
-          if (useChatStore.getState().pendingRetry?.stableId === copy.recoveredFrom) return;
           if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
-          useChatStore.setState({
-            pendingRetry: { stableId: copy.recoveredFrom, text: copy.text, files: [] },
-          });
+          // The identity may already be armed (a remount keeps conversation state,
+          // and this effect re-runs as the identity it arms lands); the text is
+          // restored either way.
+          if (useChatStore.getState().pendingRetry?.stableId !== copy.recoveredFrom) {
+            useChatStore.setState({
+              pendingRetry: { stableId: copy.recoveredFrom, text: copy.text, files: [] },
+            });
+          }
           replaceText(copy.text, copy.replyDraft);
           textareaRef.current = tailTextareaRef.current;
+          dirtyRef.current = false;
           return;
         }
         if (valueRef.current === copy.text && filesRef.current.length === 0) {
@@ -3072,8 +3076,11 @@ function ComposerImpl(
       replaceText(unsent.text, unsent.replyDraft);
       textareaRef.current = tailTextareaRef.current;
       // Persist the copy tagged with its record, not as an ordinary draft: the
-      // first edit re-saves it untagged (`dirtyRef`), and a copy still tagged
-      // when the record is acknowledged is dropped above instead of resent.
+      // first edit re-saves it untagged (`dirtyRef`, reset here so earlier
+      // typing that was cleared cannot overwrite the tag), and a copy still
+      // tagged when the record is acknowledged is dropped above instead of
+      // resent.
+      dirtyRef.current = false;
       setSessionDraft(conversationId, {
         text: unsent.text,
         files: [],

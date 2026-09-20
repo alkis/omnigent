@@ -3292,12 +3292,35 @@ describe("Composer reply quotes", () => {
       }),
     );
     render(<Composer {...composerProps()} />).unmount();
-    // Recovery persisted a tagged copy, not an ordinary draft.
+    // Recovery persisted a tagged copy, not an ordinary draft, and the identity
+    // stays armed in conversation state across the remount.
     expect(getSessionDraft("conv_test")?.recoveredFrom).toBe("sid_copy");
-    useChatStore.setState({ pendingRetry: null });
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_copy");
     render(<Composer {...composerProps()} />);
     expect(textarea()).toHaveValue("still unsent");
     expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_copy");
+  });
+
+  it("keeps the recovered copy tagged when the composer was edited and cleared before recovery", () => {
+    // Earlier typing leaves the draft dirty; recovery must not let the live
+    // persist effect re-save its copy untagged, or the copy would outlive the
+    // record's acknowledgment as an ordinary draft.
+    useChatStore.setState({ pendingRetry: null, loadingConversation: true });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_dirty: { conversationId: "conv_test", text: "recovered late", stableId: "sid_dirty" },
+      }),
+    );
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "started something" } });
+    fireEvent.change(textarea(), { target: { value: "" } });
+    act(() => useChatStore.setState({ loadingConversation: false }));
+    expect(textarea()).toHaveValue("recovered late");
+    expect(getSessionDraft("conv_test")).toMatchObject({
+      text: "recovered late",
+      recoveredFrom: "sid_dirty",
+    });
   });
 
   it("clears an untouched recovered copy when its record is acknowledged in place, but keeps an edit", () => {
