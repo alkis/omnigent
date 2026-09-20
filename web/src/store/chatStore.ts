@@ -2296,8 +2296,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       const { message, code } = describeSendFailure(err);
       // A definitive rejection (400/413/415…) is the server's answer too: the
-      // durable copy is done. Transient or uncertain failures keep it.
-      if (isDefinitiveRequestError(err)) clearUnsentMessage(stableId);
+      // durable copy is done. Transient or uncertain failures keep it, and so
+      // does a 401: the auth layer redirects to login, and the text should
+      // survive that round trip.
+      if (isDefinitiveRequestError(err) && !(err instanceof ApiError && err.status === 401)) {
+        clearUnsentMessage(stableId);
+      }
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
@@ -4291,8 +4295,12 @@ async function hydrateHistoryOnce(
       // (on cold load) keep the per-conversation stash consistent.
       //
       // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
-      // are authoritative — keep them untouched. Deduping/merging here would
-      // flink the live bubble; they clear via the consumed FIFO path.
+      // are authoritative, except a bubble whose message the snapshot shows
+      // committed but the entry never held: its ``session.input.consumed``
+      // fired while the stream was down or history was missing (a reconnect
+      // or Retry after a failed load), so the recovered item is its
+      // acknowledgment. Matched by text, pairwise, so an in-flight bubble the
+      // snapshot does not hold yet is kept.
       //
       // Cold load (``hydratePending=true``): the server's ``pending_inputs``
       // is the source of truth for queued-but-unpersisted messages — replay
@@ -4313,7 +4321,15 @@ async function hydrateHistoryOnce(
       });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
-        candidatePending = state.pendingUserMessages;
+        const recoveredTexts = committedUserTextsOf(missing);
+        candidatePending = state.pendingUserMessages.filter((p) => {
+          const text = messageContentText(p.content);
+          if (text === "") return true;
+          const i = recoveredTexts.findIndex((committed) => committed.endsWith(text));
+          if (i === -1) return true;
+          recoveredTexts.splice(i, 1);
+          return false;
+        });
       } else {
         const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match

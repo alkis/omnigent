@@ -2456,6 +2456,12 @@ describe("chatStore — send (first-send ordering)", () => {
     status = 503;
     await useChatStore.getState().send("try later", "agent_xyz");
     expect(records()).toHaveLength(1);
+
+    // A 401 is final for the request but not for the text: the auth layer
+    // sends the user through login, and the copy must survive that.
+    status = 401;
+    await useChatStore.getState().send("after re-login", "agent_xyz");
+    expect(records()).toHaveLength(2);
   });
 
   it("acknowledges a durable record whose item the snapshot already holds", async () => {
@@ -2621,8 +2627,24 @@ describe("chatStore — send (first-send ordering)", () => {
     await useChatStore.getState().switchTo("conv_order");
     const entry = conversationRegistry.peek("conv_order")!;
     expect(entry.getState().conversationLoadError).not.toBeNull();
-    // The exchange streamed live while history was unavailable.
-    entry.setState({ blocks: itemsToBlocks(live) });
+    // The reply streamed live while history was unavailable; the question's
+    // committed item and its consumed event were missed, so its optimistic
+    // bubble is still up, next to one whose POST is still in flight.
+    entry.setState({
+      blocks: itemsToBlocks([live[1]!]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_asked",
+          content: [{ type: "input_text", text: "asked while history was down" }],
+          posted: true,
+        },
+        {
+          tempId: "pend_inflight",
+          content: [{ type: "input_text", text: "not committed yet" }],
+          posted: true,
+        },
+      ],
+    });
 
     failSnapshot = false;
     await useChatStore.getState().switchTo("conv_other");
@@ -2632,6 +2654,8 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
       [...older, ...live].map((item) => item.id),
     );
+    // The recovered item acknowledged its bubble; the in-flight one is kept.
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_inflight"]);
   });
 
   it("a superseded stream open neither releases nor leaks the successor's slot", async () => {
@@ -10335,8 +10359,22 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const entry = conversationRegistry.peek("conv_reconnect_order")!;
     expect(entry.getState().conversationLoadError).not.toBeNull();
     expect(sinks).toHaveLength(1);
-    // The exchange streamed live while history was unavailable.
-    entry.setState({ blocks: itemsToBlocks([live]) });
+    // The message was posted but the stream dropped before its consumed event:
+    // its bubble is still up, next to one whose POST is still in flight.
+    entry.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_live",
+          content: [{ type: "input_text", text: "streamed live" }],
+          posted: true,
+        },
+        {
+          tempId: "pend_inflight",
+          content: [{ type: "input_text", text: "not committed yet" }],
+          posted: true,
+        },
+      ],
+    });
 
     failSnapshot = false;
     sinks[0]!.error();
@@ -10344,6 +10382,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
     await vi.waitFor(() => expect(entry.getState().conversationLoadError).toBeNull());
     expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual([older.id, live.id]);
+    // The recovered item acknowledged its bubble; the in-flight one is kept.
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_inflight"]);
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
