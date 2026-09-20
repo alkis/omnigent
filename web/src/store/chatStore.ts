@@ -4214,7 +4214,14 @@ async function hydrateHistoryOnce(
     // Committed items acknowledge durable records keyed by their id: a send
     // whose response never arrived but whose item is in the transcript was
     // delivered, so it must not be offered for recovery again.
-    acknowledgeUnsentMessages(items.map((it) => it.id));
+    const acknowledged = acknowledgeUnsentMessages(items.map((it) => it.id));
+    if (acknowledged.size > 0) {
+      set((state) =>
+        state.pendingRetry !== null && acknowledged.has(state.pendingRetry.stableId)
+          ? { pendingRetry: null }
+          : {},
+      );
+    }
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 

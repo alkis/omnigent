@@ -132,6 +132,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   getSessionDraft,
+  hasUnsentMessage,
   markUnsentRecovered,
   peekUnsentMessage,
   promoteSessionDraft,
@@ -2520,6 +2521,7 @@ function ComposerImpl(
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
+  const pendingRetry = useChatStore((s) => s.pendingRetry);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -2760,7 +2762,11 @@ function ComposerImpl(
       !isTempConvId(conversationId)
         ? promoteSessionDraft(previousConversationId, conversationId)
         : undefined;
-    const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
+    const saved = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
+    // An untouched recovered copy is restored by the recovery effect below once
+    // history has loaded or failed, so one the snapshot shows delivered is
+    // dropped instead of coming back without its identity.
+    const restored = saved?.recoveredFrom === undefined ? saved : undefined;
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
@@ -3028,7 +3034,33 @@ function ComposerImpl(
       // transcript), which must not be offered as unsent.
       if (!conversationId || loadingConversation) return;
       const unsent = peekUnsentMessage(conversationId);
-      if (unsent === undefined) return;
+      if (unsent === undefined) {
+        // A recovered copy persisted as this conversation's draft: restore it
+        // while its record is still unacknowledged (a remount on this page), or
+        // drop it once the snapshot showed the message delivered — unless the
+        // user has typed since, in which case their text stays.
+        const copy = getSessionDraft(conversationId);
+        if (copy?.recoveredFrom === undefined) return;
+        if (hasUnsentMessage(copy.recoveredFrom)) {
+          // Already restored (this effect re-runs as the identity it arms lands).
+          if (useChatStore.getState().pendingRetry?.stableId === copy.recoveredFrom) return;
+          if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+          useChatStore.setState({
+            pendingRetry: { stableId: copy.recoveredFrom, text: copy.text, files: [] },
+          });
+          replaceText(copy.text, copy.replyDraft);
+          textareaRef.current = tailTextareaRef.current;
+          return;
+        }
+        if (valueRef.current === copy.text && filesRef.current.length === 0) {
+          replaceText("", undefined);
+        }
+        setSessionDraft(conversationId, { text: "", files: [] });
+        if (useChatStore.getState().pendingRetry?.stableId === copy.recoveredFrom) {
+          useChatStore.setState({ pendingRetry: null });
+        }
+        return;
+      }
       const sameText =
         valueRef.current.trim() === unsent.text.trim() && filesRef.current.length === 0;
       if (!sameText && (valueRef.current.trim() !== "" || filesRef.current.length > 0)) return;
@@ -3039,7 +3071,15 @@ function ComposerImpl(
       if (sameText) return;
       replaceText(unsent.text, unsent.replyDraft);
       textareaRef.current = tailTextareaRef.current;
-      dirtyRef.current = true;
+      // Persist the copy tagged with its record, not as an ordinary draft: the
+      // first edit re-saves it untagged (`dirtyRef`), and a copy still tagged
+      // when the record is acknowledged is dropped above instead of resent.
+      setSessionDraft(conversationId, {
+        text: unsent.text,
+        files: [],
+        replyDraft: unsent.replyDraft,
+        recoveredFrom: unsent.recordId,
+      });
       if (!isMobileRef.current) textareaRef.current?.focus();
       return;
     }
@@ -3072,7 +3112,14 @@ function ComposerImpl(
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, loadingConversation, replaceText]);
+  }, [
+    failedSendDraft,
+    conversationId,
+    settledConversationId,
+    loadingConversation,
+    pendingRetry,
+    replaceText,
+  ]);
 
   /**
    * Execute a slash command by name + optional argument string.

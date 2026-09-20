@@ -2472,11 +2472,26 @@ describe("chatStore — send (first-send ordering)", () => {
       }),
     );
 
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_ack" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
     await useChatStore.getState().switchTo("conv_ack");
+    const entry = conversationRegistry.peek("conv_ack")!;
+    // Recovery armed the delivered message's identity while history was down.
+    entry.setState({ pendingRetry: { stableId: delivered.id, text: "made it", files: [] } });
+
+    failSnapshot = false;
+    await retryConversationHistory("conv_ack");
 
     expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
       "sid_lost",
     ]);
+    expect(entry.getState().pendingRetry).toBeNull();
   });
 
   it("resends a recovered slash command under its record id and clears it on acknowledgment", async () => {

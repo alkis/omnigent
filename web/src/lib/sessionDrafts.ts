@@ -3,6 +3,13 @@ import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
+  /**
+   * The unsent record this draft is an untouched recovered copy of. The
+   * composer's recovery owns such a draft: it is restored while the record is
+   * unacknowledged and dropped once the transcript shows the message delivered.
+   * The first edit makes it an ordinary draft again.
+   */
+  recoveredFrom?: string;
 }
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
@@ -19,7 +26,9 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
     const drafts = new Map<string, SessionDraft>();
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      if (draft?.text) drafts.set(id, { ...draft, files: [] });
+      if (!draft?.text) continue;
+      const recoveredFrom = recoveredFromOf(entry);
+      drafts.set(id, { ...draft, files: [], ...(recoveredFrom ? { recoveredFrom } : {}) });
     }
     return drafts;
   } catch {
@@ -27,14 +36,25 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
   }
 }
 
+function recoveredFromOf(entry: unknown): string | undefined {
+  if (typeof entry !== "object" || entry === null) return undefined;
+  const value = (entry as { recoveredFrom?: unknown }).recoveredFrom;
+  return typeof value === "string" ? value : undefined;
+}
+
 function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
-    const entries: Record<string, string | ComposerDraft> = {};
+    const entries: Record<string, string | (ComposerDraft & { recoveredFrom?: string })> = {};
     for (const [id, draft] of sessionDrafts) {
-      if (draft.text)
-        entries[id] = draft.replyDraft
-          ? { text: draft.text, replyDraft: draft.replyDraft }
+      if (!draft.text) continue;
+      entries[id] =
+        draft.replyDraft || draft.recoveredFrom
+          ? {
+              text: draft.text,
+              ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
+              ...(draft.recoveredFrom ? { recoveredFrom: draft.recoveredFrom } : {}),
+            }
           : draft.text;
     }
     if (Object.keys(entries).length === 0) {
@@ -213,13 +233,19 @@ export function clearUnsentMessage(recordId: string): void {
  * server persists the item under that id), so it is acknowledged even though
  * the POST's response never reached this client.
  */
-export function acknowledgeUnsentMessages(itemIds: Iterable<string>): void {
+export function acknowledgeUnsentMessages(itemIds: Iterable<string>): Set<string> {
   const messages = loadUnsentMessages();
   const delivered = new Set([...itemIds].filter((id) => id in messages));
-  if (delivered.size === 0) return;
+  if (delivered.size === 0) return delivered;
   saveUnsentMessages(
     Object.fromEntries(Object.entries(messages).filter(([id]) => !delivered.has(id))),
   );
+  return delivered;
+}
+
+/** Whether `recordId` is still stored, i.e. its POST was never acknowledged. */
+export function hasUnsentMessage(recordId: string): boolean {
+  return recordId in loadUnsentMessages();
 }
 
 export interface RecoverableUnsentMessage extends UnsentMessage {

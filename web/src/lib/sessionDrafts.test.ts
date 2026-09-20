@@ -101,6 +101,26 @@ describe("session drafts", () => {
     expect(getSessionDraft("temp:failed")).toBeUndefined();
     expect(sessionStorage.getItem(key)).toBeNull();
   });
+
+  it("keeps a recovered copy's provenance across a reload and knows whether its record is stored", async () => {
+    const first = await import("./sessionDrafts");
+    first.setSessionDraft("conv", { text: "delivered?", files: [], recoveredFrom: "sid_r" });
+    first.recordUnsentMessage("sid_r", {
+      conversationId: "conv",
+      text: "delivered?",
+      stableId: "sid_r",
+    });
+    vi.resetModules();
+    const second = await import("./sessionDrafts");
+    expect(second.getSessionDraft("conv")).toEqual({
+      text: "delivered?",
+      files: [],
+      recoveredFrom: "sid_r",
+    });
+    expect(second.hasUnsentMessage("sid_r")).toBe(true);
+    second.clearUnsentMessage("sid_r");
+    expect(second.hasUnsentMessage("sid_r")).toBe(false);
+  });
 });
 
 describe("unsent messages", () => {
