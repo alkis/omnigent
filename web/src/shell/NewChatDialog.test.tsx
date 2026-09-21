@@ -4003,29 +4003,34 @@ describe("NewChatLandingScreen", () => {
   );
 
   it.each([
-    ["claude-native", "needs-auth"],
-    ["codex-native", "binary-missing"],
-    ["pi-native", "version-too-low"],
-    ["devin-native", false],
-  ])("skips unavailable %s and loads it when the host reports readiness", (harness, readiness) => {
-    mockAgents(catalogAgents);
-    mockHosts([
-      {
-        ...host("online"),
-        configured_harnesses: { ...readyCatalogs, [harness as string]: readiness },
-      },
-    ]);
-    renderLanding();
-    const agent = catalogAgents.find((candidate) => candidate.harness === harness)!;
-    selectUnconfiguredAgent(agent.id);
-    const calls = () => useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness);
-    expect(calls().every(([, , enabled]) => !enabled)).toBe(true);
-    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    ["claude-native", "needs-auth", true],
+    ["codex-native", "binary-missing", true],
+    ["pi-native", "version-too-low", false],
+    ["devin-native", false, true],
+  ])(
+    "skips unavailable %s and loads it when the host reports readiness",
+    (harness, readiness, poll) => {
+      mockAgents(catalogAgents);
+      mockHosts([
+        {
+          ...host("online"),
+          configured_harnesses: { ...readyCatalogs, [harness as string]: readiness },
+        },
+      ]);
+      renderLanding();
+      const agent = catalogAgents.find((candidate) => candidate.harness === harness)!;
+      selectUnconfiguredAgent(agent.id);
+      const calls = () => useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness);
+      expect(calls().every(([, , enabled]) => !enabled)).toBe(true);
+      expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
 
-    mockHosts([{ ...host("online"), configured_harnesses: readyCatalogs }]);
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "Ready" } });
-    expect(calls().at(-1)).toEqual(["host_1", harness, true, { poll: true }]);
-  });
+      mockHosts([{ ...host("online"), configured_harnesses: readyCatalogs }]);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Ready" },
+      });
+      expect(calls().at(-1)).toEqual(["host_1", harness, true, { poll }]);
+    },
+  );
 
   it.each(["pending", "offline"])(
     "waits for a %s restored host, then prefetches catalogs and polls the selected harness",
