@@ -9,6 +9,6 @@ describe("createE2eCoveragePlugin", () => {
   it("enables Istanbul only for coverage-index builds", () => {
     const plugin = createE2eCoveragePlugin({ [E2E_COVERAGE_ENV]: "1" });
 
-    expect(plugin?.name).toBe("vite-plugin-istanbul");
+    expect(plugin?.name).toBe("vite:istanbul");
   });
 });
