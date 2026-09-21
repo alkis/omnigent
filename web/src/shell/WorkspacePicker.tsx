@@ -527,7 +527,7 @@ export function WorkspacePicker({
     resolved: !worktreesPlaceholder && hostWorktrees !== undefined,
   });
   const linkedWorktrees = verifiedGithubWorktrees.filter((worktree) => !worktree.is_main);
-  const showWorktreePanel = verifiedGithubWorktrees.length > 0;
+  const showWorktreePanel = linkedWorktrees.length > 0;
 
   useEffect(() => {
     if (
@@ -1075,11 +1075,11 @@ export function WorkspacePicker({
                 Boolean(error)
               }
               onClick={handleSelect}
-              title={`Confirm working directory: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
+              title={`Use this folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
               className="shrink-0 px-4"
               data-testid="workspace-picker-select"
             >
-              Confirm
+              Use this folder
             </Button>
           )}
         </div>

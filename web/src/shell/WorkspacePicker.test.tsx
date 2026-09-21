@@ -698,8 +698,8 @@ describe("WorkspacePicker modal actions", () => {
     );
 
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(screen.getByRole("button", { name: "Use this folder" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/repo");
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -756,7 +756,7 @@ describe("WorkspacePicker modal actions", () => {
 
     fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
     expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
     expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
   });
