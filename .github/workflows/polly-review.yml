@@ -130,7 +130,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_BODY: ${{ github.event_name == 'workflow_dispatch' && '/review force' || github.event.comment.body }}
         run: |
           set -euo pipefail
 
