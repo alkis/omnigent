@@ -13,9 +13,12 @@ import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
+    RequestCancelFrame,
+    RequestFrame,
     ResponseBodyFrame,
     ResponseEndFrame,
     ResponseHeadFrame,
+    decode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import (
@@ -41,6 +44,134 @@ def _hello() -> HelloFrame:
 def _make_request(method: str = "GET", path: str = "/health") -> httpx.Request:
     """Build a minimal httpx.Request for testing."""
     return httpx.Request(method, f"http://runner{path}")
+
+
+def _timed_request(read: float | None, path: str = "/health") -> httpx.Request:
+    """Build a request carrying the timeout extension httpx sets from a Timeout."""
+    timeout = httpx.Timeout(5.0, read=read)
+    return httpx.Request("GET", f"http://runner{path}", extensions={"timeout": timeout.as_dict()})
+
+
+async def _sent_frames(reg: TunnelRegistry, runner_id: str) -> list[object]:
+    """Drain the frames the registry queued for the runner's sender loop."""
+    await asyncio.sleep(0)  # send_text enqueues via call_soon_threadsafe
+    session = reg.get(runner_id)
+    assert session is not None
+    frames: list[object] = []
+    while not session.outbound_queue.empty():
+        text = session.outbound_queue.get_nowait()
+        if text is not None:
+            frames.append(decode_frame(text))
+    return frames
+
+
+def _cancels(frames: list[object]) -> list[tuple[str, str]]:
+    return [(f.id, f.reason) for f in frames if isinstance(f, RequestCancelFrame)]
+
+
+def _request_id(frames: list[object]) -> str:
+    requests = [f for f in frames if isinstance(f, RequestFrame)]
+    assert len(requests) == 1
+    return requests[0].id
+
+
+# ── read timeout ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_bounds_the_wait_for_the_response_head() -> None:
+    """A runner that never answers costs the read budget, not the tunnel's lifetime.
+
+    Before this, the head wait had no deadline, so every ``timeout=`` a
+    caller passed over the tunnel was a no-op and a stalled runner held the
+    request until its tunnel dropped.
+    """
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    with pytest.raises(httpx.ReadTimeout, match="did not answer within"):
+        await transport.handle_async_request(_timed_request(read=0.05))
+
+    session = reg.get("r1")
+    assert session is not None
+    assert session.in_flight == {}
+    frames = await _sent_frames(reg, "r1")
+    assert _cancels(frames) == [(_request_id(frames), "read_timeout")]
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_none_waits_for_a_slow_head() -> None:
+    """``read=None`` keeps today's behavior: the head may take as long as it takes."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_timed_request(read=None)))
+    await asyncio.sleep(0.15)
+    assert not task.done()
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=204, headers=[]))
+    reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+
+    assert (await task).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_bounds_each_body_frame() -> None:
+    """A head followed by silence times out while reading the body and frees the slot."""
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_timed_request(read=0.05)))
+    await asyncio.sleep(0.01)
+    session = reg.get("r1")
+    assert session is not None
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200, headers=[]))
+    response = await task
+
+    with pytest.raises(httpx.ReadTimeout, match="sent no response body within"):
+        async for _chunk in response.stream:  # type: ignore[union-attr]
+            pass
+
+    assert req_id not in session.in_flight
+    assert _cancels(await _sent_frames(reg, "r1")) == [(req_id, "read_timeout")]
+
+
+@pytest.mark.asyncio
+async def test_client_per_call_timeout_reaches_the_tunnel() -> None:
+    """The timeout a caller passes to ``client.get`` is what bounds the tunnel wait.
+
+    The router builds its runner clients with ``httpx.Timeout(5.0, read=None)``,
+    so a call without its own timeout still waits without bound.
+    """
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(reg, "r1"),
+        base_url="http://runner",
+        timeout=httpx.Timeout(5.0, read=None),
+    )
+    try:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.get("/v1/sessions/abc", timeout=0.1)
+
+        task = asyncio.create_task(client.get("/v1/sessions/abc"))
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        session = reg.get("r1")
+        assert session is not None
+        req_id = next(iter(session.in_flight))
+        reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=200, headers=[]))
+        reg.route_response_frame("r1", ResponseBodyFrame(id=req_id, body="{}", encoding="utf-8"))
+        reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+        assert (await task).status_code == 200
+    finally:
+        await client.aclose()
 
 
 # ── handle_async_request: offline runner ────────────────

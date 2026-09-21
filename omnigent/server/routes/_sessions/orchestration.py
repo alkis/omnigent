@@ -4382,8 +4382,8 @@ async def _ensure_native_terminal_ready(
 
     The runner's explicit ``ensure_native_terminal`` endpoint is the
     authoritative readiness check for native user messages. Any non-2xx
-    response or transport failure fails this user turn quickly with a
-    durable error item; a 2xx response preserves the normal boot grace
+    response or transport failure fails this user turn with a durable
+    error item; a 2xx response preserves the normal boot grace
     because the runner has accepted responsibility for terminal startup.
 
     A runner tunnel that drops while the request is in flight is the one
@@ -4417,7 +4417,7 @@ async def _ensure_native_terminal_ready(
                 "ensure_native_terminal": True,
                 "persist_resource_event": persist_resource_event,
             },
-            timeout=10.0,
+            timeout=_NATIVE_TERMINAL_ENSURE_TIMEOUT,
         )
 
     def _transport_failure(exc: httpx.HTTPError | ConnectionError) -> _NativeTerminalEnsureOutcome:
@@ -6536,6 +6536,11 @@ _RELAY_RETRY_INTERVAL_S: float = 0.5
 # stalled and re-registers once it can (observed: 24 s). Hold the message that
 # long before failing it instead of discarding it on a drop the runner outlives.
 _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
+# The runner creates the terminal inline and answers once it is up, so an
+# ensure legitimately lasts as long as a native launch; the runner's own
+# readiness budgets bound that. No read deadline here: a dropped tunnel still
+# fails the request.
+_NATIVE_TERMINAL_ENSURE_TIMEOUT = httpx.Timeout(5.0, read=None)
 # Session statuses that mean a turn was in flight. A runner going away
 # only interrupts work in one of these states; from any other state the
 # departure is a benign disconnect, carried by liveness rather than a
