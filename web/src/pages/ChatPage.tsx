@@ -2579,8 +2579,17 @@ function ComposerImpl(
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
-  const [configBusy, setConfigBusy] = useState(false);
-  const configBusyRef = useRef(false);
+  // Scope the shared lock to one session so an old request cannot unlock a new one.
+  const configBusyRef = useMemo(() => ({ current: false, conversationId }), [conversationId]);
+  const [configBusyOwner, setConfigBusyOwner] = useState<typeof configBusyRef | null>(null);
+  const configBusy = configBusyOwner === configBusyRef;
+  const setConfigBusy = useCallback(
+    (busy: boolean) =>
+      setConfigBusyOwner((owner) =>
+        busy ? configBusyRef : owner === configBusyRef ? null : owner,
+      ),
+    [configBusyRef],
+  );
 
   // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
@@ -4015,8 +4024,8 @@ function ComposerImpl(
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
-                  // Opening the picker wakes a missing native terminal, so it
-                  // stays usable on asleep sessions with a reachable host.
+                  // Selecting a configuration wakes a missing native terminal,
+                  // so the picker stays usable on reachable, asleep sessions.
                   disabled={isReadOnly || unreachable}
                   openNonce={pickerOpenNonce}
                 />
@@ -4625,7 +4634,7 @@ function hasSessionConfig({
 }
 
 function SessionHarnessPicker({
-  busy: updating,
+  busy,
   busyRef,
   setBusy,
   agentName,
@@ -4668,9 +4677,7 @@ function SessionHarnessPicker({
   const [menuOpen, setMenuOpen] = useState(false);
   const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [startingTerminal, setStartingTerminal] = useState(false);
-  const terminalStartupRef = useRef<Promise<void> | null>(null);
-  const busy = updating || startingTerminal;
+  const mounted = useRef(true);
   const appliedOpenNonce = useRef(openNonce);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4738,35 +4745,14 @@ function SessionHarnessPicker({
   const openMenu = useCallback(() => {
     if (disabled || busyRef.current || !configurable) return false;
     setMenuOpen(true);
-    if (
-      needsTerminal &&
-      conversationId !== null &&
-      !isTempConvId(conversationId) &&
-      terminalStartupRef.current === null
-    ) {
-      setStartingTerminal(true);
-      setError(null);
-      terminalStartupRef.current = retrySession(conversationId)
-        .then((result) => {
-          if (!result.recovered && result.recovery !== "already_connected") {
-            throw new Error("Unable to start the session terminal");
-          }
-        })
-        .catch((failure: unknown) => {
-          if (useChatStore.getState().conversationId !== conversationId) return;
-          setError(
-            failure instanceof Error ? failure.message : "Unable to start the session terminal",
-          );
-          setMenuOpen(false);
-          setConfigMenu(null);
-        })
-        .finally(() => {
-          terminalStartupRef.current = null;
-          setStartingTerminal(false);
-        });
-    }
     return true;
-  }, [disabled, busyRef, configurable, needsTerminal, conversationId]);
+  }, [disabled, busyRef, configurable]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
@@ -4779,17 +4765,24 @@ function SessionHarnessPicker({
     setConfigMenu(null);
     setError(null);
   }, [conversationId]);
+  const isCurrentSession = () =>
+    mounted.current && useChatStore.getState().conversationId === conversationId;
   const apply = async (change: () => Promise<unknown>) => {
-    if (disabled || busyRef.current || terminalStartupRef.current || pendingModelChange !== null)
-      return;
+    if (disabled || busyRef.current || pendingModelChange !== null) return;
     busyRef.current = true;
     setBusy(true);
     setError(null);
-    const sourceSessionId = useChatStore.getState().conversationId;
     try {
+      if (needsTerminal && conversationId !== null && !isTempConvId(conversationId)) {
+        const result = await retrySession(conversationId);
+        if (!result.recovered && result.recovery !== "already_connected") {
+          throw new Error("Unable to start the session terminal");
+        }
+      }
+      if (!isCurrentSession()) return;
       await change();
     } catch (failure) {
-      if (useChatStore.getState().conversationId === sourceSessionId)
+      if (isCurrentSession())
         setError(
           failure instanceof Error ? failure.message : "Unable to update session configuration",
         );
@@ -4801,22 +4794,17 @@ function SessionHarnessPicker({
   const selectModel = (modelId: string | null) =>
     void apply(async () => {
       const store = useChatStore.getState();
-      const sourceSessionId = store.conversationId;
       await store.setModel(modelId, {
         expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
       });
-      if (useChatStore.getState().conversationId !== sourceSessionId) return;
+      if (!isCurrentSession()) return;
       if (
         modelPickerKind === "codex" &&
         selectedEffort !== null &&
         !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)
       )
         await store.setEffort(null);
-      if (
-        costRoutingEligible &&
-        routingOn &&
-        useChatStore.getState().conversationId === sourceSessionId
-      )
+      if (costRoutingEligible && routingOn && isCurrentSession())
         await store.setCostControlMode("off");
     });
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
@@ -4827,9 +4815,8 @@ function SessionHarnessPicker({
   const selectFusionModel = (modelUid: string) =>
     void apply(async () => {
       const store = useChatStore.getState();
-      const sourceSessionId = store.conversationId;
       await store.setModel(modelUid, { expectConfirmation: false });
-      if (useChatStore.getState().conversationId !== sourceSessionId) return;
+      if (!isCurrentSession()) return;
       if (selectedEffort !== null) await store.setEffort(null);
     });
   const modelContent = (
@@ -4963,14 +4950,14 @@ function SessionHarnessPicker({
           model: label,
           effort: effortLabel ?? undefined,
           icon: <ComposerAgentIcon agent={iconAgent} />,
-          disabled: updating || !configurable,
-          "aria-disabled": disabled || updating || !configurable,
+          disabled: busy || !configurable,
+          "aria-disabled": disabled || busy || !configurable,
           className: disabled ? "cursor-default opacity-50" : undefined,
           testIdPrefix: "composer",
           "data-testid": "composer-config-gear",
           loading: modelLabelLoading && !routingOn,
           pending:
-            startingTerminal ||
+            busy ||
             ((sessionModelSeeded || pendingModelChange !== null) &&
               (modelPickerKind === "claude" || modelPickerKind === "codex")),
         }}
@@ -4978,11 +4965,6 @@ function SessionHarnessPicker({
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
       >
-        {startingTerminal && (
-          <div role="status" className="px-2 py-1 text-xs text-muted-foreground">
-            Starting terminal…
-          </div>
-        )}
         {isMobile && configMenu !== null ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"

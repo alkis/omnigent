@@ -1,4 +1,4 @@
-"""Opening a dormant native session's model picker prepares its terminal."""
+"""Choosing native session configuration prepares its terminal on demand."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from tests.e2e_ui.conftest import seed_committed_turn
 @dataclass
 class _NativeSession:
     running: bool = False
+    hold_patches: bool = False
     mutations: list[tuple[str, dict]] = field(default_factory=list)
     pending_retries: list[Route] = field(default_factory=list)
+    pending_patches: list[tuple[Route, dict]] = field(default_factory=list)
 
     def finish_resume(self) -> None:
         """Complete the server's terminal-readiness acknowledgement."""
@@ -25,6 +27,11 @@ class _NativeSession:
             json={"queued": False, "recovered": True, "recovery": "runner_relaunched"},
         )
 
+    def finish_change(self) -> None:
+        """Acknowledge a configuration PATCH after the harness applies it."""
+        route, payload = self.pending_patches.pop()
+        route.fulfill(json=payload)
+
 
 def _mock_native_session(
     page: Page,
@@ -32,9 +39,10 @@ def _mock_native_session(
     session_id: str,
     *,
     running: bool = False,
+    hold_patches: bool = False,
 ) -> _NativeSession:
     """Keep the real transcript and mock only the native runtime boundary."""
-    state = _NativeSession(running=running)
+    state = _NativeSession(running=running, hold_patches=hold_patches)
     response = page.request.get(f"{base_url}/v1/sessions/{session_id}")
     assert response.ok
     snapshot = response.json()
@@ -77,6 +85,11 @@ def _mock_native_session(
                 body = route.request.post_data_json
                 state.mutations.append(("patch", body))
                 snapshot.update(body)
+                if state.hold_patches:
+                    state.pending_patches.append(
+                        (route, {**snapshot, "runner_online": state.running})
+                    )
+                    return
             route.fulfill(json={**snapshot, "runner_online": state.running})
         elif path == f"/v1/sessions/{session_id}/resources/terminals" and method == "GET":
             route.fulfill(
@@ -131,7 +144,10 @@ def _mock_native_session(
           window.fetch = (input, init) => {
             const url = typeof input === "string" ? input : input.url;
             if (new URL(url, location.origin).pathname === `/v1/sessions/${sessionId}/stream`) {
-              return Promise.resolve(new Response(new ReadableStream(), {
+              const stream = new ReadableStream({
+                start(controller) { window.__modelPickerStreamController = controller; },
+              });
+              return Promise.resolve(new Response(stream, {
                 headers: { "content-type": "text/event-stream" },
               }));
             }
@@ -143,11 +159,22 @@ def _mock_native_session(
     return state
 
 
-def test_model_picker_resumes_before_editing_without_sending_a_message(
+def _confirm_model(page: Page, session_id: str, model: str) -> None:
+    """Publish the native harness's applied model, independently of its PATCH."""
+    page.wait_for_function("window.__modelPickerStreamController !== undefined")
+    payload = {"conversation_id": session_id, "model": model}
+    frame = f"event: session.model\ndata: {json.dumps(payload)}\n\n"
+    page.evaluate(
+        "frame => window.__modelPickerStreamController.enqueue(new TextEncoder().encode(frame))",
+        frame,
+    )
+
+
+def test_model_selection_resumes_without_sending_a_message(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A gear click starts one terminal and preserves the user's draft/view."""
+    """Browsing stays local; choosing starts a terminal and awaits confirmation."""
     base_url, session_id = seeded_session
     seed_committed_turn(session_id, prompt="An earlier prompt.", reply="An earlier answer.")
     state = _mock_native_session(page, base_url, session_id)
@@ -161,49 +188,113 @@ def test_model_picker_resumes_before_editing_without_sending_a_message(
     composer.fill("Keep this unsent draft.")
     assert state.mutations == []
 
+    gear.click()
+    model_trigger = page.get_by_test_id("composer-agent-edit")
+    effort_trigger = page.get_by_test_id("composer-agent-effort-select")
+    expect(model_trigger).to_be_enabled()
+    expect(effort_trigger).to_be_enabled()
+    model_trigger.click()
+    model_choice = page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]')
+    expect(model_choice).to_be_enabled()
+    expect(page.get_by_test_id("composer-model-pending")).to_have_count(0)
+    expect(page.get_by_text("Starting terminal…", exact=True)).to_have_count(0)
+    assert state.mutations == []
+
+    # Browsing either submenu, including closing/reopening, never launches.
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("composer-agent-menu")).to_have_count(0)
+    gear.click()
+    effort_trigger.click()
+    expect(page.locator('[role="menuitemcheckbox"][data-effort-level="high"]')).to_be_enabled()
+    assert state.mutations == []
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("composer-agent-menu")).to_have_count(0)
+    gear.click()
+    model_trigger.click()
+
     with page.expect_request(
         lambda request: (
             request.method == "POST"
             and urlparse(request.url).path == f"/v1/sessions/{session_id}/events"
         )
     ):
-        gear.click()
+        model_choice.click()
 
-    expect(page.get_by_text("Starting terminal…", exact=True)).to_be_visible()
-    model_trigger = page.get_by_test_id("composer-agent-edit")
-    expect(model_trigger).to_be_disabled()
-    expect(page.get_by_test_id("composer-agent-effort-select")).to_be_disabled()
+    pending = page.get_by_test_id("composer-model-pending")
+    expect(pending).to_be_visible()
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text("GPT-5.5")
     expect(page.get_by_test_id("view-mode-chat")).to_have_attribute("aria-pressed", "true")
     expect(composer).to_have_value("Keep this unsent draft.")
     assert state.mutations == [("event", {"type": "retry_session", "data": {}})]
 
-    # Reopening the picker while startup is pending must reuse that launch.
-    page.keyboard.press("Escape")
-    expect(page.get_by_test_id("composer-agent-menu")).to_have_count(0)
-    gear.click()
-    expect(model_trigger).to_be_disabled()
-    assert len(state.pending_retries) == 1
-
-    state.finish_resume()
-    expect(model_trigger).to_be_enabled()
-    expect(page.get_by_text("Starting terminal…", exact=True)).to_have_count(0)
-    model_trigger.click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
             and urlparse(response.url).path == f"/v1/sessions/{session_id}"
         )
     ):
-        page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]').click()
+        state.finish_resume()
 
     assert state.mutations == [
         ("event", {"type": "retry_session", "data": {}}),
         ("patch", {"model_override": "gpt-5.6-luna"}),
     ]
+    expect(pending).to_be_visible()
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text("GPT-5.5")
+
+    _confirm_model(page, session_id, "gpt-5.6-luna")
+    expect(page.get_by_test_id("composer-agent-model-value")).to_have_text("GPT-5.6-Luna")
+    expect(pending).to_have_count(0)
     expect(page.get_by_test_id("view-mode-chat")).to_have_attribute("aria-pressed", "true")
     expect(composer).to_have_value("Keep this unsent draft.")
     expect(page.locator('[data-testid="message-bubble"][data-role="user"]')).to_have_count(1)
     expect(page.get_by_text("An earlier answer.", exact=True)).to_be_visible()
+
+
+def test_effort_selection_resumes_and_stays_pending_until_applied(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """An effort pick stays pending across terminal startup and its native PATCH."""
+    base_url, session_id = seeded_session
+    state = _mock_native_session(page, base_url, session_id, hold_patches=True)
+    with page.expect_response(lambda response: urlparse(response.url).path == "/health"):
+        page.goto(f"{base_url}/c/{session_id}?view=chat")
+
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-agent-effort-select").click()
+    effort_choice = page.locator('[role="menuitemcheckbox"][data-effort-level="high"]')
+    expect(effort_choice).to_be_enabled()
+    assert state.mutations == []
+
+    with page.expect_request(
+        lambda request: (
+            request.method == "POST"
+            and urlparse(request.url).path == f"/v1/sessions/{session_id}/events"
+        )
+    ):
+        effort_choice.click()
+
+    pending = page.get_by_test_id("composer-model-pending")
+    expect(pending).to_be_visible()
+    assert state.mutations == [("event", {"type": "retry_session", "data": {}})]
+    with page.expect_request(
+        lambda request: (
+            request.method == "PATCH"
+            and urlparse(request.url).path == f"/v1/sessions/{session_id}"
+        )
+    ):
+        state.finish_resume()
+
+    expect(pending).to_be_visible()
+    assert state.mutations == [
+        ("event", {"type": "retry_session", "data": {}}),
+        ("patch", {"reasoning_effort": "high"}),
+    ]
+    state.finish_change()
+    expect(pending).to_have_count(0)
+    expect(page.get_by_test_id("composer-agent-effort-value")).to_have_text("High")
+    expect(page.get_by_test_id("view-mode-chat")).to_have_attribute("aria-pressed", "true")
 
 
 def test_model_picker_does_not_resume_a_running_terminal(
@@ -235,4 +326,6 @@ def test_model_picker_does_not_resume_a_running_terminal(
         page.locator('[role="menuitemcheckbox"][data-model-id="gpt-5.6-luna"]').click()
 
     assert state.mutations == [("patch", {"model_override": "gpt-5.6-luna"})]
+    _confirm_model(page, session_id, "gpt-5.6-luna")
+    expect(page.get_by_test_id("composer-model-pending")).to_have_count(0)
     expect(page.get_by_test_id("view-mode-chat")).to_have_attribute("aria-pressed", "true")
