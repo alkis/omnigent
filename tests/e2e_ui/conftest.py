@@ -62,12 +62,24 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
+from tests.e2e_ui.coverage_index import (
+    DEFAULT_OUTPUT_ROOT,
+    build_shard_payload,
+    normalize_browser_coverage,
+    repository_sha,
+    write_json,
+)
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
 _CODEX_GOAL_MIN_VERSION = (0, 139, 0)
 _PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
+_COVERAGE_INDEX_ENV = "OMNIGENT_E2E_COVERAGE_INDEX"
+_COVERAGE_SHARD_ENV = "OMNIGENT_E2E_COVERAGE_SHARD"
+_coverage_records: dict[str, dict[str, Any]] = {}
+_coverage_sync_pages: dict[str, list[Any]] = {}
+_coverage_sync_contexts: dict[str, list[Any]] = {}
 
 
 # A pooled connection the server closes as the replay goes out surfaces as one
@@ -422,15 +434,84 @@ def pytest_collection_modifyitems(
     """
     splits = config.getoption("--splits")
     group = config.getoption("--group")
-    if splits is None and group is None:
+    if splits is not None or group is not None:
+        if splits is None or group is None:
+            raise pytest.UsageError("--splits and --group must be passed together")
+        if splits < 1:
+            raise pytest.UsageError("--splits must be >= 1")
+        if not 1 <= group <= splits:
+            raise pytest.UsageError(f"--group must be between 1 and {splits}")
+        items[:] = items[group - 1 :: splits]
+
+    if os.environ.get(_COVERAGE_INDEX_ENV) == "1":
+        for item in items:
+            _coverage_records[item.nodeid] = {
+                "status": "missing",
+                "frontend_modules": [],
+                "message": "no browser coverage was captured",
+            }
+
+
+def _store_browser_coverage(nodeid: str, raw: Any) -> None:
+    modules, error = normalize_browser_coverage(raw, _REPO_ROOT)
+    record = _coverage_records.setdefault(
+        nodeid, {"status": "missing", "frontend_modules": [], "message": "missing"}
+    )
+    record["frontend_modules"] = sorted(set(record["frontend_modules"]) | set(modules))
+    if error:
+        record["status"] = "malformed" if "malformed" in error else "missing"
+        record["message"] = error
+    elif record.get("status") != "malformed":
+        record["status"] = "captured"
+        record.pop("message", None)
+
+
+def _capture_sync_page(nodeid: str, page: Any) -> None:
+    try:
+        raw = page.evaluate("() => globalThis.__coverage__ ?? null")
+    except Exception as exc:  # Playwright raises several closed/target error types.
+        _store_browser_coverage(nodeid, None)
+        _coverage_records[nodeid]["message"] = f"browser coverage read failed: {exc}"
         return
-    if splits is None or group is None:
-        raise pytest.UsageError("--splits and --group must be passed together")
-    if splits < 1:
-        raise pytest.UsageError("--splits must be >= 1")
-    if not 1 <= group <= splits:
-        raise pytest.UsageError(f"--group must be between 1 and {splits}")
-    items[:] = items[group - 1 :: splits]
+    _store_browser_coverage(nodeid, raw)
+
+
+async def _capture_async_page(nodeid: str, page: Any) -> None:
+    try:
+        raw = await page.evaluate("() => globalThis.__coverage__ ?? null")
+    except Exception as exc:  # Playwright raises several closed/target error types.
+        _store_browser_coverage(nodeid, None)
+        _coverage_records[nodeid]["message"] = f"browser coverage read failed: {exc}"
+        return
+    _store_browser_coverage(nodeid, raw)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item) -> Iterator[None]:
+    """Capture sync browser coverage after the test call, including failures."""
+    yield
+    if os.environ.get(_COVERAGE_INDEX_ENV) != "1":
+        return
+    for context in _coverage_sync_contexts.get(item.nodeid, []):
+        for page in context.pages:
+            _capture_sync_page(item.nodeid, page)
+    for page in _coverage_sync_pages.get(item.nodeid, []):
+        _capture_sync_page(item.nodeid, page)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    """Write the normalized per-shard payload after all fixture teardowns."""
+    if os.environ.get(_COVERAGE_INDEX_ENV) != "1":
+        return
+    group = session.config.getoption("--group")
+    shard = os.environ.get(_COVERAGE_SHARD_ENV) or (str(group) if group else "unsharded")
+    output = DEFAULT_OUTPUT_ROOT / "shards" / f"{shard}.json"
+    payload = build_shard_payload(
+        shard=shard,
+        repository_sha=repository_sha(_REPO_ROOT),
+        tests=_coverage_records,
+    )
+    write_json(_REPO_ROOT / output, payload)
 
 
 def _register_agent_yaml(
@@ -2214,6 +2295,84 @@ def paused_mid_turn_session(
         if respawned is not None:
             respawned.terminate()
             respawned.wait(timeout=5)
+
+
+@pytest.fixture(autouse=True)
+def _capture_browser_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> Iterator[None]:
+    """Track sync and async Playwright pages for the current test."""
+    if os.environ.get(_COVERAGE_INDEX_ENV) != "1":
+        yield
+        return
+
+    from playwright.async_api import Browser as AsyncBrowser
+    from playwright.async_api import BrowserContext as AsyncBrowserContext
+    from playwright.async_api import Page as AsyncPage
+    from playwright.sync_api import Browser as SyncBrowser
+    from playwright.sync_api import BrowserContext as SyncBrowserContext
+    from playwright.sync_api import Page as SyncPage
+
+    nodeid = request.node.nodeid
+    original_sync_browser_new_page = SyncBrowser.new_page
+    original_sync_browser_new_context = SyncBrowser.new_context
+    original_sync_context_new_page = SyncBrowserContext.new_page
+    original_sync_page_close = SyncPage.close
+    original_async_browser_new_page = AsyncBrowser.new_page
+    original_async_browser_new_context = AsyncBrowser.new_context
+    original_async_context_new_page = AsyncBrowserContext.new_page
+    original_async_context_close = AsyncBrowserContext.close
+    original_async_page_close = AsyncPage.close
+
+    def sync_browser_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        page = original_sync_browser_new_page(self, *args, **kwargs)
+        _coverage_sync_pages.setdefault(nodeid, []).append(page)
+        return page
+
+    def sync_browser_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        context = original_sync_browser_new_context(self, *args, **kwargs)
+        _coverage_sync_contexts.setdefault(nodeid, []).append(context)
+        return context
+
+    def sync_context_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        page = original_sync_context_new_page(self, *args, **kwargs)
+        _coverage_sync_pages.setdefault(nodeid, []).append(page)
+        return page
+
+    def sync_page_close(self: Any, *args: Any, **kwargs: Any) -> Any:
+        _capture_sync_page(nodeid, self)
+        return original_sync_page_close(self, *args, **kwargs)
+
+    async def async_browser_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        page = await original_async_browser_new_page(self, *args, **kwargs)
+        return page
+
+    async def async_browser_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return await original_async_browser_new_context(self, *args, **kwargs)
+
+    async def async_context_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return await original_async_context_new_page(self, *args, **kwargs)
+
+    async def async_context_close(self: Any, *args: Any, **kwargs: Any) -> Any:
+        for page in self.pages:
+            await _capture_async_page(nodeid, page)
+        return await original_async_context_close(self, *args, **kwargs)
+
+    async def async_page_close(self: Any, *args: Any, **kwargs: Any) -> Any:
+        await _capture_async_page(nodeid, self)
+        return await original_async_page_close(self, *args, **kwargs)
+
+    monkeypatch.setattr(SyncBrowser, "new_page", sync_browser_new_page)
+    monkeypatch.setattr(SyncBrowser, "new_context", sync_browser_new_context)
+    monkeypatch.setattr(SyncBrowserContext, "new_page", sync_context_new_page)
+    monkeypatch.setattr(SyncPage, "close", sync_page_close)
+    monkeypatch.setattr(AsyncBrowser, "new_page", async_browser_new_page)
+    monkeypatch.setattr(AsyncBrowser, "new_context", async_browser_new_context)
+    monkeypatch.setattr(AsyncBrowserContext, "new_page", async_context_new_page)
+    monkeypatch.setattr(AsyncBrowserContext, "close", async_context_close)
+    monkeypatch.setattr(AsyncPage, "close", async_page_close)
+    yield
 
 
 @pytest.fixture(autouse=True)

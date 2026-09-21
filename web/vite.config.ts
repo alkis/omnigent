@@ -4,6 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
+import { createE2eCoveragePlugin } from "./vite.coverage";
 import { shikiManualChunk } from "./vite.shiki";
 import { streamdownManualChunk } from "./vite.streamdown";
 
@@ -217,8 +218,12 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
+const e2eCoveragePlugin = createE2eCoveragePlugin();
+
 export default defineConfig({
-  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss(), e2eCoveragePlugin].filter(
+    (plugin): plugin is Plugin => plugin !== null,
+  ),
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
