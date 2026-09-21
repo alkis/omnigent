@@ -4047,10 +4047,14 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
         "_poll_request_disconnect",
         _disconnect_immediately,
     )
+    # Wide on purpose: the retry can only adopt the gap tombstone while the
+    # severed poll's pending entry it fingerprints against still exists. A
+    # short grace let the deferred clear beat the verdict POST, dropping the
+    # fingerprint so the retry fail-closed and re-parked with an empty body.
     monkeypatch.setattr(
         sessions_route,
         "_HARNESS_ELICITATION_REPARK_GRACE_S",
-        0.25,
+        30.0,
     )
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-codex-gap-verdict")
@@ -4085,11 +4089,22 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
         json=_CODEX_REPARK_PAYLOAD,
     )
     assert second.status_code == 200, second.text
+    # Check the raw body first: an empty one means the retry re-parked rather
+    # than consuming the tombstone, which names the fault better than a bare
+    # JSONDecodeError out of the .json() below.
+    assert second.content, (
+        "expected the codex JSON-RPC verdict body, got an empty response — "
+        "the retry re-parked instead of consuming the gap tombstone "
+        "(status=200, empty body means fail-ask fired again)"
+    )
     assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
-    # Drain the severed poll's deferred clear so it doesn't outlive the
-    # test's event loop (it no-ops the index either way).
+    # Cancel the severed poll's deferred clear rather than awaiting it: its
+    # outcome is moot (the index is empty either way) and waiting would sleep
+    # out the whole grace above.
     for task in set(sessions_route._deferred_elicitation_clear_tasks):
-        await asyncio.wait_for(task, timeout=5.0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     pending_elicitations.reset_for_tests()
 
 
