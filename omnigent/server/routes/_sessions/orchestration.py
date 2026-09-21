@@ -83,6 +83,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing_host import session_routing_hosts
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
@@ -858,6 +859,7 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    routing_host_id: str | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -899,6 +901,7 @@ def _build_session_list_item(
         wired — emitted as ``comments_count=0`` /
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
+    :param routing_host_id: Precomputed host affinity for colocated children.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -926,6 +929,7 @@ def _build_session_list_item(
         labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
+        routing_host_id=routing_host_id or conv.host_id,
         reasoning_effort=conv.reasoning_effort,
         permission_level=level,
         owner=owner,
@@ -1048,6 +1052,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    routing_host_id: str | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1115,6 +1120,7 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param routing_host_id: Host affinity resolved without changing ownership.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1158,6 +1164,7 @@ def _build_session_response(
         labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
+        routing_host_id=routing_host_id or conv.host_id,
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
@@ -10991,6 +10998,9 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
+        routing_host_id=(await asyncio.to_thread(session_routing_hosts, [conv], conv_store))[
+            conv.id
+        ],
         pending_elicitation_events=await asyncio.to_thread(
             _pending_elicitation_snapshot_for_session,
             conv_store,

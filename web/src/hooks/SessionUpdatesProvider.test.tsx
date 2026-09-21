@@ -18,6 +18,7 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { getSessionHost, setSessionHost } from "@/lib/sessionHost";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -223,6 +224,58 @@ function wireItem(id: string, commentsCount: number, commentsUpdatedAt: number |
 }
 
 describe("SessionUpdatesProvider host changes", () => {
+  afterEach(() => setSessionHost("conv_routing", null));
+
+  it("updates and clears an open child's routing host from stream frames", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_parent"]);
+    renderProvider(client, ["/c/conv_routing"]);
+    const handler = frameHandler();
+    const child = { id: "conv_routing", parent_session_id: "conv_parent", host_id: null };
+
+    act(() =>
+      handler({
+        type: "snapshot",
+        items: [{ ...child, routing_host_id: "host_a" }],
+      }),
+    );
+    expect(getSessionHost("conv_routing")).toBe("host_a");
+
+    act(() =>
+      handler({
+        type: "changed",
+        items: [{ ...child, routing_host_id: "host_b" }],
+      }),
+    );
+    expect(getSessionHost("conv_routing")).toBe("host_b");
+
+    act(() =>
+      handler({
+        type: "changed",
+        items: [{ ...child, routing_host_id: null }],
+      }),
+    );
+    expect(getSessionHost("conv_routing")).toBeNull();
+  });
+
+  it("uses legacy host fields and preserves affinity on partial frames", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_routing"]);
+    renderProvider(client, ["/c/conv_routing"]);
+    const handler = frameHandler();
+
+    act(() =>
+      handler({ type: "snapshot", items: [{ id: "conv_routing", host_id: "host_legacy" }] }),
+    );
+    expect(getSessionHost("conv_routing")).toBe("host_legacy");
+
+    act(() => handler({ type: "changed", items: [{ id: "conv_routing", status: "idle" }] }));
+    expect(getSessionHost("conv_routing")).toBe("host_legacy");
+
+    act(() => handler({ type: "changed", items: [{ id: "conv_routing", host_id: null }] }));
+    expect(getSessionHost("conv_routing")).toBeNull();
+  });
+
   it("invalidates cached session agents so shell inventories refresh", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_old"]);

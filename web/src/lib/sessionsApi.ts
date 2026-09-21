@@ -116,6 +116,8 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  /** Replica-routing host, including a colocated child's inherited host. */
+  routing_host_id?: string | null;
   /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
@@ -310,7 +312,7 @@ function usageByModelFromWire(
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, wire.routing_host_id ?? wire.host_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,

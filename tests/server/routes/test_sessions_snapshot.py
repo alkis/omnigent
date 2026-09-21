@@ -133,6 +133,9 @@ class _ConversationStore:
             agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         )
 
+    def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
+        return {sid: conv for sid in conversation_ids if (conv := self.get_conversation(sid))}
+
     def list_conversations(
         self,
         *,
@@ -213,6 +216,34 @@ def _message_item(item_id: str, text: str) -> ConversationItem:
             content=[{"type": "input_text", "text": text}],
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_routes_colocated_child_without_assigning_host_ownership() -> None:
+    parent = Conversation(
+        id="routing_parent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="routing_parent",
+        runner_id="runner_shared",
+        host_id="host_parent",
+    )
+    child = Conversation(
+        id="routing_child",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=parent.id,
+        parent_conversation_id=parent.id,
+        runner_id=parent.runner_id,
+        agent_id="agent_child",
+    )
+    store = _ConversationStore([], {parent.id: parent, child.id: child})
+
+    snapshot = await _get_session_snapshot(store, child.id, include_usage=False)
+
+    assert snapshot.host_id is None
+    assert snapshot.routing_host_id == parent.host_id
+    assert child.host_id is None
 
 
 @pytest.mark.asyncio

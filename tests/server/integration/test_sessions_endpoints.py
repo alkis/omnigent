@@ -833,6 +833,37 @@ async def test_list_sessions_kind_filter(
     assert resp.status_code == 422
 
 
+async def test_child_snapshot_and_list_inherit_routing_without_host_ownership(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id, runner_id = uuid.uuid4().hex, uuid.uuid4().hex
+    store.set_host_id(parent["id"], host_id, workspace="/workspace")
+    store.set_runner_id(parent["id"], runner_id)
+    child_response = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "parent_session_id": parent["id"]}
+    )
+    assert child_response.status_code == 201, child_response.text
+    child_id = child_response.json()["id"]
+
+    snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["host_id"] is None
+    assert snapshot.json()["routing_host_id"] == host_id
+    listing = await client.get("/v1/sessions", params={"kind": "sub_agent"})
+    assert listing.status_code == 200
+    child = next(row for row in listing.json()["data"] if row["id"] == child_id)
+    assert child.get("host_id") is None
+    assert child["routing_host_id"] == host_id
+    stored_child = store.get_conversation(child_id)
+    assert stored_child is not None
+    assert stored_child.host_id is None
+    assert stored_child.runner_id == runner_id
+
+
 async def test_list_sessions_includes_title_and_status(
     client: httpx.AsyncClient,
 ) -> None:

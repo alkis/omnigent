@@ -1,4 +1,4 @@
-// Client-side `session_id → host_id` map for host-sharded routing.
+// Client-side `session_id → routing_host_id` map for host-sharded routing.
 //
 // When the server shards replicas by host_id, a session's runner tunnel lives
 // on its host's replica, so session-scoped traffic (turn dispatch, terminal
@@ -10,14 +10,14 @@
 //
 // A small standalone map (rather than reading the TanStack Query cache) keeps
 // this decoupled from the query-key convention and needs no QueryClient handle.
-// A session's host_id is fixed for its lifetime, so the recorded value can't go
-// stale. Returns `null` when the session hasn't been loaded yet or is a hostless
-// local session, leaving routing to the default.
+// Colocated children use their ancestor's routing host without owning it.
+// Snapshots refresh this mapping when bindings change. Returns `null` for an
+// unknown session or a local session without a routing host.
 
 const _sessionHosts = new Map<string, string>();
 
 /**
- * Record (or clear) the host a session is bound to. Called wherever a session
+ * Record (or clear) the host a session routes through. Called wherever a session
  * object is parsed; a null/absent host clears any stale mapping so a session
  * that loses its host binding stops routing to the old replica.
  */

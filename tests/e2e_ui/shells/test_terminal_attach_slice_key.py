@@ -12,10 +12,9 @@ This drives the real flow — open a shell from the rail's "+" menu — and asse
 the attach WebSocket the browser actually opens carries **no** slice key. The
 e2e harness serves the standalone SPA build (``built_spa``), which installs no
 host fetcher, so this is exactly the unsharded case, and it is the observable
-half of the contract in this environment. The complementary keyed emission
-(embedded / workspace, where a fetcher IS installed) is not reachable from the
-standalone build, so it is covered by the ``TerminalView`` / ``identity`` unit
-tests (which mock the fetcher) rather than end-to-end.
+half of the contract in this environment. The complementary workspace case
+uses a separate frontend in ``test_subagent_terminal_routing.py`` and checks
+both HTTP routing and terminal attachment through an inherited host.
 """
 
 from __future__ import annotations

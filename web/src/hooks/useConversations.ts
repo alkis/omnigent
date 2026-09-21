@@ -157,6 +157,8 @@ export interface Conversation {
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
   host_id?: string | null;
+  /** Replica-routing host; may be inherited without owning the host. */
+  routing_host_id?: string | null;
   /**
    * Absolute path the runner cd's into, e.g. ``"/Users/me/repo"``. For
    * worktree sessions this is the isolated worktree dir, not the picked
@@ -477,7 +479,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // enter client state only through here, and terminal-attach / session-scoped
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, wire.routing_host_id ?? wire.host_id);
   return {
     id: wire.id,
     object: "conversation",
@@ -489,6 +491,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
+    routing_host_id: wire.routing_host_id ?? wire.host_id ?? null,
     workspace: wire.workspace ?? null,
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
@@ -557,9 +560,9 @@ export async function fetchConversationsPage({
   // than whichever single session happened to be fetched individually first;
   // (2) a session-scoped request (`/v1/sessions/{id}/*`) issued before that
   // session's own snapshot loads still keys to the right replica instead of
-  // falling back to the modal. host_id is fixed for a session's life, so this
-  // can't seed a stale value; a hostless row clears any prior mapping.
-  for (const row of page.data) setSessionHost(row.id, row.host_id);
+  // falling back to the modal. Refresh inherited routing after runner rebinding;
+  // a row without a routing host clears any prior mapping.
+  for (const row of page.data) setSessionHost(row.id, row.routing_host_id ?? row.host_id);
   return applySessionTombstones(
     withRecentlyCreated(
       page,

@@ -45,6 +45,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing_host import session_routing_hosts
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
@@ -1354,7 +1355,10 @@ def register_core_routes(
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
-        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        comments_fingerprints, routing_hosts = await asyncio.gather(
+            _comments_fingerprints_for(conv_ids),
+            asyncio.to_thread(session_routing_hosts, page.data, conversation_store),
+        )
         # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
         # A session whose persisted live_status is still running/waiting but
         # whose runner is confirmed gone — a replica that restarted and
@@ -1425,6 +1429,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                routing_host_id=routing_hosts.get(conv.id),
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1536,13 +1541,19 @@ def register_core_routes(
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+        (
+            agent_names_by_id,
+            child_ids_by_parent,
+            comments_fingerprints,
+            routing_hosts,
+        ) = await asyncio.gather(
             asyncio.to_thread(agent_store.get_names, unique_agent_ids),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
+            asyncio.to_thread(session_routing_hosts, convs, conversation_store),
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
         items = [
@@ -1556,6 +1567,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                routing_host_id=routing_hosts.get(conv.id),
             )
             for conv in convs
         ]
@@ -3354,6 +3366,9 @@ def register_core_routes(
             permission_level=level,
             last_task_error=None,
             agent_name=base_agent.name,
+            routing_host_id=(
+                await asyncio.to_thread(session_routing_hosts, [new_conv], conversation_store)
+            )[new_conv.id],
         )
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
@@ -3594,4 +3609,7 @@ def register_core_routes(
             permission_level=level,
             last_task_error=None,
             agent_name=target_agent.name,
+            routing_host_id=(
+                await asyncio.to_thread(session_routing_hosts, [updated], conversation_store)
+            )[updated.id],
         )

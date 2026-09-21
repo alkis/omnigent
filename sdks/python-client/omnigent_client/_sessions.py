@@ -182,6 +182,9 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param routing_host_id: Host serving this session's runner, including
+        an inherited parent host for co-located child sessions. ``None``
+        when unavailable or omitted by an older server.
     """
 
     id: str
@@ -203,6 +206,7 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    routing_host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -239,6 +243,7 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            routing_host_id=raw.get("routing_host_id"),
         )
 
 
@@ -279,6 +284,9 @@ class SessionListItem:
         ``list`` with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param routing_host_id: Host serving this session's runner, including
+        an inherited parent host for co-located child sessions. ``None``
+        when unavailable or omitted by an older server.
     """
 
     id: str
@@ -295,6 +303,7 @@ class SessionListItem:
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
+    routing_host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -321,6 +330,7 @@ class SessionListItem:
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
+            routing_host_id=raw.get("routing_host_id"),
         )
 
 
@@ -610,6 +620,7 @@ class SessionsNamespace:
         sort_by: str = "created_at",
         include_archived: bool = False,
         visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        kind: Literal["default", "sub_agent", "any"] | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -639,6 +650,9 @@ class SessionsNamespace:
             by the caller. ``"archived"`` returns only archived sessions.
             Without server authentication, ``"mine"`` and ``"shared"``
             behave like ``"all"``. Always sent explicitly to the server.
+        :param kind: ``"default"`` returns top-level sessions,
+            ``"sub_agent"`` returns children, and ``"any"`` includes both.
+            ``None`` leaves the server's top-level-only default unchanged.
         :returns: List of :class:`SessionListItem`.
         :raises StaleCursorError: If ``after``/``before`` names a session
             that has since been deleted. The walk cannot continue from
@@ -661,6 +675,8 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        if kind is not None:
+            params["kind"] = kind
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,

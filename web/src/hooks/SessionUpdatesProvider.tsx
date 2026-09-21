@@ -38,7 +38,7 @@ import {
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
-import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import { isModalHostResolved, resolveModalHost, setSessionHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
 
@@ -74,6 +74,11 @@ function applyItemsToCache(
   const itemsById = new Map<string, SessionListWireItem>();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
+    // Keep replica affinity current even when this child has no sidebar row.
+    // Partial legacy frames without either host field leave the mapping alone.
+    if ("routing_host_id" in item || "host_id" in item) {
+      setSessionHost(item.id, item.routing_host_id ?? item.host_id);
+    }
     itemsById.set(
       item.id,
       nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),

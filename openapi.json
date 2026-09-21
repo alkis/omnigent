@@ -5935,6 +5935,18 @@
             "description": "Per-session reasoning-effort hint.",
             "title": "Reasoning Effort"
           },
+          "routing_host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replica-routing host, including a colocated child's inherited host without changing host ownership.",
+            "title": "Routing Host Id"
+          },
           "runner_id": {
             "anyOf": [
               {
@@ -6884,6 +6896,18 @@
             ],
             "description": "The id of this session's spawn-tree root, e.g. `\"conv_root1\"`. Equals `id` for top-level sessions; for sub-agents it points at the top-level ancestor. Lets orchestration tools (e.g. `sys_session_close`) confirm a target shares the caller's spawn tree over the REST path. `None` only when the underlying row predates the `root_conversation_id` column (not expected post-migration).",
             "title": "Root Conversation Id"
+          },
+          "routing_host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host used for replica routing, inherited from a colocated ancestor when the child has no host of its own.",
+            "title": "Routing Host Id"
           },
           "runner_id": {
             "anyOf": [

@@ -594,6 +594,28 @@ describe("runner binding", () => {
     expect(session?.hostId).toBe("host_a1b2");
   });
 
+  it("routes a colocated child through its parent host without claiming host ownership", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "child_routing_host",
+        agent_id: "agent_pi",
+        runner_id: "runner_shared",
+        host_id: null,
+        routing_host_id: "host_parent",
+        status: "running",
+        created_at: 1704067200,
+        items: [],
+      }),
+    );
+
+    const session = await getSession("child_routing_host");
+
+    expect(session.hostId).toBeNull();
+    // HTTP and terminal WebSocket requests share this route lookup.
+    expect(getSessionHost(session.id)).toBe("host_parent");
+    setSessionHost(session.id, null);
+  });
+
   it("returns null when no runner is online", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ data: [] }));
 
