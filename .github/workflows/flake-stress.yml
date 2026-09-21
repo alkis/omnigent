@@ -53,6 +53,10 @@ env:
   # Pin the PyPI index for uv/pip resolution (same as ci.yml).
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
+  # Match ci.yml's hang-guard scale. Unset, tests.budgets.budget() waits run
+  # at 1x here while the lane being reproduced runs at 4x, so a budget-guarded
+  # test fails under stress and looks flaky when ci.yml would have passed it.
+  OMNIGENT_TEST_TIMEOUT_SCALE: "4"
 
 jobs:
   prep:
