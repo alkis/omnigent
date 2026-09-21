@@ -101,26 +101,6 @@ describe("session drafts", () => {
     expect(getSessionDraft("temp:failed")).toBeUndefined();
     expect(sessionStorage.getItem(key)).toBeNull();
   });
-
-  it("keeps a recovered copy's provenance across a reload and knows whether its record is stored", async () => {
-    const first = await import("./sessionDrafts");
-    first.setSessionDraft("conv", { text: "delivered?", files: [], recoveredFrom: "sid_r" });
-    first.recordUnsentMessage("sid_r", {
-      conversationId: "conv",
-      text: "delivered?",
-      stableId: "sid_r",
-    });
-    vi.resetModules();
-    const second = await import("./sessionDrafts");
-    expect(second.getSessionDraft("conv")).toEqual({
-      text: "delivered?",
-      files: [],
-      recoveredFrom: "sid_r",
-    });
-    expect(second.hasUnsentMessage("sid_r")).toBe(true);
-    second.clearUnsentMessage("sid_r");
-    expect(second.hasUnsentMessage("sid_r")).toBe(false);
-  });
 });
 
 describe("unsent messages", () => {
@@ -172,17 +152,32 @@ describe("unsent messages", () => {
     expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_other"]);
   });
 
-  it("acknowledges records whose ids the transcript already holds", async () => {
+  it("drops a previous page's record whose POST got no answer instead of offering it", async () => {
+    // The server may have processed that message; this page can never learn
+    // the outcome, so the message must not be resent. A record the server
+    // answered with a rejection is recoverable again.
     sessionStorage.setItem(
       unsentKey,
       JSON.stringify({
-        sid_sent: { conversationId: "conv", text: "delivered", stableId: "sid_sent" },
-        sid_lost: { conversationId: "conv", text: "never landed", stableId: "sid_lost" },
+        sid_lost: { conversationId: "conv", text: "in flight at reload", postedAt: 1 },
+        sid_safe: { conversationId: "conv", text: "never went out" },
       }),
     );
-    const { acknowledgeUnsentMessages } = await import("./sessionDrafts");
-    acknowledgeUnsentMessages(["msg_other", "sid_sent"]);
-    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_lost"]);
+    const { peekUnsentMessage, markUnsentPosted, markUnsentAnswered, recordUnsentMessage } =
+      await import("./sessionDrafts");
+    expect(peekUnsentMessage("conv")?.recordId).toBe("sid_safe");
+    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_safe"]);
+
+    recordUnsentMessage("sid_now", { conversationId: "conv", text: "posted now" });
+    markUnsentPosted("sid_now");
+    expect(JSON.parse(sessionStorage.getItem(unsentKey)!).sid_now.postedAt).toEqual(
+      expect.any(Number),
+    );
+    markUnsentAnswered("sid_now");
+    expect(JSON.parse(sessionStorage.getItem(unsentKey)!).sid_now).toEqual({
+      conversationId: "conv",
+      text: "posted now",
+    });
   });
 
   it("never offers a record written during this page", async () => {

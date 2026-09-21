@@ -132,7 +132,6 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   getSessionDraft,
-  hasUnsentMessage,
   markUnsentRecovered,
   peekUnsentMessage,
   promoteSessionDraft,
@@ -2520,8 +2519,6 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
-  const loadingConversation = useChatStore((s) => s.loadingConversation);
-  const pendingRetry = useChatStore((s) => s.pendingRetry);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -2762,11 +2759,7 @@ function ComposerImpl(
       !isTempConvId(conversationId)
         ? promoteSessionDraft(previousConversationId, conversationId)
         : undefined;
-    const saved = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
-    // An untouched recovered copy is restored by the recovery effect below once
-    // history has loaded or failed, so one the snapshot shows delivered is
-    // dropped instead of coming back without its identity.
-    const restored = saved?.recoveredFrom === undefined ? saved : undefined;
+    const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
@@ -3022,49 +3015,17 @@ function ComposerImpl(
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
     if (failedSendDraft === null) {
-      // A send the server never acknowledged before a reload: recover it into
-      // an empty composer with its identity, so a resend dedupes (the record id
-      // is the stable_id for a plain message, the record key for a command). If
-      // the composer already holds that same text (a recovery persisted as the
+      // A send the server never accepted before a reload (its POST never went
+      // out, or was answered with a rejection): recover it into an empty
+      // composer with its identity, so a resend dedupes (the record id is the
+      // stable_id for a plain message, the record key for a command). If the
+      // composer already holds that same text (a recovery persisted as the
       // draft, then reloaded again), only the identity is missing. Newer typed
       // text wins and leaves the record unrecovered for a later visit; only an
-      // acknowledgment removes it.
-      // Not before history has loaded or definitively failed: the snapshot
-      // acknowledges a record whose message was delivered (its item is in the
-      // transcript), which must not be offered as unsent.
-      if (!conversationId || loadingConversation) return;
+      // answer from the server removes it.
+      if (!conversationId) return;
       const unsent = peekUnsentMessage(conversationId);
-      if (unsent === undefined) {
-        // A recovered copy persisted as this conversation's draft: restore it
-        // while its record is still unacknowledged (a remount on this page), or
-        // drop it once the snapshot showed the message delivered — unless the
-        // user has typed since, in which case their text stays.
-        const copy = getSessionDraft(conversationId);
-        if (copy?.recoveredFrom === undefined) return;
-        if (hasUnsentMessage(copy.recoveredFrom)) {
-          if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
-          // The identity may already be armed (a remount keeps conversation state,
-          // and this effect re-runs as the identity it arms lands); the text is
-          // restored either way.
-          if (useChatStore.getState().pendingRetry?.stableId !== copy.recoveredFrom) {
-            useChatStore.setState({
-              pendingRetry: { stableId: copy.recoveredFrom, text: copy.text, files: [] },
-            });
-          }
-          replaceText(copy.text, copy.replyDraft);
-          textareaRef.current = tailTextareaRef.current;
-          dirtyRef.current = false;
-          return;
-        }
-        if (valueRef.current === copy.text && filesRef.current.length === 0) {
-          replaceText("", undefined);
-        }
-        setSessionDraft(conversationId, { text: "", files: [] });
-        if (useChatStore.getState().pendingRetry?.stableId === copy.recoveredFrom) {
-          useChatStore.setState({ pendingRetry: null });
-        }
-        return;
-      }
+      if (unsent === undefined) return;
       const sameText =
         valueRef.current.trim() === unsent.text.trim() && filesRef.current.length === 0;
       if (!sameText && (valueRef.current.trim() !== "" || filesRef.current.length > 0)) return;
@@ -3075,18 +3036,7 @@ function ComposerImpl(
       if (sameText) return;
       replaceText(unsent.text, unsent.replyDraft);
       textareaRef.current = tailTextareaRef.current;
-      // Persist the copy tagged with its record, not as an ordinary draft: the
-      // first edit re-saves it untagged (`dirtyRef`, reset here so earlier
-      // typing that was cleared cannot overwrite the tag), and a copy still
-      // tagged when the record is acknowledged is dropped above instead of
-      // resent.
-      dirtyRef.current = false;
-      setSessionDraft(conversationId, {
-        text: unsent.text,
-        files: [],
-        replyDraft: unsent.replyDraft,
-        recoveredFrom: unsent.recordId,
-      });
+      dirtyRef.current = true;
       if (!isMobileRef.current) textareaRef.current?.focus();
       return;
     }
@@ -3119,14 +3069,7 @@ function ComposerImpl(
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [
-    failedSendDraft,
-    conversationId,
-    settledConversationId,
-    loadingConversation,
-    pendingRetry,
-    replaceText,
-  ]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.

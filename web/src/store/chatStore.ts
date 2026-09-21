@@ -115,8 +115,9 @@ import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // ids without an import cycle back to the store.
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
 import {
-  acknowledgeUnsentMessages,
   clearUnsentMessage,
+  markUnsentAnswered,
+  markUnsentPosted,
   recordUnsentMessage,
 } from "@/lib/sessionDrafts";
 import { useTerminalActivityStore } from "./terminalActivity";
@@ -2003,6 +2004,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...fileBlocks,
           ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
         ];
+        markUnsentPosted(stableId);
         await postEvent(conversationId, {
           type: "message",
           data: { role: "user", content, stable_id: stableId },
@@ -2010,7 +2012,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // Accepted: the durable copy is done.
         clearUnsentMessage(stableId);
       })()
-        .catch(() => {
+        .catch((err: unknown) => {
+          settleUnsentRecord(stableId, err);
           backgroundFlushCooldownUntil.set(
             conversationId,
             Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
@@ -2254,6 +2257,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
       }
 
+      markUnsentPosted(stableId);
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2311,13 +2315,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const { message, code } = describeSendFailure(err);
-      // A definitive rejection (400/413/415…) is the server's answer too: the
-      // durable copy is done. Transient or uncertain failures keep it, and so
-      // does a 401: the auth layer redirects to login, and the text should
-      // survive that round trip.
-      if (isDefinitiveRequestError(err) && !(err instanceof ApiError && err.status === 401)) {
-        clearUnsentMessage(stableId);
-      }
+      settleUnsentRecord(stableId, err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
@@ -2487,6 +2485,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
+      markUnsentPosted(unsentRecordId);
       const postResult = await postEvent(sessionId, {
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
@@ -2526,6 +2525,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      settleUnsentRecord(unsentRecordId, err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
       // forever. Target `postedSessionId ?? submitConversationId` (mirrors
@@ -3151,6 +3151,19 @@ function pendingRetryIdentity(
   const outgoing = files ?? [];
   if (outgoing.length !== pending.files.length) return null;
   return outgoing.every((file, i) => file === pending.files[i]) ? pending.stableId : null;
+}
+
+/**
+ * Settle a message's durable copy after its POST failed. A response from the
+ * server means the message was not processed: the copy stays recoverable, and
+ * a definitive rejection (a 4xx other than 401, which only sends the user
+ * through login) retires it. No response — a network failure — leaves the
+ * outcome unknown, so the copy keeps its `postedAt` and is never resent.
+ */
+function settleUnsentRecord(recordId: string, err: unknown): void {
+  if (!(err instanceof ApiError)) return;
+  markUnsentAnswered(recordId);
+  if (isDefinitiveRequestError(err) && err.status !== 401) clearUnsentMessage(recordId);
 }
 
 function queuedSendOptions(
@@ -4231,17 +4244,6 @@ async function hydrateHistoryOnce(
     const [session, page] = await fetchSnapshotWithRetry(id, queryClient, controller, obsolete);
     if (obsolete()) return;
     const items = page.items;
-    // Committed items acknowledge durable records keyed by their id: a send
-    // whose response never arrived but whose item is in the transcript was
-    // delivered, so it must not be offered for recovery again.
-    const acknowledged = acknowledgeUnsentMessages(items.map((it) => it.id));
-    if (acknowledged.size > 0) {
-      set((state) =>
-        state.pendingRetry !== null && acknowledged.has(state.pendingRetry.stableId)
-          ? { pendingRetry: null }
-          : {},
-      );
-    }
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 

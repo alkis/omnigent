@@ -2462,42 +2462,40 @@ describe("chatStore — send (first-send ordering)", () => {
     status = 401;
     await useChatStore.getState().send("after re-login", "agent_xyz");
     expect(records()).toHaveLength(2);
-  });
+    // Every answered record is recoverable: no POST is left in doubt.
+    const stored = (): Record<string, { postedAt?: number }> =>
+      JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
+    expect(Object.values(stored()).every((r) => r.postedAt === undefined)).toBe(true);
 
-  it("acknowledges a durable record whose item the snapshot already holds", async () => {
-    // The POST landed but its response never reached the browser: the item is
-    // persisted under the send's stable_id, so hydration retires the record
-    // instead of offering an already-delivered message for recovery.
-    const delivered = userMessage("resp_d", "made it");
-    seedSession("conv_ack", [delivered]);
-    sessionStorage.setItem(
-      "omnigent.unsentMessages",
-      JSON.stringify({
-        [delivered.id]: { conversationId: "conv_ack", text: "made it", stableId: delivered.id },
-        sid_lost: { conversationId: "conv_ack", text: "never landed", stableId: "sid_lost" },
-      }),
-    );
-
-    let failSnapshot = true;
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url.split("?")[0] === "/v1/sessions/conv_ack" && (init?.method ?? "GET") === "GET") {
-        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+    // No answer at all: the server may have processed it, so the copy keeps
+    // its posted mark and a later page will not offer it for resend.
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return Promise.reject(new TypeError("Failed to fetch"));
       }
       return defaultFetchHandler(input, init);
     });
-    await useChatStore.getState().switchTo("conv_ack");
-    const entry = conversationRegistry.peek("conv_ack")!;
-    // Recovery armed the delivered message's identity while history was down.
-    entry.setState({ pendingRetry: { stableId: delivered.id, text: "made it", files: [] } });
+    await useChatStore.getState().send("did it land?", "agent_xyz");
+    const uncertain = Object.values(stored()).filter((r) => r.postedAt !== undefined);
+    expect(uncertain).toHaveLength(1);
+  });
 
-    failSnapshot = false;
-    await retryConversationHistory("conv_ack");
+  it("retires a slash command's durable copy on a definitive rejection", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "no" }, { ok: false, status: 400 });
+      }
+      return defaultFetchHandler(input, init);
+    });
 
-    expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
-      "sid_lost",
-    ]);
-    expect(entry.getState().pendingRetry).toBeNull();
+    await useChatStore.getState().sendSlashCommand("review", "", "agent_xyz");
+
+    expect(sessionStorage.getItem("omnigent.unsentMessages")).toBeNull();
   });
 
   it("resends a recovered slash command under its record id and clears it on acknowledgment", async () => {
@@ -13795,6 +13793,28 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
     expect(records()).toEqual({});
+  });
+
+  it("retires a background send's durable copy on a definitive rejection", async () => {
+    // Same rule as a foreground send: a 413 is the server's final answer, so
+    // the message must not come back as unsent after a reload.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(String(input)) && init?.method === "POST") {
+        return mockResponse({}, { ok: false, status: 413 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "too large", conversationId: "conv_bg" }],
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+
+    expect(sessionStorage.getItem("omnigent.unsentMessages")).toBeNull();
   });
 
   it("does not flush a non-active conversation that is not idle", async () => {

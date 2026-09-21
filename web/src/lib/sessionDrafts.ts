@@ -3,13 +3,6 @@ import { readComposerDraft, type ComposerDraft } from "./replyDraft";
 
 export interface SessionDraft extends ComposerDraft {
   files: File[];
-  /**
-   * The unsent record this draft is an untouched recovered copy of. The
-   * composer's recovery owns such a draft: it is restored while the record is
-   * unacknowledged and dropped once the transcript shows the message delivered.
-   * The first edit makes it an ordinary draft again.
-   */
-  recoveredFrom?: string;
 }
 
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
@@ -26,9 +19,7 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
     const drafts = new Map<string, SessionDraft>();
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      if (!draft?.text) continue;
-      const recoveredFrom = recoveredFromOf(entry);
-      drafts.set(id, { ...draft, files: [], ...(recoveredFrom ? { recoveredFrom } : {}) });
+      if (draft?.text) drafts.set(id, { ...draft, files: [] });
     }
     return drafts;
   } catch {
@@ -36,25 +27,14 @@ function loadDraftsFromStorage(): Map<string, SessionDraft> {
   }
 }
 
-function recoveredFromOf(entry: unknown): string | undefined {
-  if (typeof entry !== "object" || entry === null) return undefined;
-  const value = (entry as { recoveredFrom?: unknown }).recoveredFrom;
-  return typeof value === "string" ? value : undefined;
-}
-
 function saveDraftsToStorage(): void {
   if (typeof window === "undefined") return;
   try {
-    const entries: Record<string, string | (ComposerDraft & { recoveredFrom?: string })> = {};
+    const entries: Record<string, string | ComposerDraft> = {};
     for (const [id, draft] of sessionDrafts) {
-      if (!draft.text) continue;
-      entries[id] =
-        draft.replyDraft || draft.recoveredFrom
-          ? {
-              text: draft.text,
-              ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
-              ...(draft.recoveredFrom ? { recoveredFrom: draft.recoveredFrom } : {}),
-            }
+      if (draft.text)
+        entries[id] = draft.replyDraft
+          ? { text: draft.text, replyDraft: draft.replyDraft }
           : draft.text;
     }
     if (Object.keys(entries).length === 0) {
@@ -151,15 +131,22 @@ export function useHasSessionDraft(conversationId: string): boolean {
 const UNSENT_MESSAGES_KEY = "omnigent.unsentMessages";
 
 /**
- * A message whose POST the server has not acknowledged, persisted so a reload
+ * A message whose POST the server has not answered, persisted so a reload
  * mid-send can recover it. One record per message (keyed by the send's id), so
  * overlapping sends never clobber each other, and kept apart from the editable
  * composer draft: text the user is typing meanwhile must never be overwritten.
+ *
+ * Only a message the server provably never accepted is recovered: one whose
+ * POST never started, or one the server answered with a rejection. A POST that
+ * got no answer (`postedAt` set) may have been processed, so it is never
+ * offered for resend — the server has no idempotency for a consumed message.
  */
 export interface UnsentMessage extends ComposerDraft {
   conversationId: string;
   /** Send identity, when the send has one, so a recovered resend dedupes server-side. */
   stableId?: string;
+  /** When the POST went out. Cleared once the server answers; set = outcome unknown. */
+  postedAt?: number;
 }
 
 // Record ids written or recovered during this page's life. A record written
@@ -179,15 +166,17 @@ function loadUnsentMessages(): Record<string, UnsentMessage> {
     const messages: Record<string, UnsentMessage> = {};
     for (const [id, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      const { conversationId, stableId } = entry as {
+      const { conversationId, stableId, postedAt } = entry as {
         conversationId?: unknown;
         stableId?: unknown;
+        postedAt?: unknown;
       };
       if (!draft?.text || typeof conversationId !== "string") continue;
       messages[id] = {
         ...draft,
         conversationId,
         ...(typeof stableId === "string" ? { stableId } : {}),
+        ...(typeof postedAt === "number" ? { postedAt } : {}),
       };
     }
     return messages;
@@ -227,25 +216,22 @@ export function clearUnsentMessage(recordId: string): void {
   );
 }
 
-/**
- * The transcript already holds items with these ids: a record keyed by one of
- * them was delivered (a plain message's record id is its `stable_id`, and the
- * server persists the item under that id), so it is acknowledged even though
- * the POST's response never reached this client.
- */
-export function acknowledgeUnsentMessages(itemIds: Iterable<string>): Set<string> {
+/** The POST is going out: until the server answers, the outcome is unknown. */
+export function markUnsentPosted(recordId: string): void {
   const messages = loadUnsentMessages();
-  const delivered = new Set([...itemIds].filter((id) => id in messages));
-  if (delivered.size === 0) return delivered;
-  saveUnsentMessages(
-    Object.fromEntries(Object.entries(messages).filter(([id]) => !delivered.has(id))),
-  );
-  return delivered;
+  if (!(recordId in messages)) return;
+  messages[recordId] = { ...messages[recordId]!, postedAt: Date.now() };
+  saveUnsentMessages(messages);
 }
 
-/** Whether `recordId` is still stored, i.e. its POST was never acknowledged. */
-export function hasUnsentMessage(recordId: string): boolean {
-  return recordId in loadUnsentMessages();
+/** The server answered with a rejection: the message was not processed, so it can be recovered. */
+export function markUnsentAnswered(recordId: string): void {
+  const messages = loadUnsentMessages();
+  const record = messages[recordId];
+  if (record === undefined || record.postedAt === undefined) return;
+  const { postedAt: _posted, ...answered } = record;
+  messages[recordId] = answered;
+  saveUnsentMessages(messages);
 }
 
 export interface RecoverableUnsentMessage extends UnsentMessage {
@@ -254,12 +240,21 @@ export interface RecoverableUnsentMessage extends UnsentMessage {
 }
 
 /**
- * The oldest unacknowledged message for `conversationId` that this page has
- * not yet recovered, or `undefined`. Does not mark it: the caller decides
- * whether it can be shown, then calls `markUnsentRecovered`.
+ * The oldest recoverable message for `conversationId` that this page has not
+ * yet recovered, or `undefined`. Does not mark it: the caller decides whether
+ * it can be shown, then calls `markUnsentRecovered`. A previous page's record
+ * whose POST got no answer is dropped instead: the server may have processed
+ * it, and this page can never learn the outcome.
  */
 export function peekUnsentMessage(conversationId: string): RecoverableUnsentMessage | undefined {
-  for (const [recordId, message] of Object.entries(loadUnsentMessages())) {
+  const stored = loadUnsentMessages();
+  const uncertain = (recordId: string, message: UnsentMessage): boolean =>
+    message.postedAt !== undefined && !unsentThisPage.has(recordId);
+  const messages = Object.fromEntries(
+    Object.entries(stored).filter(([recordId, message]) => !uncertain(recordId, message)),
+  );
+  if (Object.keys(messages).length !== Object.keys(stored).length) saveUnsentMessages(messages);
+  for (const [recordId, message] of Object.entries(messages)) {
     if (message.conversationId !== conversationId || unsentThisPage.has(recordId)) continue;
     return { ...message, recordId };
   }

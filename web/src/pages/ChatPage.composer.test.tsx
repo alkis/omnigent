@@ -16,7 +16,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
   clearSessionDrafts,
-  clearUnsentMessage,
   getSessionDraft,
   hasSessionDraft,
   setSessionDraft,
@@ -3248,113 +3247,6 @@ describe("Composer reply quotes", () => {
     expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
       "sid_reload",
     ]);
-  });
-
-  it("waits for history to load before offering a recovered send", () => {
-    // Hydration acknowledges records whose items the snapshot already holds, so
-    // recovery must not run ahead of it and offer a delivered message as unsent.
-    useChatStore.setState({ pendingRetry: null, loadingConversation: true });
-    sessionStorage.setItem(
-      "omnigent.unsentMessages",
-      JSON.stringify({
-        sid_wait: { conversationId: "conv_test", text: "after history", stableId: "sid_wait" },
-      }),
-    );
-    render(<Composer {...composerProps()} />);
-    expect(textarea()).toHaveValue("");
-    expect(useChatStore.getState().pendingRetry).toBeNull();
-    act(() => useChatStore.setState({ loadingConversation: false }));
-    expect(textarea()).toHaveValue("after history");
-    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_wait");
-  });
-
-  it("drops an untouched recovered copy once the snapshot acknowledged its record", () => {
-    // Page 1 recovered the message and persisted it as a tagged draft; on this
-    // page hydration found the item, so the record is gone. The copy must not
-    // come back as an ordinary draft: sent again it would run twice.
-    useChatStore.setState({ pendingRetry: null });
-    setSessionDraft("conv_test", {
-      text: "already delivered",
-      files: [],
-      recoveredFrom: "sid_gone",
-    });
-    render(<Composer {...composerProps()} />);
-    expect(textarea()).toHaveValue("");
-    expect(getSessionDraft("conv_test")).toBeUndefined();
-  });
-
-  it("restores an untouched recovered copy across a remount while its record is unacknowledged", () => {
-    useChatStore.setState({ pendingRetry: null });
-    sessionStorage.setItem(
-      "omnigent.unsentMessages",
-      JSON.stringify({
-        sid_copy: { conversationId: "conv_test", text: "still unsent", stableId: "sid_copy" },
-      }),
-    );
-    render(<Composer {...composerProps()} />).unmount();
-    // Recovery persisted a tagged copy, not an ordinary draft, and the identity
-    // stays armed in conversation state across the remount.
-    expect(getSessionDraft("conv_test")?.recoveredFrom).toBe("sid_copy");
-    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_copy");
-    render(<Composer {...composerProps()} />);
-    expect(textarea()).toHaveValue("still unsent");
-    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_copy");
-  });
-
-  it("keeps the recovered copy tagged when the composer was edited and cleared before recovery", () => {
-    // Earlier typing leaves the draft dirty; recovery must not let the live
-    // persist effect re-save its copy untagged, or the copy would outlive the
-    // record's acknowledgment as an ordinary draft.
-    useChatStore.setState({ pendingRetry: null, loadingConversation: true });
-    sessionStorage.setItem(
-      "omnigent.unsentMessages",
-      JSON.stringify({
-        sid_dirty: { conversationId: "conv_test", text: "recovered late", stableId: "sid_dirty" },
-      }),
-    );
-    render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "started something" } });
-    fireEvent.change(textarea(), { target: { value: "" } });
-    act(() => useChatStore.setState({ loadingConversation: false }));
-    expect(textarea()).toHaveValue("recovered late");
-    expect(getSessionDraft("conv_test")).toMatchObject({
-      text: "recovered late",
-      recoveredFrom: "sid_dirty",
-    });
-  });
-
-  it("clears an untouched recovered copy when its record is acknowledged in place, but keeps an edit", () => {
-    useChatStore.setState({ pendingRetry: null });
-    sessionStorage.setItem(
-      "omnigent.unsentMessages",
-      JSON.stringify({
-        sid_live: { conversationId: "conv_test", text: "recovered", stableId: "sid_live" },
-      }),
-    );
-    render(<Composer {...composerProps()} />);
-    expect(textarea()).toHaveValue("recovered");
-    // Retry succeeded meanwhile: hydration retired the record and its identity.
-    act(() => {
-      clearUnsentMessage("sid_live");
-      useChatStore.setState({ pendingRetry: null });
-    });
-    expect(textarea()).toHaveValue("");
-    expect(getSessionDraft("conv_test")).toBeUndefined();
-    cleanup();
-
-    sessionStorage.setItem(
-      "omnigent.unsentMessages",
-      JSON.stringify({
-        sid_edit2: { conversationId: "conv_test", text: "recovered", stableId: "sid_edit2" },
-      }),
-    );
-    render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "recovered, then edited" } });
-    act(() => {
-      clearUnsentMessage("sid_edit2");
-      useChatStore.setState({ pendingRetry: null });
-    });
-    expect(textarea()).toHaveValue("recovered, then edited");
   });
 
   it("submits a recovered send with exactly the text its identity was armed for", () => {
