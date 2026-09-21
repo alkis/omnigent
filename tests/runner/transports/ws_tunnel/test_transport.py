@@ -84,7 +84,9 @@ async def test_read_timeout_bounds_the_wait_for_the_response_head() -> None:
 
     Before this, the head wait had no deadline, so every ``timeout=`` a
     caller passed over the tunnel was a no-op and a stalled runner held the
-    request until its tunnel dropped.
+    request until its tunnel dropped. The handler is not cancelled: runner
+    handlers are not uniformly safe to cancel mid-request, and a caller that
+    gives up before the head has always just dropped the late response.
     """
     reg = TunnelRegistry()
     reg.register("r1", _NoopWS(), _hello())
@@ -97,7 +99,8 @@ async def test_read_timeout_bounds_the_wait_for_the_response_head() -> None:
     assert session is not None
     assert session.in_flight == {}
     frames = await _sent_frames(reg, "r1")
-    assert _cancels(frames) == [(_request_id(frames), "read_timeout")]
+    assert _request_id(frames)  # the request itself was sent
+    assert _cancels(frames) == []
 
 
 @pytest.mark.asyncio
@@ -121,7 +124,10 @@ async def test_read_timeout_none_waits_for_a_slow_head() -> None:
 
 @pytest.mark.asyncio
 async def test_read_timeout_bounds_each_body_frame() -> None:
-    """A head followed by silence times out while reading the body and frees the slot."""
+    """A head followed by silence times out while reading the body, frees the slot, and cancels.
+
+    Cancelling here mirrors a consumer that stops reading the stream.
+    """
     reg = TunnelRegistry()
     reg.register("r1", _NoopWS(), _hello())
     transport = WSTunnelTransport(reg, "r1")

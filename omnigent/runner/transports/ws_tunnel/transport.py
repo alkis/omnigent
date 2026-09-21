@@ -161,10 +161,13 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
     a higher-level routing concern, not this transport's).
 
     The httpx ``read`` timeout is honored: waiting for the response head or
-    for a body frame past it raises :class:`httpx.ReadTimeout`, cancels the
-    runner-side dispatch, and frees the request slot; ``read=None`` waits
-    without bound. ``connect``, ``pool`` and ``write`` do not apply: the
-    tunnel is already connected and a request is a single frame.
+    for a body frame past it raises :class:`httpx.ReadTimeout` and frees the
+    request slot; ``read=None`` waits without bound. A body-frame timeout
+    also cancels the runner-side dispatch, as a consumer that stops reading
+    does; a head timeout leaves the handler to finish and drops its late
+    response, as a caller that gives up before the head always has.
+    ``connect``, ``pool`` and ``write`` do not apply: the tunnel is already
+    connected and a request is a single frame.
 
     :param registry: The :class:`TunnelRegistry` that owns the runner's
         live WebSocket and reassembly state.
@@ -218,11 +221,13 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             )
             # Block until the response head arrives, the tunnel aborts the
             # request, or the read budget runs out. The future belongs to
-            # the registry, so shield it from wait_for's cancellation.
+            # the registry, so shield it from wait_for's cancellation. The
+            # runner keeps processing and its late response is dropped with
+            # the slot: like a caller that gives up before the head, this
+            # does not cancel a handler mid-request.
             try:
                 head = await _wait_for_read(asyncio.shield(state.head_future), read_timeout)
             except asyncio.TimeoutError:
-                await _cancel_request(self._registry, state, req_id, "read_timeout")
                 raise httpx.ReadTimeout(
                     f"runner {self._runner_id!r} did not answer within {read_timeout:g}s",
                     request=request,
