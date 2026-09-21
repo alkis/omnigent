@@ -27,7 +27,6 @@ FULL_SUITE_PREFIXES = (
     ".github/actions/",
     ".github/scripts/ci/",
     ".github/workflows/",
-    "omnigent/",
     "tests/e2e_ui/",
 )
 FULL_SUITE_PATHS = {
