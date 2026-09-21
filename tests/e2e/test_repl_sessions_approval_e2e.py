@@ -11,7 +11,7 @@ pre-configured before each pexpect interaction.
 
 Usage::
 
-    python -m pytest tests/e2e/test_repl_sessions_approval_e2e.py -v --timeout=120
+    python -m pytest tests/e2e/test_repl_sessions_approval_e2e.py -v
 """
 
 from __future__ import annotations
@@ -139,9 +139,45 @@ def _spawn_repl_with_args(
     )
 
 
-def _wait_for_prompt_ready(child: Any, timeout: float = 60.0) -> None:
+# ── PTY wait budgets ────────────────────────────────────
+# Every test here spawns its own ``omnigent run``, so each one pays a full cold
+# start: interpreter import, server spawn, runner zygote, session create. That
+# costs 60-85s on a busy machine, which put the old 60s prompt budget right on
+# the edge -- it timed out on 13 unrelated branches. Sizes below are for a
+# saturated runner; an expect returns the moment its pattern lands, so the
+# normal path costs the same as before.
+_BOOT_S = float(os.environ.get("OMNIGENT_E2E_REPL_BOOT_S", "150"))
+_TURN_S = float(os.environ.get("OMNIGENT_E2E_REPL_TURN_S", "75"))
+# A verdict echo is local rendering once the keystroke lands, not a round trip.
+_VERDICT_S = 20.0
+
+# The e2e lane runs pytest with --timeout=180, which cannot cover one boot plus
+# one turn plus the drains below. A marker outranks the command-line value, so
+# raise the per-test cap to something the budgets above actually fit inside.
+pytestmark = pytest.mark.timeout(360)
+
+
+def _expect(child: Any, pattern: str, *, timeout: float, what: str) -> None:
+    """``child.expect`` that reports the real PTY tail when it times out.
+
+    pexpect truncates its own dump to 100 characters; on this spinner-driven
+    REPL those are all working-indicator repaints and say nothing about why the
+    wait failed. Re-raise the same exception type with the stripped tail so the
+    next regression is diagnosable instead of anonymous.
+    """
+    try:
+        child.expect(pattern, timeout=timeout)
+    except pexpect.TIMEOUT:
+        tail = _strip_ansi(child.before or "")[-1500:]
+        raise pexpect.TIMEOUT(
+            f"timed out after {timeout:.0f}s waiting for {what} ({pattern!r}).\n"
+            f"PTY tail (ANSI-stripped):\n{tail}"
+        ) from None
+
+
+def _wait_for_prompt_ready(child: Any, timeout: float | None = None) -> None:
     """Wait for the REPL prompt (``❯``) to appear."""
-    child.expect("❯", timeout=timeout)
+    _expect(child, "❯", timeout=_BOOT_S if timeout is None else timeout, what="the REPL prompt")
 
 
 def _read_pending(child: Any, seconds: float = 0.3) -> str:
@@ -213,9 +249,9 @@ def test_sessions_single_approval_allows_llm_response(
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=_TURN_S, what="the approval prompt")
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=_VERDICT_S, what="the approval verdict")
 
         buffered = _read_pending(child, seconds=5.0)
         buffered += _read_pending(child, seconds=3.0)
@@ -246,9 +282,9 @@ def test_sessions_refusal_shows_deny_sentinel(
     try:
         _wait_for_prompt_ready(child)
         child.send("Hello\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=_TURN_S, what="the approval prompt")
         child.send("n\r")
-        child.expect("refused", timeout=10)
+        _expect(child, "refused", timeout=_VERDICT_S, what="the refusal verdict")
 
         buffered = _read_pending(child, seconds=5.0)
         assert "DENIED" in buffered.upper() or "refused" in buffered.lower(), (
@@ -277,16 +313,16 @@ def test_sessions_two_turns_fires_one_approval_per_turn(
 
         # Turn 1.
         child.send("First message\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=_TURN_S, what="the approval prompt")
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=_VERDICT_S, what="the approval verdict")
         _read_pending(child, seconds=5.0)
 
         # Turn 2.
         child.send("Second message\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=_TURN_S, what="the approval prompt")
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=_VERDICT_S, what="the approval verdict")
         buffered = _read_pending(child, seconds=5.0)
         assert re.search(r"[A-Za-z]{3,}", buffered), (
             f"No reply after second-turn approval.\nBuffer:\n{buffered[:800]}"
@@ -314,9 +350,9 @@ def test_sessions_approve_always_caches_for_later_turns(
 
         # Turn 1: approve always.
         child.send("First\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=_TURN_S, what="the approval prompt")
         child.send("a\r")
-        child.expect("approved always", timeout=10)
+        _expect(child, "approved always", timeout=_VERDICT_S, what="the approve-always verdict")
         _read_pending(child, seconds=5.0)
 
         # Turn 2: should auto-approve (no prompt).
@@ -371,11 +407,11 @@ def test_sessions_tool_call_approval_allows_tool(
 
     child = _spawn_sessions_repl(tool_gate_yaml, repl_env)
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child)
         child.send("Use the tool\r")
-        child.expect("approval required", timeout=30)
+        _expect(child, "approval required", timeout=_TURN_S, what="the approval prompt")
         child.send("y\r")
-        child.expect("approved", timeout=10)
+        _expect(child, "approved", timeout=_VERDICT_S, what="the approval verdict")
         buffered = _read_pending(child, seconds=8.0)
         assert re.search(r"[A-Za-z]{3,}", buffered), (
             f"No response after tool approval.\nBuffer:\n{buffered[:800]}"
@@ -419,7 +455,7 @@ def test_sessions_default_flag_works(
 
     child = _spawn_repl_with_args(yaml_path, repl_env)
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child)
         child.send("Say hello in exactly five words\r")
 
         buffered = _read_pending(child, seconds=10.0)
