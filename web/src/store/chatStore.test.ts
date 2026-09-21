@@ -81,8 +81,10 @@ import {
 import { conversationRegistry } from "./conversationRegistry";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
 import {
+  getStreamSlotManager,
   resetStreamSlotManager,
   setStreamSlotManagerForTest,
+  STREAM_SLOT_LOCK_REQUEST_TIMEOUT_MS,
   type StreamSlot,
   type StreamSlotManager,
 } from "./streamSlots";
@@ -13567,6 +13569,60 @@ describe("chatStore — attributing pre-turn blocks to the turn", () => {
 });
 
 describe("chatStore — origin-wide stream slots", () => {
+  it("fails open without requesting Web Locks while the document is hidden", async () => {
+    const request = vi.fn();
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      locks: { request },
+    });
+    resetStreamSlotManager();
+
+    await expect(getStreamSlotManager().tryAcquire()).resolves.toBeNull();
+    expect(request).not.toHaveBeenCalled();
+    visibility.mockRestore();
+  });
+
+  it("fails open when Chromium never runs an ifAvailable lock callback", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      locks: {
+        request: vi.fn(() => new Promise<void>(() => {})),
+      },
+    });
+    resetStreamSlotManager();
+
+    const acquisition = getStreamSlotManager().tryAcquire();
+    await vi.advanceTimersByTimeAsync(STREAM_SLOT_LOCK_REQUEST_TIMEOUT_MS * 3);
+
+    await expect(acquisition).resolves.toBeNull();
+  });
+
+  it("releases a lock granted after its request already timed out", async () => {
+    vi.useFakeTimers();
+    const grants: LockGrantedCallback<void>[] = [];
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      locks: {
+        request: vi.fn(
+          (_name: string, _options: LockOptions, callback: LockGrantedCallback<void>) => {
+            grants.push(callback);
+            return new Promise<void>(() => {});
+          },
+        ),
+      },
+    });
+    resetStreamSlotManager();
+
+    const acquisition = getStreamSlotManager().tryAcquire();
+    await vi.advanceTimersByTimeAsync(STREAM_SLOT_LOCK_REQUEST_TIMEOUT_MS * 3);
+    await expect(acquisition).resolves.toBeNull();
+
+    expect(grants).toHaveLength(3);
+    expect(grants[2]?.({ name: "omnigent:stream-slot:2", mode: "exclusive" })).toBeUndefined();
+  });
+
   it("holds one slot per live stream while within budget", async () => {
     const slots = makeFakeSlotManager({ capacity: 5 });
     setStreamSlotManagerForTest(slots);

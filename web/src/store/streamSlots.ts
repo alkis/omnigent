@@ -38,6 +38,7 @@ export interface StreamSlotManager {
 }
 
 const SLOT_LOCK_PREFIX = "omnigent:stream-slot:";
+export const STREAM_SLOT_LOCK_REQUEST_TIMEOUT_MS = 500;
 
 /**
  * Hold `name` until the returned slot's `release` runs, or resolve `null` when
@@ -45,21 +46,38 @@ const SLOT_LOCK_PREFIX = "omnigent:stream-slot:";
  * either gets the lock or gets `null`, atomically.
  */
 function holdLockIfFree(name: string): Promise<StreamSlot | null> {
+  // Chromium may indefinitely defer Web Lock callbacks and timers in hidden embedded views.
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+    return Promise.resolve(null);
+  }
   return new Promise((settle) => {
     let releaseHeld: () => void = () => {};
     let released = false;
+    let settled = false;
+    let timedOut = false;
+    const finish = (slot: StreamSlot | null): boolean => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timeout);
+      settle(slot);
+      return true;
+    };
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      finish(null);
+    }, STREAM_SLOT_LOCK_REQUEST_TIMEOUT_MS);
     // `requestDone` resolves when the callback's returned promise settles —
     // i.e. after `releaseHeld()` runs AND the browser has released the lock.
     // `release` awaits it so the freed slot is observable to the next acquire.
     const requestDone = navigator.locks
       .request(name, { ifAvailable: true }, (lock) => {
-        if (lock === null) {
-          settle(null);
+        if (lock === null || timedOut) {
+          finish(null);
           return;
         }
         return new Promise<void>((r) => {
           releaseHeld = r;
-          settle({
+          const granted = finish({
             release: async () => {
               if (!released) {
                 released = true;
@@ -68,9 +86,10 @@ function holdLockIfFree(name: string): Promise<StreamSlot | null> {
               await requestDone;
             },
           });
+          if (!granted) r();
         });
       })
-      .catch(() => settle(null));
+      .catch(() => finish(null));
   });
 }
 
