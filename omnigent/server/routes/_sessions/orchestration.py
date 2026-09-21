@@ -10879,10 +10879,8 @@ async def _get_session_snapshot(
                             resolved_spec = _sub_spec
                     if resolved_spec is not None:
                         # A self-authenticated harness (own-auth ACP) picks its
-                        # own model; the spec's pin is not what the session
-                        # runs, so don't present it as the model. The observed
-                        # context-window label below still repopulates
-                        # ``context_window`` once the harness reports usage.
+                        # own model: the spec's pin is not what the session
+                        # runs, so claim neither it nor its context window.
                         effective_harness = conv.harness_override or _spec_harness(resolved_spec)
                         harness_owns_model = harness_owns_its_credential(effective_harness)
                         # Prefer the spec's name over the agent row's: a
