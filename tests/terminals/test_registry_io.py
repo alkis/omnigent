@@ -29,18 +29,20 @@ import pytest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.terminals import TerminalRegistry
+from tests.budgets import budget
 
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="tmux not installed; registry I/O tests need a real tmux on PATH",
 )
 
-# Each poll round-trips through a real tmux ``send-keys``/``capture-pane``
-# subprocess spawn plus bash actually running the command; under heavy host
-# contention (parallel test workers) that pipeline can take several seconds
-# longer than it does standalone, so the budget needs real headroom rather
-# than just the shell's own latency.
-_MARKER_BUDGET_S = 15.0
+# A hang guard, not a latency assertion: each poll round-trips a real tmux
+# ``send-keys``/``capture-pane`` subprocess spawn plus bash actually running
+# the command, and a shared CI runner can stall that well past 5s for reasons
+# that have nothing to do with the shell under test. Follow CI's scale knob
+# (see tests/budgets.py) so it stays loose there while local runs still fail
+# fast on a genuine hang.
+_MARKER_BUDGET_S = budget(5.0)
 _POLL_INTERVAL_S = 0.1
 
 

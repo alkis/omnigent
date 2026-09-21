@@ -657,8 +657,6 @@ async def test_seed_alternate_screen_does_not_leak_primary_history() -> None:
     scrollback from before the app switched — lines that were never part of
     the app's UI. The bridge must capture the visible screen only there.
     """
-    from omnigent.terminals.control_bridge import _run_tmux_capture
-
     # 50 primary-screen "OLD" lines, then enter the alternate screen and draw.
     sock, target = await _new_private_tmux(
         "python3 -c 'import sys,time\n"
@@ -667,10 +665,11 @@ async def test_seed_alternate_screen_does_not_leak_primary_history() -> None:
         'for r in range(1,25): sys.stdout.write(f"\\x1b[{r};1HALT-row{r}")\n'
         "sys.stdout.flush(); time.sleep(30)'"
     )
-    await asyncio.sleep(0.5)
     try:
-        seed = await _run_tmux_capture(str(sock), target)
-        assert seed is not None
+        # Poll instead of a fixed sleep: the switch to the alternate screen and
+        # the row draws race tmux's own reflow under load, so wait for the last
+        # row rather than assuming a fixed delay covers the whole sequence.
+        seed = await _capture_seed_until(sock, target, b"ALT-row24")
         assert seed.count(b"OLD-") == 0, (
             f"alt-screen seed leaked {seed.count(b'OLD-')} stale primary-history lines"
         )
