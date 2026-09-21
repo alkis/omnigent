@@ -48,6 +48,7 @@ import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -153,7 +154,6 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github",
             },
           ]
         : path === null
@@ -171,7 +171,6 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github" as const,
             },
           ]
         : [],
@@ -289,7 +288,9 @@ function renderLanding(
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }

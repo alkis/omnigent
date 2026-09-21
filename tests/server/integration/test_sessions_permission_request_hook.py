@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -4032,80 +4033,81 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
     later — the click dropped, the codex sub-agent still blocked.
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions import orchestration
+
+    grace_started = asyncio.Event()
+    release_grace = asyncio.Event()
+
+    async def _wait_for_grace(delay: float) -> None:
+        if delay == sessions_route._HARNESS_ELICITATION_REPARK_GRACE_S:
+            grace_started.set()
+            await release_grace.wait()
+        else:
+            await asyncio.sleep(delay)
 
     async def _disconnect_immediately(_request: Any) -> None:
-        """
-        Sever every hook long-poll straight away.
-
-        :param _request: Ignored FastAPI request.
-        :returns: None.
-        """
-        await asyncio.sleep(0.01)
+        """Sever each hook poll without a timing dependency."""
+        return
 
     monkeypatch.setattr(
         sessions_route,
         "_poll_request_disconnect",
         _disconnect_immediately,
     )
-    # Wide on purpose: the retry can only adopt the gap tombstone while the
-    # severed poll's pending entry it fingerprints against still exists. A
-    # short grace let the deferred clear beat the verdict POST, dropping the
-    # fingerprint so the retry fail-closed and re-parked with an empty body.
+    # Hold the real deferred cleanup until the gap verdict has been consumed.
+    # Replace only this module's asyncio binding, leaving other sleeps intact.
     monkeypatch.setattr(
-        sessions_route,
-        "_HARNESS_ELICITATION_REPARK_GRACE_S",
-        30.0,
+        orchestration,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "sleep": _wait_for_grace}),
     )
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-codex-gap-verdict")
     session_id = await _create_session(client, agent["id"])
 
-    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
-    await asyncio.sleep(0.05)
-    first = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
-    )
-    assert first.status_code == 200, first.text
-    assert first.content == b""
-    event = await drain_task
+    collector = await start_session_stream_collector(session_id)
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert first.status_code == 200, first.text
+        assert first.content == b""
+        event = await collector.next_event()
+        assert event["type"] == "response.elicitation_request"
+        await asyncio.wait_for(grace_started.wait(), timeout=5.0)
+        assert pending_elicitations.count_for(session_id) == 1
+        assert event["elicitation_id"] not in sessions_route._harness_elicitation_registry
 
-    # Verdict arrives while NO poll is parked (the gap).
-    verdict = await _post_approval(
-        client,
-        session_id,
-        event["elicitation_id"],
-        "accept",
-        content={"ok": "go"},
-    )
-    assert verdict.status_code == 202, verdict.text
-    assert pending_elicitations.count_for(session_id) == 0
+        # Verdict arrives while no poll is parked and cleanup is still waiting.
+        verdict = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"ok": "go"},
+        )
+        assert verdict.status_code == 202, verdict.text
+        assert pending_elicitations.count_for(session_id) == 0
 
-    # The retry consumes the tombstone and returns the verdict in the
-    # codex result shape without re-publishing the prompt; an empty
-    # body here means the tombstone was dropped and the click lost.
-    second = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
-    )
-    assert second.status_code == 200, second.text
-    # Check the raw body first: an empty one means the retry re-parked rather
-    # than consuming the tombstone, which names the fault better than a bare
-    # JSONDecodeError out of the .json() below.
-    assert second.content, (
-        "expected the codex JSON-RPC verdict body, got an empty response — "
-        "the retry re-parked instead of consuming the gap tombstone "
-        "(status=200, empty body means fail-ask fired again)"
-    )
-    assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
-    # Cancel the severed poll's deferred clear rather than awaiting it: its
-    # outcome is moot (the index is empty either way) and waiting would sleep
-    # out the whole grace above.
-    for task in set(sessions_route._deferred_elicitation_clear_tasks):
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    pending_elicitations.reset_for_tests()
+        # The retry must consume the saved verdict instead of publishing again.
+        second = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert second.status_code == 200, second.text
+        assert second.content, (
+            "expected the codex JSON-RPC verdict body, got an empty response — "
+            "the retry re-parked instead of consuming the gap tombstone "
+            "(status=200, empty body means fail-ask fired again)"
+        )
+        assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
+    finally:
+        release_grace.set()
+        for task in set(sessions_route._deferred_elicitation_clear_tasks):
+            await asyncio.wait_for(task, timeout=5.0)
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
 
 
 # ── Antigravity elicitation hook tests ──────────────────────────────────────
