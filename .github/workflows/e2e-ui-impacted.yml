@@ -121,7 +121,8 @@ jobs:
       - name: Select impacted tests
         id: selection
         run: |
-          index_path="$(find /tmp/impacted-e2e-index -name e2e-ui-coverage-index.json -print -quit)"
+          index_path="$(find /tmp/impacted-e2e-index -type f \
+            \( -name index.json -o -name e2e-ui-coverage-index.json \) -print -quit)"
           index_path="${index_path:-/tmp/impacted-e2e-index/e2e-ui-coverage-index.json}"
           if [[ -f .github/scripts/ci/select-impacted-e2e.py ]]; then
             uv run --no-sync python .github/scripts/ci/select-impacted-e2e.py \
