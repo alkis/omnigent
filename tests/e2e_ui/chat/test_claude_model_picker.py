@@ -473,12 +473,7 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """An asleep session keeps the config gear live and Save PATCHes the model.
-
-    A model/effort change persists server-side and applies when the next
-    message wakes the session, so wherever the composer stays open (here:
-    ``host_asleep``) the gear must stay enabled with the catalog-backed
-    dropdown — not inert behind a live-runner requirement.
+    """Opening an asleep session's config wakes it before a model PATCH.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -488,6 +483,20 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     base_url, session_id = seeded_session
     _force_asleep_liveness(page, session_id)
     patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
+    _install_catalog_stream(page, session_id)
+    page.route(
+        f"**/v1/sessions/{session_id}/resources/terminals*",
+        lambda route: route.fulfill(json={"object": "list", "data": [], "has_more": False}),
+    )
+    retry_bodies: list[dict] = []
+
+    def _resume(route: Route) -> None:
+        retry_bodies.append(route.request.post_data_json)
+        route.fulfill(
+            json={"queued": False, "recovered": True, "recovery": "runner_relaunched"},
+        )
+
+    page.route(f"**/v1/sessions/{session_id}/events", _resume)
 
     # Wait for the /health poll that resolves liveness to host_asleep to land
     # before the gear assertions, so they exercise the settled asleep state and
@@ -501,10 +510,18 @@ def test_claude_native_picker_saves_model_while_host_asleep(
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_have_attribute("aria-disabled", "false")
-    gear.click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}/events"
+        )
+    ):
+        gear.click()
+    assert retry_bodies == [{"type": "retry_session", "data": {}}]
+    assert patch_bodies == []
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
-    # The catalog still populates the dropdown while the session sleeps.
+    # The catalog remains available while terminal resources catch up.
     expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
         len(_EXPECTED_ROWS)
     )

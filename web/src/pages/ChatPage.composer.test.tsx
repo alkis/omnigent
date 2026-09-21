@@ -26,6 +26,11 @@ import {
 import { setOmnigentHostConfig } from "@/lib/host";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import * as sessionsApi from "@/lib/sessionsApi";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "@/shell/TerminalFirstContext";
 import {
   getSessionModelLabelCacheKey,
   readSessionModelLabelCache,
@@ -4120,6 +4125,279 @@ describe("Composer — editing queued messages", () => {
   });
 });
 
+describe("Composer native picker terminal startup", () => {
+  let previous: ChatState;
+
+  beforeEach(() => {
+    previous = useChatStore.getState();
+    clearSessionDrafts();
+    setComposerState({
+      conversationId: "conv_picker_startup",
+      skills: [],
+      sessionHarness: "claude-native",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      pendingModelChange: null,
+      llmModel: "opus",
+      nativeVendorOwnsModel: false,
+      sessionReasoningEffort: "high",
+      costControlModeOverride: null,
+      queuedMessages: [],
+      setModel: vi.fn().mockResolvedValue(undefined),
+      setEffort: vi.fn().mockResolvedValue(undefined),
+      refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.spyOn(sessionsApi, "retrySession").mockResolvedValue({
+      queued: false,
+      recovered: true,
+      recovery: "native_terminal_ready",
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    useChatStore.setState(previous, true);
+    vi.restoreAllMocks();
+  });
+
+  function renderPicker(
+    overrides: Partial<Parameters<typeof Composer>[0]> = {},
+    terminalOverrides: Partial<TerminalFirstContextValue> = {},
+  ) {
+    const terminal: TerminalFirstContextValue = {
+      isClaudeNative: true,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      isShellView: false,
+      view: "chat",
+      terminalViewKey: null,
+      setView: vi.fn(),
+      terminalsAvailable: false,
+      terminalStartingUp: false,
+      ...terminalOverrides,
+    };
+    const props = composerProps({
+      showModels: true,
+      modelPickerKind: "claude",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      ...overrides,
+    });
+    renderWithTooltips(
+      <TerminalFirstContextProvider value={terminal}>
+        <Composer {...props} />
+      </TerminalFirstContextProvider>,
+    );
+    return { props, terminal };
+  }
+
+  function pendingStartup() {
+    let resolve!: (result: sessionsApi.PostEventResponse) => void;
+    let reject!: (error: Error) => void;
+    vi.mocked(sessionsApi.retrySession).mockReturnValueOnce(
+      new Promise((onResolve, onReject) => {
+        resolve = onResolve;
+        reject = onReject;
+      }),
+    );
+    return { resolve, reject };
+  }
+
+  function openWithHotkey() {
+    fireEvent.keyDown(window, {
+      key: "M",
+      code: "KeyM",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+  }
+
+  it.each([
+    { recovered: true, recovery: "native_terminal_ready" },
+    { recovered: false, recovery: "already_connected" },
+  ] as const)(
+    "starts only on click and waits for $recovery before applying changes",
+    async (result) => {
+      const user = userEvent.setup();
+      const startup = pendingStartup();
+      const { props, terminal } = renderPicker();
+      const trigger = screen.getByTestId("composer-config-gear");
+
+      expect(sessionsApi.retrySession).not.toHaveBeenCalled();
+      await user.hover(trigger);
+      expect(sessionsApi.retrySession).not.toHaveBeenCalled();
+      await user.click(trigger);
+
+      expect(sessionsApi.retrySession).toHaveBeenCalledExactlyOnceWith("conv_picker_startup");
+      const menu = screen.getByTestId("composer-agent-menu");
+      expect(within(menu).getByRole("status")).toHaveTextContent("Starting terminal…");
+      expect(screen.getByTestId("composer-agent-edit")).toHaveAttribute("data-disabled");
+      expect(screen.getByTestId("composer-agent-effort-select")).toHaveAttribute("data-disabled");
+      fireEvent.click(screen.getByTestId("composer-agent-edit"));
+      fireEvent.click(screen.getByTestId("composer-agent-effort-select"));
+      expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
+      expect(useChatStore.getState().setEffort).not.toHaveBeenCalled();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(terminal.setView).not.toHaveBeenCalled();
+
+      await act(async () => startup.resolve({ queued: false, ...result }));
+      expect(screen.queryByText("Starting terminal…")).toBeNull();
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled");
+      expect(screen.getByTestId("composer-agent-effort-select")).not.toHaveAttribute(
+        "data-disabled",
+      );
+      await openSessionModels();
+      fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+      await waitFor(() =>
+        expect(useChatStore.getState().setModel).toHaveBeenCalledWith("sonnet", {
+          expectConfirmation: true,
+        }),
+      );
+      expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["hotkey", "/model"] as const)("also starts the terminal through %s", async (entry) => {
+    const startup = pendingStartup();
+    const { props, terminal } = renderPicker();
+    if (entry === "hotkey") openWithHotkey();
+    else {
+      fireEvent.change(textarea(), { target: { value: "/model " } });
+      fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" });
+    }
+
+    expect(sessionsApi.retrySession).toHaveBeenCalledExactlyOnceWith("conv_picker_startup");
+    expect(screen.getByText("Starting terminal…")).toBeVisible();
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(terminal.setView).not.toHaveBeenCalled();
+    await act(async () => startup.resolve({ queued: false, recovered: true }));
+  });
+
+  it("shares one startup request when the picker is closed and reopened", async () => {
+    const user = userEvent.setup();
+    const startup = pendingStartup();
+    renderPicker();
+    openSessionConfig();
+    await user.click(textarea());
+    expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+
+    openSessionConfig();
+    expect(screen.getByText("Starting terminal…")).toBeVisible();
+    expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
+    await act(async () => startup.resolve({ queued: false, recovered: true }));
+  });
+
+  it("does not restart an existing terminal", async () => {
+    renderPicker({}, { terminalsAvailable: true });
+    await openSessionModels();
+    expect(sessionsApi.retrySession).not.toHaveBeenCalled();
+    expect(screen.getByTestId("composer-agent-model-sonnet")).not.toHaveAttribute("data-disabled");
+  });
+
+  it.each([null, "acp", "configured"] as const)(
+    "does not launch a terminal for an SDK picker of kind %s",
+    (modelPickerKind) => {
+      renderPicker(
+        { modelPickerKind, isNativeWrapper: false },
+        { isNativeWrapper: false, isClaudeNative: false },
+      );
+      openSessionConfig();
+      expect(screen.getByTestId("composer-agent-menu")).toBeVisible();
+      expect(sessionsApi.retrySession).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([null, "temp:creating"])(
+    "does not launch a terminal for session id %s",
+    (conversationId) => {
+      useChatStore.setState({ conversationId });
+      renderPicker();
+      openSessionConfig();
+      expect(sessionsApi.retrySession).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { permissionLevel: 1 },
+    { readOnlyReason: "Session is read-only" },
+    { unreachable: true },
+  ])("does not launch a terminal when configuration is disabled: %j", (overrides) => {
+    renderPicker(overrides);
+    openSessionConfig();
+    openWithHotkey();
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter", code: "Enter" });
+    expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+    expect(sessionsApi.retrySession).not.toHaveBeenCalled();
+  });
+
+  it("starts custom native agents whose picker identifies the harness without a wrapper label", async () => {
+    const startup = pendingStartup();
+    renderPicker({ isNativeWrapper: false }, { isNativeWrapper: false, isClaudeNative: false });
+    openSessionConfig();
+    expect(sessionsApi.retrySession).toHaveBeenCalledExactlyOnceWith("conv_picker_startup");
+    await act(async () => startup.resolve({ queued: false, recovered: true }));
+  });
+
+  it.each(["rejection", "unrecovered"] as const)(
+    "closes on startup %s and retries when reopened",
+    async (failure) => {
+      const startup = pendingStartup();
+      renderPicker();
+      openSessionConfig();
+      await act(async () => {
+        if (failure === "rejection") startup.reject(new Error("Host is offline"));
+        else startup.resolve({ queued: false, recovered: false });
+      });
+
+      expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+      const detail =
+        failure === "rejection" ? "Host is offline" : "Unable to start the session terminal";
+      const error = screen.getByTestId("composer-config-error");
+      expect(error).toHaveAccessibleName(`Couldn't update configuration: ${detail}`);
+      fireEvent.focus(error);
+      expect(await screen.findByTestId("composer-config-error-tooltip")).toHaveTextContent(detail);
+      expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
+      openSessionConfig();
+      await waitFor(() => expect(screen.queryByText("Starting terminal…")).toBeNull());
+      expect(sessionsApi.retrySession).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId("composer-agent-menu")).toBeVisible();
+      expect(screen.queryByTestId("composer-config-error")).toBeNull();
+    },
+  );
+
+  it.each(["resolve", "reject"] as const)(
+    "isolates a prior session's startup %s and does not replay its open request",
+    async (completion) => {
+      const firstStartup = pendingStartup();
+      const nextStartup = pendingStartup();
+      renderPicker();
+      openWithHotkey();
+      expect(sessionsApi.retrySession).toHaveBeenCalledExactlyOnceWith("conv_picker_startup");
+
+      act(() => useChatStore.setState({ conversationId: "conv_next_picker" }));
+      expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+      expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
+      openSessionConfig();
+      expect(sessionsApi.retrySession).toHaveBeenLastCalledWith("conv_next_picker");
+      expect(sessionsApi.retrySession).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        if (completion === "reject") firstStartup.reject(new Error("Previous host unavailable"));
+        else firstStartup.resolve({ queued: false, recovered: true });
+      });
+      expect(screen.getByText("Starting terminal…")).toBeVisible();
+      expect(screen.getByTestId("composer-agent-edit")).toHaveAttribute("data-disabled");
+      expect(screen.queryByTestId("composer-config-error")).toBeNull();
+      await act(async () => nextStartup.resolve({ queued: false, recovered: true }));
+      expect(screen.queryByText("Starting terminal…")).toBeNull();
+      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled");
+    },
+  );
+});
+
 describe("Composer config gear", () => {
   beforeEach(() => {
     setComposerState({
@@ -4176,10 +4454,9 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("keeps the gear live on an asleep session (change persists and applies on wake)", () => {
-    // Asleep/starting/unknown sessions accept sends (which wake the runner),
-    // and a config PATCH persists server-side and applies on the next
-    // wake/turn — so the gear stays live wherever the composer does.
+  it("keeps the gear live on an asleep SDK session (change persists and applies on wake)", () => {
+    // SDK config changes persist server-side and apply on the next turn;
+    // they do not need a native terminal before opening the picker.
     renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).toHaveAttribute("aria-disabled", "false");
     openSessionConfig();

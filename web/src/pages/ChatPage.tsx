@@ -3993,6 +3993,7 @@ function ComposerImpl(
             <>
               <div className="flex min-w-0 items-center rounded-lg">
                 <SessionHarnessPicker
+                  key={conversationId}
                   busy={configBusy}
                   busyRef={configBusyRef}
                   setBusy={setConfigBusy}
@@ -4014,11 +4015,8 @@ function ComposerImpl(
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
-                  // Config changes persist server-side and apply on the next
-                  // wake/turn (the runner forward is best-effort), so the gear
-                  // stays live wherever a message could be sent — including
-                  // asleep/starting/unknown. Only read-only viewers and sessions
-                  // no message can wake (unreachable) get an inert gear.
+                  // Opening the picker wakes a missing native terminal, so it
+                  // stays usable on asleep sessions with a reachable host.
                   disabled={isReadOnly || unreachable}
                   openNonce={pickerOpenNonce}
                 />
@@ -4627,7 +4625,7 @@ function hasSessionConfig({
 }
 
 function SessionHarnessPicker({
-  busy,
+  busy: updating,
   busyRef,
   setBusy,
   agentName,
@@ -4666,10 +4664,14 @@ function SessionHarnessPicker({
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
+  const terminalFirst = useTerminalFirst();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const appliedOpenNonce = useRef(0);
+  const [startingTerminal, setStartingTerminal] = useState(false);
+  const terminalStartupRef = useRef<Promise<void> | null>(null);
+  const busy = updating || startingTerminal;
+  const appliedOpenNonce = useRef(openNonce);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
@@ -4728,21 +4730,58 @@ function SessionHarnessPicker({
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
       : effortLevels;
+  const needsTerminal =
+    modelPickerKind !== null &&
+    modelPickerKind !== "acp" &&
+    modelPickerKind !== "configured" &&
+    terminalFirst?.terminalsAvailable === false;
+  const openMenu = useCallback(() => {
+    if (disabled || busyRef.current || !configurable) return false;
+    setMenuOpen(true);
+    if (
+      needsTerminal &&
+      conversationId !== null &&
+      !isTempConvId(conversationId) &&
+      terminalStartupRef.current === null
+    ) {
+      setStartingTerminal(true);
+      setError(null);
+      terminalStartupRef.current = retrySession(conversationId)
+        .then((result) => {
+          if (!result.recovered && result.recovery !== "already_connected") {
+            throw new Error("Unable to start the session terminal");
+          }
+        })
+        .catch((failure: unknown) => {
+          if (useChatStore.getState().conversationId !== conversationId) return;
+          setError(
+            failure instanceof Error ? failure.message : "Unable to start the session terminal",
+          );
+          setMenuOpen(false);
+          setConfigMenu(null);
+        })
+        .finally(() => {
+          terminalStartupRef.current = null;
+          setStartingTerminal(false);
+        });
+    }
+    return true;
+  }, [disabled, busyRef, configurable, needsTerminal, conversationId]);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
-    if (!disabled && configurable) {
-      setMenuOpen(true);
+    if (openMenu()) {
       setConfigMenu(showModels ? "model" : "effort");
     }
-  }, [openNonce, disabled, configurable, showModels]);
+  }, [openNonce, openMenu, showModels]);
   useEffect(() => {
     setMenuOpen(false);
     setConfigMenu(null);
     setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
-    if (disabled || busyRef.current || pendingModelChange !== null) return;
+    if (disabled || busyRef.current || terminalStartupRef.current || pendingModelChange !== null)
+      return;
     busyRef.current = true;
     setBusy(true);
     setError(null);
@@ -4913,28 +4952,37 @@ function SessionHarnessPicker({
       <HarnessPicker
         open={menuOpen}
         onOpenChange={(next) => {
-          if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigMenu(null);
+          if (next) openMenu();
+          else {
+            setMenuOpen(false);
+            setConfigMenu(null);
+          }
         }}
         trigger={{
           label: "Configure session",
           model: label,
           effort: effortLabel ?? undefined,
           icon: <ComposerAgentIcon agent={iconAgent} />,
-          disabled: busy || !configurable,
-          "aria-disabled": disabled || busy || !configurable,
+          disabled: updating || !configurable,
+          "aria-disabled": disabled || updating || !configurable,
           className: disabled ? "cursor-default opacity-50" : undefined,
           testIdPrefix: "composer",
           "data-testid": "composer-config-gear",
           loading: modelLabelLoading && !routingOn,
           pending:
-            (sessionModelSeeded || pendingModelChange !== null) &&
-            (modelPickerKind === "claude" || modelPickerKind === "codex"),
+            startingTerminal ||
+            ((sessionModelSeeded || pendingModelChange !== null) &&
+              (modelPickerKind === "claude" || modelPickerKind === "codex")),
         }}
         tooltip={<ComposerConfigTooltipRows rows={summary} />}
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
       >
+        {startingTerminal && (
+          <div role="status" className="px-2 py-1 text-xs text-muted-foreground">
+            Starting terminal…
+          </div>
+        )}
         {isMobile && configMenu !== null ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"
