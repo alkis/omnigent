@@ -5382,6 +5382,19 @@ describe("NewChatLandingScreen", () => {
     expect(installMutate).toHaveBeenCalledWith("codex-native", expect.anything());
   });
 
+  it("shows setup-required harness badges with a real tooltip", async () => {
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding({ harness_install_enabled: true });
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const warning = screen.getByTestId("new-chat-landing-agent-warning-a2");
+    expect(warning).not.toHaveAttribute("title");
+    fireEvent.focus(warning);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("needs setup");
+  });
+
   it("gates Set up auth until the harness is installed (no auth-before-install)", () => {
     // codex-native not installed: the credential form must NOT be available
     // yet — the auth row shows a DISABLED "Set up auth" (install first).

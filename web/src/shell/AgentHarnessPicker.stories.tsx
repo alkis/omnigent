@@ -152,6 +152,32 @@ export const NeedsSetupBadges: Story = {
   play: async ({ canvasElement }) => openPicker(canvasElement),
 };
 
+export const ClaudeSelected: Story = {
+  args: {
+    effectiveAgentId: claude.id,
+    agentLabel: "Claude Code",
+    triggerDetails: [
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Effort", value: "High" },
+    ],
+  },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+export const ReadOnlyPermissionSummary: Story = {
+  args: {
+    triggerDetails: [
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Permission mode", value: "Plan" },
+    ],
+    triggerTooltipRows: [
+      { label: "Harness", value: "Claude Code" },
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Permission mode", value: "Plan" },
+    ],
+  },
+};
+
 export const SmartRoutingWithCustomAgents: Story = {
   args: {
     agentEntries: [polly, debby, customReviewer],

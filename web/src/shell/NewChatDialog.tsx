@@ -107,6 +107,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
+  harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
@@ -1595,11 +1596,9 @@ export function AgentHarnessPicker({
       : "";
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
-    const unavailable = harnessUnconfiguredOnHost(agent.harness, host);
-    const warning = harnessWarningBadgeText(
-      harnessUnavailableReasonOnHost(agent.harness, host),
-      collapsedBadge,
-    );
+    const readiness = harnessReadinessOnHost(agent.harness, host);
+    const unavailable = !readiness.selectable && readiness.fallbackRelevant;
+    const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -1631,14 +1630,18 @@ export function AgentHarnessPicker({
         editTestId={`new-chat-landing-agent-config-${agent.id}`}
         warning={
           unavailable && (
-            <span
-              title={warning}
-              aria-label={warning}
-              data-testid={`new-chat-landing-agent-warning-${agent.id}`}
-              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
-            >
-              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
-            </span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  aria-label={warning}
+                  data-testid={`new-chat-landing-agent-warning-${agent.id}`}
+                  className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+                >
+                  <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{warning}</TooltipContent>
+            </Tooltip>
           )
         }
       />
@@ -1657,7 +1660,9 @@ export function AgentHarnessPicker({
     const secondaryOrder = ["opencode", "pi"];
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
-      if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(agent.harness, host)) continue;
+      const readiness = harnessReadinessOnHost(agent.harness, host);
+      if (!selected && hideUnconfigured && !readiness.selectable && readiness.fallbackRelevant)
+        continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
       if (primaryOrder.includes(key) || agent.id === promotedHarnessId) {
         ready.push(agent);
