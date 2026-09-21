@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:)?[^\s:\"]+\.py):(?P<line>\d+)(?::in (?P<func>[^\s]+))?")
+PATH_RE = re.compile(r"(?P<path>(?:[A-Za-z]:)?[^\s:\"]+\.py):(?P<line>\d+)(?::\s*in\s+(?P<func>[^\s]+))?")
 ADDRESS_RE = re.compile(r"\b(?:0x[0-9a-f]+|\d{4,}|[0-9a-f]{8}-[0-9a-f-]{27,})\b", re.I)
 SPACE_RE = re.compile(r"\s+")
 PARAM_RE = re.compile(r"\[[^\]]+\]$")
