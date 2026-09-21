@@ -257,7 +257,7 @@ jobs:
             echo "- Fallback/selection reasons: ${REASON:-selection step did not complete}"
             echo "- Selected tests: ${SELECTED_COUNT:-unknown} / ${FULL_COUNT:-unknown}"
             echo "- Time to first E2E signal (measured after security gate): ${elapsed}s"
-            echo "- Merge gating: nonblocking; the five authoritative E2E UI shards remain unchanged"
+            echo "- Merge gating: nonblocking; the authoritative E2E UI shards remain unchanged"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload impacted-lane diagnostics
         if: always()

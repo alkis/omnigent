@@ -218,12 +218,22 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
-const e2eCoveragePlugin = createE2eCoveragePlugin();
-
-export default defineConfig({
-  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss(), e2eCoveragePlugin].filter(
-    (plugin): plugin is Plugin => plugin !== null,
-  ),
+export default defineConfig(({ command }) => ({
+  // Relative asset base for production builds so the SPA can be served under
+  // any path prefix (e.g. code-server's `/proxy/6767/`), decided purely at
+  // server runtime via OMNIGENT_WEB_BASE_PATH — no separate build needed per
+  // deployment. Dynamic code-split chunks and the Monaco worker then resolve
+  // relative to `import.meta.url` instead of a hardcoded `/assets/...`. The
+  // server rewrites the entry/asset refs in `index.html` to absolute
+  // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
+  // omnigent/server/app.py). Dev (`vite serve`) stays at root.
+  base: command === "build" ? "./" : "/",
+  plugins: [
+    safariLookbehindWorkarounds(),
+    react(),
+    tailwindcss(),
+    createE2eCoveragePlugin(),
+  ].filter((plugin): plugin is Plugin => plugin !== null),
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -282,4 +292,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

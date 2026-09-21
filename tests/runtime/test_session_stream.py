@@ -93,8 +93,9 @@ async def test_publish_without_subscriber_is_silent_noop() -> None:
     session_stream.publish("conv_unknown", {"type": "x", "i": 1})
     # If publish were silently creating a slot, the registry would
     # have grown. The contract: only ``subscribe`` adds slots.
-    assert session_stream._subscribers == {}, (
-        f"publish must NOT create subscriber slots. State: {session_stream._subscribers!r}"
+    assert session_stream._subscribers.all_values() == [], (
+        f"publish must NOT create subscriber slots. "
+        f"State: {session_stream._subscribers.all_values()!r}"
     )
 
 
@@ -275,6 +276,31 @@ async def test_has_subscribers_tracks_live_subscription() -> None:
     session_stream.publish("conv_probe", {"type": "a"})
     await asyncio.wait_for(task, timeout=2.0)
     assert session_stream.has_subscribers("conv_probe") is False
+
+
+@pytest.mark.asyncio
+async def test_subscribers_are_isolated_across_workspaces() -> None:
+    """The same conversation id in two workspaces has independent subscribers.
+
+    Regression for OMNI-7361: conversation ids collide across workspaces
+    (imported sessions), so a subscriber registered in one tenant's workspace
+    must not be seen — or fed — by a publish in another's, even for the same id.
+    """
+    from omnigent.db.db_models import workspace_scope
+
+    conv = "conv_shared"
+    with workspace_scope(1):
+        task = asyncio.create_task(_collect(conv, expected=1))
+        await asyncio.sleep(0)  # let the subscriber register under workspace 1
+        assert session_stream.has_subscribers(conv) is True
+    with workspace_scope(2):
+        # Same id, other workspace: no subscriber, and a publish reaches nobody.
+        assert session_stream.has_subscribers(conv) is False
+        assert session_stream.publish(conv, {"type": "ws2-only"}) == 0
+    with workspace_scope(1):
+        assert session_stream.publish(conv, {"type": "ws1-only"}) == 1
+    events = await asyncio.wait_for(task, timeout=2.0)
+    assert events == [{"type": "ws1-only"}]
 
 
 @pytest.mark.asyncio
@@ -856,7 +882,7 @@ def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
 
 
 def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event(
             "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}, "delta": "text"}
@@ -880,7 +906,7 @@ def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch
 
 
 def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: False)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: False)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
@@ -909,6 +935,7 @@ def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
 def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     # A terminal SSE event emits one first-class turn_finished audit row carrying
     # the outcome + safe ids; a non-terminal event emits none.
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_audit_logger() as records:
         session_stream._log_sse_event(
@@ -965,6 +992,7 @@ def test_failed_event_logs_nested_error_code_without_content(
             "message": "private legacy detail",
         }
     expected_code = "legacy_error" if legacy_error else "runner_error"
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event("conv_failed", event)
@@ -994,6 +1022,7 @@ def test_failed_event_logs_omit_unrecognized_sources(
     monkeypatch: pytest.MonkeyPatch, source: object
 ) -> None:
     """Unvalidated source data must not enter diagnostics or suppress the failure log."""
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event(
