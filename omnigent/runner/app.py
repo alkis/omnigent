@@ -3077,6 +3077,66 @@ def create_runner_app(
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    # In-flight REPL-terminal auto-create work, keyed by session. The bounded
+    # awaits below abandon this task on timeout instead of cancelling it:
+    # cancelling mid-creation can strand partial state (an orphan detached tmux
+    # session, or a terminal registered without its REPL role) that neither the
+    # init path's presence guard nor the attach recreate's role guard would
+    # ever repair. Retaining the task also deduplicates creation attempts.
+    _repl_terminal_autocreate_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _discard_repl_terminal_autocreate_task(session_id: str, task: asyncio.Task[None]) -> None:
+        if _repl_terminal_autocreate_tasks.get(session_id) is task:
+            del _repl_terminal_autocreate_tasks[session_id]
+
+    def _cancel_repl_terminal_autocreate_task(session_id: str) -> None:
+        # Only for session teardown, where the terminal can never be used and
+        # an abandoned stalled launch would otherwise stay parked forever.
+        task = _repl_terminal_autocreate_tasks.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _bounded_repl_terminal_autocreate(
+        session_id: str, *, agent_spec: AgentSpec | ResolvedSpec | None
+    ) -> None:
+        """
+        Await REPL-terminal auto-create with a finite budget, never cancelling it.
+
+        Bounds the *wait*, not the *work*: on timeout the creation keeps running
+        in the retained per-session task, and a later init/attach awaits that
+        same in-flight task instead of launching a duplicate. Creation failures
+        are logged by the task itself, so an attempt abandoned on timeout still
+        surfaces its eventual error.
+
+        :raises TimeoutError: When the budget elapses before creation finishes.
+        """
+        task = _repl_terminal_autocreate_tasks.get(session_id)
+        if task is None or task.done():
+
+            async def _run() -> None:
+                try:
+                    await _auto_create_repl_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        agent_spec=agent_spec,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Failed to auto-create omnigent REPL terminal for %s",
+                        session_id,
+                    )
+
+            task = asyncio.create_task(_run(), name=f"repl-terminal-autocreate:{session_id}")
+            _repl_terminal_autocreate_tasks[session_id] = task
+            task.add_done_callback(
+                functools.partial(_discard_repl_terminal_autocreate_task, session_id)
+            )
+        await asyncio.wait_for(
+            asyncio.shield(task), timeout=resolve_repl_terminal_autocreate_timeout_s()
+        )
+
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
     # Conversations whose claude-sdk `/compact` published an up-front
@@ -4472,15 +4532,8 @@ def create_runner_app(
                         # Session init blocks on this await; keep it bounded so a
                         # stalled terminal launch degrades to "no auto terminal"
                         # instead of wedging init (web UI stuck on "Starting up…").
-                        await asyncio.wait_for(
-                            _auto_create_repl_terminal(
-                                session_id,
-                                resource_registry,
-                                _publish_event,
-                                server_client=server_client,
-                                agent_spec=repl_agent_spec,
-                            ),
-                            timeout=resolve_repl_terminal_autocreate_timeout_s(),
+                        await _bounded_repl_terminal_autocreate(
+                            session_id, agent_spec=repl_agent_spec
                         )
                     except TimeoutError:
                         _logger.warning(
@@ -4857,6 +4910,7 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _cancel_repl_terminal_autocreate_task(session_id)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
@@ -10850,15 +10904,8 @@ def create_runner_app(
                     # Bounded like the init-path auto-create: a stall here would
                     # wedge this request AND hold the per-session ensure lock,
                     # blocking every later init of the same session.
-                    await asyncio.wait_for(
-                        _auto_create_repl_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            agent_spec=repl_agent_spec,
-                        ),
-                        timeout=resolve_repl_terminal_autocreate_timeout_s(),
+                    await _bounded_repl_terminal_autocreate(
+                        session_id, agent_spec=repl_agent_spec
                     )
                 except TimeoutError:
                     _logger.warning(
@@ -12224,6 +12271,7 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _cancel_repl_terminal_autocreate_task(session_id)
         await resource_registry.cleanup_session(session_id)
         await _delete_native_bridge_dirs(
             server_client=server_client,
@@ -12252,6 +12300,7 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _cancel_repl_terminal_autocreate_task(session_id)
         await _teardown_session_terminals(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))

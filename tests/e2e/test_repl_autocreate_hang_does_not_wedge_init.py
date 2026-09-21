@@ -36,9 +36,9 @@ Fail→pass contract
 -------------------
 * Buggy build: the POST never returns (init blocked on the unbounded await) and
   ``terminal_pending`` is stuck ``True`` → assertions fail.
-* Fixed build (bound the auto-create ``await`` with ``asyncio.wait_for``): the
-  hang is aborted, the ``finally`` publishes ``terminal_pending=False``, and the
-  POST returns → assertions pass.
+* Fixed build (auto-create await bounded): the wait is abandoned, the
+  ``finally`` publishes ``terminal_pending=False``, and the POST returns 201 →
+  assertions pass.
 
 The fix must bound REPL auto-create well under ``_INIT_BOUND_S`` below. If the
 fix reads ``OMNIGENT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S`` (mirroring the
@@ -131,10 +131,11 @@ async def test_repl_autocreate_hang_does_not_wedge_session_init(
     }
 
     posted = False
+    resp = None
     async with _runner_client(app) as client:
         try:
             try:
-                await asyncio.wait_for(
+                resp = await asyncio.wait_for(
                     client.post("/v1/sessions", json=payload), timeout=_INIT_BOUND_S
                 )
                 posted = True
@@ -166,9 +167,103 @@ async def test_repl_autocreate_hang_does_not_wedge_session_init(
         "(web UI stuck on 'Starting up…')"
     )
 
+    # Returning is not enough: init must SUCCEED without the terminal (a fast
+    # 5xx would clear the spinner into a broken session).
+    assert resp is not None and resp.status_code == 201, (
+        f"init returned {resp.status_code}: {resp.text}" if resp is not None else "no response"
+    )
+
     # The invariant the fix restores: terminal_pending is always cleared, even
     # when auto-create stalls (the finally must run).
     assert saw_pending_false, (
         "terminal_pending was published True but never cleared to False — the "
         f"'finally' that clears it never ran; got {events!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_repl_autocreate_timeout_abandons_but_never_cancels_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A timed-out auto-create must be abandoned, never cancelled mid-creation.
+
+    Cancelling the creation coroutine can strand partial state — an orphan
+    detached tmux session, or a terminal registered without its REPL role —
+    that neither session init (presence-guarded) nor the attach recreate
+    (role-guarded) would ever repair. The bound must abandon the wait and let
+    the retained task finish, and a re-init while creation is still in flight
+    must await that same task instead of launching a duplicate.
+    """
+    monkeypatch.setenv("DATABRICKS_REPRO_GATEWAY_TOKEN", "test-dummy-token")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_REPRO_GATEWAY_TOKEN", "test-dummy-token")
+    monkeypatch.setenv("OMNIGENT_REPL_TERMINAL_AUTOCREATE_TIMEOUT_S", "0.2")
+
+    release = asyncio.Event()
+    state = {"calls": 0, "cancelled": False, "completed": False}
+
+    async def _stalling_auto_create(  # type: ignore[no-untyped-def]
+        session_id, resource_registry, publish_event, **kwargs
+    ):
+        del session_id, resource_registry, publish_event, kwargs
+        state["calls"] += 1
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        state["completed"] = True
+
+    monkeypatch.setattr(runner_app, "_auto_create_repl_terminal", _stalling_auto_create)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="repl-sdk",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        ),
+    )
+
+    async def _resolver(agent_id, session_id=None):  # type: ignore[no-untyped-def]
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    payload = {
+        "session_id": "b91f9702634f0b41a52f77e00fc8a921",
+        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+        "host_id": "a8fd87d1ec915a4d95a0cab76f9dc4bb",
+    }
+
+    async with _runner_client(app) as client:
+        resp = await asyncio.wait_for(client.post("/v1/sessions", json=payload), timeout=20)
+        assert resp.status_code == 201, resp.text
+        assert state["calls"] == 1
+        assert not state["cancelled"], (
+            "the bounded wait cancelled the in-flight auto-create; a timeout must "
+            "abandon the wait, not the work"
+        )
+
+        resp = await asyncio.wait_for(client.post("/v1/sessions", json=payload), timeout=20)
+        assert resp.status_code == 201, resp.text
+        assert state["calls"] == 1, (
+            "re-init while creation was in flight launched a duplicate auto-create"
+        )
+
+        release.set()
+        for _ in range(200):
+            if state["completed"]:
+                break
+            await asyncio.sleep(0.01)
+        assert state["completed"], "the abandoned auto-create never ran to completion"
+        assert not state["cancelled"]
