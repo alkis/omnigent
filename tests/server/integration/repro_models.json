@@ -1,0 +1,5 @@
+{
+  "claude-native": "claude-sonnet-4-20250514",
+  "codex-native": "gpt-4o",
+  "openai-agents": "gpt-4o-mini"
+}
