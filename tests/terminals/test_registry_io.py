@@ -35,7 +35,12 @@ pytestmark = pytest.mark.skipif(
     reason="tmux not installed; registry I/O tests need a real tmux on PATH",
 )
 
-_MARKER_BUDGET_S = 5.0
+# Each poll round-trips through a real tmux ``send-keys``/``capture-pane``
+# subprocess spawn plus bash actually running the command; under heavy host
+# contention (parallel test workers) that pipeline can take several seconds
+# longer than it does standalone, so the budget needs real headroom rather
+# than just the shell's own latency.
+_MARKER_BUDGET_S = 15.0
 _POLL_INTERVAL_S = 0.1
 
 
