@@ -868,6 +868,7 @@ def register_core_routes(
             spec,
             inference_snapshot,
             inference_model,
+            created_by=user_id,
         )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
@@ -3223,6 +3224,7 @@ def register_core_routes(
                 up_to_response_id=body.up_to_response_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
+                created_by=user_id,
             )
         except LookupError as exc:
             raise OmnigentError(

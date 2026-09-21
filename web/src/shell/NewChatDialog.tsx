@@ -2380,46 +2380,6 @@ export function NewChatLandingScreen() {
           : managedSandboxesEnabled || (hosts ?? []).some((host) => host.status === "online")));
   const noExecutionTargetSelected =
     !sandboxSelected && selectedHostId === null && !executionTargetSelectionPending;
-  const {
-    data: hostClaudeModelOptions,
-    isLoading: hostClaudeModelsLoading,
-    error: hostClaudeModelsError,
-  } = useHostModelOptions(selectedHostId, "claude-native", hostSelected);
-  const {
-    data: hostCodexModelOptions,
-    isLoading: hostCodexModelsLoading,
-    error: hostCodexModelsError,
-  } = useHostModelOptions(selectedHostId, "codex-native", hostSelected);
-  const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "pi-native",
-    hostSelected,
-  );
-  const {
-    data: hostDevinModelOptions,
-    isLoading: hostDevinModelsLoading,
-    error: hostDevinModelsError,
-  } = useHostModelOptions(selectedHostId, "devin-native", !sandboxSelected);
-  // Only bridge this host's first fetch. Empty/error responses and host changes
-  // must never inherit another catalog or keep retired choices alive.
-  const cachedHostModels =
-    cachedPickerOptions &&
-    !sandboxSelected &&
-    !cachedPickerOptions.sandboxSelected &&
-    (selectedHostId === cachedPickerOptions.hostId ||
-      (selectedHostId === null &&
-        (hostsLoading || hosts?.some((host) => host.host_id === cachedPickerOptions.hostId))))
-      ? cachedPickerOptions.models
-      : undefined;
-  const availableClaudeModels =
-    hostClaudeModelOptions ??
-    (hostClaudeModelsLoading || selectedHostId === null ? cachedHostModels?.claude : undefined);
-  const availableCodexModels =
-    hostCodexModelOptions ??
-    (hostCodexModelsLoading || selectedHostId === null ? cachedHostModels?.codex : undefined);
-  const availablePiModels =
-    hostPiModelOptions ??
-    (hostPiModelsLoading || selectedHostId === null ? cachedHostModels?.pi : undefined);
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
@@ -3039,6 +2999,8 @@ export function NewChatLandingScreen() {
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((a) => a.id === pickedAgentId);
   const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
+  // Readiness is meaningful only for a connected host; managed sandboxes
+  // provision their own tooling and should not drive fallback warnings.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   const rememberedNativeAgent = harnessEntries.find((agent) => agent.id === pickedAgentId);
   const rememberedHarnessResolution = useMemo(
@@ -3087,7 +3049,85 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  // The selected native harness persists and restores harness-specific model,
+  // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  // Wait for readiness before prefetching. Older hosts without readiness
+  // metadata remain eligible, matching the picker's setup warnings.
+  const canLoadHostModels = (harness: string) =>
+    hostSelected &&
+    selectedHost?.status === "online" &&
+    !harnessUnconfiguredOnHost(harness, selectedHost);
+  const {
+    data: hostClaudeModelOptions,
+    isLoading: hostClaudeModelsLoading,
+    error: hostClaudeModelsError,
+  } = useHostModelOptions(selectedHostId, "claude-native", canLoadHostModels("claude-native"), {
+    poll: selectedNativeHarness === "claude-native",
+  });
+  const {
+    data: hostCodexModelOptions,
+    isLoading: hostCodexModelsLoading,
+    error: hostCodexModelsError,
+  } = useHostModelOptions(selectedHostId, "codex-native", canLoadHostModels("codex-native"), {
+    poll: selectedNativeHarness === "codex-native",
+  });
+  const { data: hostPiModelOptions, isLoading: hostPiModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "pi-native",
+    canLoadHostModels("pi-native"),
+    { poll: selectedNativeHarness === "pi-native" },
+  );
+  // Keep this host's cached choices while requests wait for readiness.
+  // A fetched catalog, including an empty one, takes precedence.
+  const cachedHostModels =
+    cachedPickerOptions &&
+    !sandboxSelected &&
+    !cachedPickerOptions.sandboxSelected &&
+    (selectedHostId === cachedPickerOptions.hostId ||
+      (selectedHostId === null &&
+        (hostsLoading || hosts?.some((host) => host.host_id === cachedPickerOptions.hostId))))
+      ? cachedPickerOptions.models
+      : undefined;
+  const hostReadinessPending = hostSelected && (hostsLoading || selectedHost?.status === "offline");
+  const availableHostModels = (
+    harness: string,
+    models: NativeModelOption[] | undefined,
+    loading: boolean,
+    cached?: NativeModelOption[],
+  ) =>
+    models ??
+    (loading ||
+    hostReadinessPending ||
+    harnessUnconfiguredOnHost(harness, selectedHost) ||
+    selectedHostId === null
+      ? cached
+      : undefined);
+  const availableClaudeModels = availableHostModels(
+    "claude-native",
+    hostClaudeModelOptions,
+    hostClaudeModelsLoading,
+    cachedHostModels?.claude,
+  );
+  const availableCodexModels = availableHostModels(
+    "codex-native",
+    hostCodexModelOptions,
+    hostCodexModelsLoading,
+    cachedHostModels?.codex,
+  );
+  const availablePiModels = availableHostModels(
+    "pi-native",
+    hostPiModelOptions,
+    hostPiModelsLoading,
+    cachedHostModels?.pi,
+  );
+  const {
+    data: hostDevinModelOptions,
+    isLoading: hostDevinModelsLoading,
+    error: hostDevinModelsError,
+  } = useHostModelOptions(selectedHostId, "devin-native", canLoadHostModels("devin-native"), {
+    poll: selectedNativeHarness === "devin-native",
+  });
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
@@ -3171,9 +3211,6 @@ export function NewChatLandingScreen() {
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
   const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // The selected native harness, used to persist/seed its option knobs (mode /
-  // model / effort), which are harness-specific. null for non-native agents,
-  // which have no knobs to remember.
   // Smart Routing as a Model choice is offered on the two native harnesses
   // whose running CLI accepts a per-turn model switch (the server injects
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
@@ -3478,9 +3515,9 @@ export function NewChatLandingScreen() {
             sandboxSelected,
             model: pickedModel,
             models: {
-              claude: hostClaudeModelOptions ?? [],
-              codex: hostCodexModelOptions ?? [],
-              pi: hostPiModelOptions ?? [],
+              claude: availableClaudeModels,
+              codex: availableCodexModels,
+              pi: availablePiModels,
             },
           }
         : null,
@@ -3490,9 +3527,9 @@ export function NewChatLandingScreen() {
       selectedHostId,
       sandboxSelected,
       pickedModel,
-      hostClaudeModelOptions,
-      hostCodexModelOptions,
-      hostPiModelOptions,
+      availableClaudeModels,
+      availableCodexModels,
+      availablePiModels,
     ],
   );
   useEffect(() => {
@@ -3837,6 +3874,12 @@ export function NewChatLandingScreen() {
         />
       </>
     ) : null;
+  const hostModelCatalogs: Record<string, NativeModelOption[] | undefined> = {
+    "claude-native": availableClaudeModels,
+    "codex-native": availableCodexModels,
+    "pi-native": availablePiModels,
+    "devin-native": hostDevinModelOptions,
+  };
   const pickerEntrySummaries = Object.fromEntries(
     [...harnessEntries, ...agentEntries].map((agent) => {
       const native = nativeCodingAgentForAvailableAgent(agent);
@@ -3846,20 +3889,27 @@ export function NewChatLandingScreen() {
       }
       const saved = readHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
-      const catalog =
-        sandboxInferenceConfigured && native.harness !== previewHarness
-          ? []
-          : native.iconKind === "claude"
-            ? claudeModelOptions
-            : native.iconKind === "codex"
-              ? codexModelOptions
-              : native.iconKind === "pi"
-                ? piModelOptions
-                : native.iconKind === "devin"
-                  ? devinModelOptions
-                  : [];
+      const catalogSuppressed = sandboxInferenceConfigured && native.harness !== previewHarness;
+      const catalog = catalogSuppressed
+        ? []
+        : native.iconKind === "claude"
+          ? claudeModelOptions
+          : native.iconKind === "codex"
+            ? codexModelOptions
+            : native.iconKind === "pi"
+              ? piModelOptions
+              : native.iconKind === "devin"
+                ? devinModelOptions
+                : [];
       const savedFusion = fusionOption(catalog)?.fusion;
-      const model = catalog.find((option) => option.id === saved.model);
+      // Preserve saved IDs while host data is absent; an empty result is authoritative.
+      const hostCatalogUnavailable =
+        !sandboxSelected &&
+        native.harness in hostModelCatalogs &&
+        hostModelCatalogs[native.harness] === undefined;
+      const model =
+        catalog.find((option) => option.id === saved.model) ??
+        (hostCatalogUnavailable && saved.model ? { id: saved.model } : undefined);
       const label = visibleModelLabel(
         savedFusion !== undefined && isFusionModelUid(saved.model)
           ? // A fusion id isn't a catalog row id, so label it from the combo.
