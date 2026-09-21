@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.runner import session_prs
 from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
@@ -479,7 +480,15 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert [entry.url for entry in store.list()] == [A]
 
 
-def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+def test_concurrent_writers_preserve_all_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 16 writes serialize through one lock, and on a CPU-contended xdist worker
+    # that queue outran the production 1s budget. Raise the budget so a late
+    # waiter still gets its turn: the invariant under test is that the merge
+    # keeps every PR, not how long a contended lock may be held.
+    monkeypatch.setattr(session_prs, "_LOCK_TIMEOUT_S", 60)
+
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)
         store.record(
