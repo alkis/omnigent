@@ -2579,10 +2579,11 @@ function ComposerImpl(
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
+  const sessionConfigPhase = useChatStore((s) => s.sessionConfigPhase);
   // Scope the shared lock to one session so an old request cannot unlock a new one.
   const configBusyRef = useMemo(() => ({ current: false, conversationId }), [conversationId]);
   const [configBusyOwner, setConfigBusyOwner] = useState<typeof configBusyRef | null>(null);
-  const configBusy = configBusyOwner === configBusyRef;
+  const configBusy = configBusyOwner === configBusyRef || sessionConfigPhase !== null;
   const setConfigBusy = useCallback(
     (busy: boolean) =>
       setConfigBusyOwner((owner) =>
@@ -2625,7 +2626,7 @@ function ComposerImpl(
       : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
-    if (isReadOnly || unreachable || configBusyRef.current) return;
+    if (isReadOnly || unreachable || configBusy || configBusyRef.current) return;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
@@ -4005,7 +4006,6 @@ function ComposerImpl(
                   key={conversationId}
                   busy={configBusy}
                   busyRef={configBusyRef}
-                  setBusy={setConfigBusy}
                   agentName={
                     subAgentName ??
                     agents?.find((agent) => agent.id === selectedAgentId)?.name ??
@@ -4636,7 +4636,6 @@ function hasSessionConfig({
 function SessionHarnessPicker({
   busy,
   busyRef,
-  setBusy,
   agentName,
   harnessLabel,
   showModels,
@@ -4655,7 +4654,6 @@ function SessionHarnessPicker({
 }: {
   busy: boolean;
   busyRef: { current: boolean };
-  setBusy: (busy: boolean) => void;
   agentName: string | null;
   harnessLabel: string | null;
   showModels: boolean;
@@ -4676,8 +4674,7 @@ function SessionHarnessPicker({
   const terminalFirst = useTerminalFirst();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const mounted = useRef(true);
+  const error = useChatStore((state) => state.sessionConfigError);
   const appliedOpenNonce = useRef(openNonce);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4743,16 +4740,10 @@ function SessionHarnessPicker({
     modelPickerKind !== "configured" &&
     terminalFirst?.terminalsAvailable === false;
   const openMenu = useCallback(() => {
-    if (disabled || busyRef.current || !configurable) return false;
+    if (disabled || busy || busyRef.current || !configurable) return false;
     setMenuOpen(true);
     return true;
-  }, [disabled, busyRef, configurable]);
-  useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
+  }, [disabled, busy, busyRef, configurable]);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
@@ -4763,49 +4754,26 @@ function SessionHarnessPicker({
   useEffect(() => {
     setMenuOpen(false);
     setConfigMenu(null);
-    setError(null);
   }, [conversationId]);
-  const isCurrentSession = () =>
-    mounted.current && useChatStore.getState().conversationId === conversationId;
-  const apply = async (change: () => Promise<unknown>) => {
-    if (disabled || busyRef.current || pendingModelChange !== null) return;
-    busyRef.current = true;
-    setBusy(true);
-    setError(null);
-    try {
-      if (needsTerminal && conversationId !== null && !isTempConvId(conversationId)) {
-        const result = await retrySession(conversationId);
-        if (!result.recovered && result.recovery !== "already_connected") {
-          throw new Error("Unable to start the session terminal");
-        }
-      }
-      if (!isCurrentSession()) return;
-      await change();
-    } catch (failure) {
-      if (isCurrentSession())
-        setError(
-          failure instanceof Error ? failure.message : "Unable to update session configuration",
-        );
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
+  const apply = (change: (sessionId: string | null) => Promise<unknown>) => {
+    if (disabled || busy || busyRef.current || pendingModelChange !== null) return;
+    return useChatStore.getState().applySessionConfig(change, { startTerminal: needsTerminal });
   };
   const selectModel = (modelId: string | null) =>
-    void apply(async () => {
+    void apply(async (sessionId) => {
       const store = useChatStore.getState();
-      await store.setModel(modelId, {
-        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
-      });
-      if (!isCurrentSession()) return;
+      await store.setModel(
+        modelId,
+        { expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex" },
+        sessionId,
+      );
       if (
         modelPickerKind === "codex" &&
         selectedEffort !== null &&
         !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)
       )
-        await store.setEffort(null);
-      if (costRoutingEligible && routingOn && isCurrentSession())
-        await store.setCostControlMode("off");
+        await store.setEffort(null, sessionId);
+      if (costRoutingEligible && routingOn) await store.setCostControlMode("off", sessionId);
     });
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
@@ -4813,11 +4781,10 @@ function SessionHarnessPicker({
   const composerFusion = composerFusionOption?.fusion;
   const fusionSelected = composerFusion !== undefined && isFusionModelUid(pickerSelectedModel);
   const selectFusionModel = (modelUid: string) =>
-    void apply(async () => {
+    void apply(async (sessionId) => {
       const store = useChatStore.getState();
-      await store.setModel(modelUid, { expectConfirmation: false });
-      if (!isCurrentSession()) return;
-      if (selectedEffort !== null) await store.setEffort(null);
+      await store.setModel(modelUid, { expectConfirmation: false }, sessionId);
+      if (selectedEffort !== null) await store.setEffort(null, sessionId);
     });
   const modelContent = (
     <>
@@ -4826,7 +4793,9 @@ function SessionHarnessPicker({
           <DropdownMenuItem
             disabled={busy || pendingModelChange !== null}
             onSelect={() =>
-              void apply(() => useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"))
+              void apply((sessionId) =>
+                useChatStore.getState().setCostControlMode(routingOn ? "off" : "on", sessionId),
+              )
             }
             data-active={routingOn ? "true" : undefined}
             className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
@@ -4925,7 +4894,8 @@ function SessionHarnessPicker({
                 label: formatStatusEffortLabel(effort) ?? effort,
                 checked: !routingOn && effort === selectedEffort,
                 disabled: routingOn || busy || pendingModelChange !== null,
-                onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                onSelect: () =>
+                  void apply((sessionId) => useChatStore.getState().setEffort(effort, sessionId)),
                 testId: `composer-agent-effort-${effort}`,
                 data: { "data-effort-level": effort },
               })),

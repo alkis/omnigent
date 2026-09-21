@@ -16,7 +16,14 @@ import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
+import {
+  bindConversationForTest,
+  releaseConversation,
+  useChatStore,
+  type ChatState,
+  type QueuedMessage,
+} from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -1056,7 +1063,11 @@ describe("Composer slash-command submit routing", () => {
       setModel.mockClear();
       fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
       await waitFor(() =>
-        expect(setModel).toHaveBeenCalledWith(row.reset ? null : "primary", expect.anything()),
+        expect(setModel).toHaveBeenCalledWith(
+          row.reset ? null : "primary",
+          expect.anything(),
+          "conv_test",
+        ),
       );
     }
   });
@@ -4138,6 +4149,8 @@ describe("Composer native picker terminal startup", () => {
       sessionModelOverride: null,
       sessionModelSeeded: false,
       pendingModelChange: null,
+      sessionConfigPhase: null,
+      sessionConfigError: null,
       llmModel: "opus",
       nativeVendorOwnsModel: false,
       sessionReasoningEffort: "high",
@@ -4157,6 +4170,8 @@ describe("Composer native picker terminal startup", () => {
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
+    releaseConversation("conv_picker_startup");
+    releaseConversation("conv_next_picker");
     useChatStore.setState(previous, true);
     vi.restoreAllMocks();
   });
@@ -4185,12 +4200,12 @@ describe("Composer native picker terminal startup", () => {
       isTerminalFirst: true,
       ...overrides,
     });
-    renderWithTooltips(
+    const view = renderWithTooltips(
       <TerminalFirstContextProvider value={terminal}>
         <Composer {...props} />
       </TerminalFirstContextProvider>,
     );
-    return { props, terminal };
+    return { props, terminal, ...view };
   }
 
   function deferred<T>() {
@@ -4224,6 +4239,21 @@ describe("Composer native picker terminal startup", () => {
       await openSessionEfforts();
       fireEvent.click(screen.getByTestId("composer-agent-effort-low"));
     }
+  }
+
+  function showSession(conversationId: string) {
+    act(() =>
+      bindConversationForTest(
+        conversationId,
+        conversationRegistry.peek(conversationId)
+          ? undefined
+          : {
+              sessionHarness: "claude-native",
+              llmModel: "opus",
+              sessionReasoningEffort: "high",
+            },
+      ),
+    );
   }
 
   function openWithHotkey() {
@@ -4267,6 +4297,7 @@ describe("Composer native picker terminal startup", () => {
       expect(screen.getByTestId("composer-agent-menu")).toBeVisible();
       expect(screen.queryByTestId("composer-model-pending")).toBeNull();
       expect(screen.queryByText("Starting terminal…")).toBeNull();
+      expect(useChatStore.getState().sessionConfigPhase).toBeNull();
       expect(sessionsApi.retrySession).not.toHaveBeenCalled();
       expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
       expect(useChatStore.getState().setEffort).not.toHaveBeenCalled();
@@ -4293,18 +4324,23 @@ describe("Composer native picker terminal startup", () => {
         expect(screen.getByTestId("composer-model-pending")).toBeInTheDocument();
         expect(screen.getByTestId("composer-agent-edit")).toHaveAttribute("data-disabled");
         expect(screen.getByTestId("composer-agent-effort-select")).toHaveAttribute("data-disabled");
+        expect(useChatStore.getState().sessionConfigPhase).toBe("starting");
 
         await act(async () => startup.resolve({ queued: false, ...result }));
         if (kind === "model") {
-          expect(confirmation.change).toHaveBeenCalledExactlyOnceWith("sonnet", {
-            expectConfirmation: true,
-          });
+          expect(confirmation.change).toHaveBeenCalledExactlyOnceWith(
+            "sonnet",
+            { expectConfirmation: true },
+            "conv_picker_startup",
+          );
         } else {
-          expect(confirmation.change).toHaveBeenCalledExactlyOnceWith("low");
+          expect(confirmation.change).toHaveBeenCalledExactlyOnceWith("low", "conv_picker_startup");
         }
+        expect(useChatStore.getState().sessionConfigPhase).toBe("applying");
         expect(screen.getByTestId("composer-model-pending")).toBeInTheDocument();
         await act(async () => confirmation.resolve());
         expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+        expect(useChatStore.getState().sessionConfigPhase).toBeNull();
         expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
         expect(props.onSend).not.toHaveBeenCalled();
         expect(terminal.setView).not.toHaveBeenCalled();
@@ -4321,6 +4357,34 @@ describe("Composer native picker terminal startup", () => {
       await act(async () => confirmation.resolve());
       expect(screen.queryByTestId("composer-model-pending")).toBeNull();
     });
+
+    it.each(["startup", "switch"] as const)(
+      "continues through a Chat/Terminal view unmount during %s",
+      async (phase) => {
+        const startup = pendingStartup();
+        const confirmation = pendingChange(kind);
+        const view = renderPicker();
+        await selectSetting(kind);
+        if (phase === "switch") {
+          await act(async () => startup.resolve({ queued: false, recovered: true }));
+        }
+        view.unmount();
+
+        if (phase === "startup") {
+          await act(async () => startup.resolve({ queued: false, recovered: true }));
+        }
+        expect(confirmation.change).toHaveBeenCalledTimes(1);
+        renderPicker();
+        expect(screen.getByTestId("composer-model-pending")).toBeInTheDocument();
+        expect(screen.getByTestId("composer-config-gear")).toBeDisabled();
+        expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
+
+        await act(async () => confirmation.resolve());
+        expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+        expect(screen.getByTestId("composer-config-gear")).toBeEnabled();
+        expect(confirmation.change).toHaveBeenCalledTimes(1);
+      },
+    );
   });
 
   it.each(["report-first", "response-first"] as const)(
@@ -4336,7 +4400,11 @@ describe("Composer native picker terminal startup", () => {
       renderPicker();
       await selectSetting("model");
       await act(async () => startup.resolve({ queued: false, recovered: true }));
-      expect(setModel).toHaveBeenCalledExactlyOnceWith("sonnet", { expectConfirmation: true });
+      expect(setModel).toHaveBeenCalledExactlyOnceWith(
+        "sonnet",
+        { expectConfirmation: true },
+        "conv_picker_startup",
+      );
       expect(screen.getByTestId("composer-agent-model-value")).toHaveTextContent("Opus");
 
       const confirm = () => useChatStore.setState({ llmModel: "sonnet", pendingModelChange: null });
@@ -4380,7 +4448,12 @@ describe("Composer native picker terminal startup", () => {
         { isNativeWrapper: false, isClaudeNative: false },
       );
       await selectSetting("effort");
-      await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith("low"));
+      await waitFor(() =>
+        expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(
+          "low",
+          "conv_picker_startup",
+        ),
+      );
       expect(sessionsApi.retrySession).not.toHaveBeenCalled();
     },
   );
@@ -4415,9 +4488,11 @@ describe("Composer native picker terminal startup", () => {
     await selectSetting("model");
     expect(sessionsApi.retrySession).toHaveBeenCalledExactlyOnceWith("conv_picker_startup");
     await act(async () => startup.resolve({ queued: false, recovered: true }));
-    expect(useChatStore.getState().setModel).toHaveBeenCalledWith("sonnet", {
-      expectConfirmation: true,
-    });
+    expect(useChatStore.getState().setModel).toHaveBeenCalledWith(
+      "sonnet",
+      { expectConfirmation: true },
+      "conv_picker_startup",
+    );
   });
 
   it.each(["rejection", "unrecovered"] as const)(
@@ -4451,14 +4526,14 @@ describe("Composer native picker terminal startup", () => {
   );
 
   it.each(["resolve", "reject"] as const)(
-    "isolates a prior session's startup %s and does not replay its open request",
+    "keeps a background session's startup %s scoped to its original selection",
     async (completion) => {
       const firstStartup = pendingStartup();
       const nextStartup = pendingStartup();
       const appliedSessions: (string | null)[] = [];
       useChatStore.setState({
-        setModel: vi.fn().mockImplementation(async () => {
-          appliedSessions.push(useChatStore.getState().conversationId);
+        setModel: vi.fn().mockImplementation(async (_model, _options, sessionId) => {
+          appliedSessions.push(sessionId);
         }),
       });
       renderPicker();
@@ -4466,7 +4541,7 @@ describe("Composer native picker terminal startup", () => {
       await selectSetting("model");
       expect(sessionsApi.retrySession).toHaveBeenCalledExactlyOnceWith("conv_picker_startup");
 
-      act(() => useChatStore.setState({ conversationId: "conv_next_picker" }));
+      showSession("conv_next_picker");
       expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
       expect(screen.queryByTestId("composer-model-pending")).toBeNull();
       expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
@@ -4480,12 +4555,20 @@ describe("Composer native picker terminal startup", () => {
         if (completion === "reject") firstStartup.reject(new Error("Previous host unavailable"));
         else firstStartup.resolve({ queued: false, recovered: true });
       });
-      expect(appliedSessions).toEqual([]);
+      expect(appliedSessions).toEqual(completion === "resolve" ? ["conv_picker_startup"] : []);
+      expect(
+        conversationRegistry.peek("conv_picker_startup")?.getState().sessionConfigPhase,
+      ).toBeNull();
+      expect(useChatStore.getState().sessionConfigPhase).toBe("starting");
       expect(screen.getByTestId("composer-model-pending")).toBeInTheDocument();
       expect(screen.getByTestId("composer-agent-edit")).toHaveAttribute("data-disabled");
       expect(screen.queryByTestId("composer-config-error")).toBeNull();
       await act(async () => nextStartup.resolve({ queued: false, recovered: true }));
-      expect(appliedSessions).toEqual(["conv_next_picker"]);
+      expect(appliedSessions).toEqual(
+        completion === "resolve"
+          ? ["conv_picker_startup", "conv_next_picker"]
+          : ["conv_next_picker"],
+      );
       expect(screen.queryByTestId("composer-model-pending")).toBeNull();
       expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled");
     },
@@ -4502,7 +4585,7 @@ describe("Composer native picker terminal startup", () => {
       await waitFor(() => expect(firstChange.change).toHaveBeenCalledTimes(1));
 
       const nextStartup = pendingStartup();
-      act(() => useChatStore.setState({ conversationId: "conv_next_picker" }));
+      showSession("conv_next_picker");
       expect(screen.queryByTestId("composer-model-pending")).toBeNull();
       await selectSetting("model");
       expect(sessionsApi.retrySession).toHaveBeenLastCalledWith("conv_next_picker");
@@ -4523,23 +4606,58 @@ describe("Composer native picker terminal startup", () => {
     },
   );
 
-  it("does not replay an unfinished selection after returning to its original session", async () => {
+  it("keeps observing one unfinished selection after returning to its original session", async () => {
     const startup = pendingStartup();
     renderPicker();
     await selectSetting("model");
-    act(() => useChatStore.setState({ conversationId: "conv_next_picker" }));
-    act(() => useChatStore.setState({ conversationId: "conv_picker_startup" }));
+    showSession("conv_next_picker");
     expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+    showSession("conv_picker_startup");
+    expect(screen.getByTestId("composer-model-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-config-gear")).toBeDisabled();
 
     await act(async () => startup.resolve({ queued: false, recovered: true }));
-    expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
+    expect(useChatStore.getState().setModel).toHaveBeenCalledExactlyOnceWith(
+      "sonnet",
+      { expectConfirmation: true },
+      "conv_picker_startup",
+    );
+    expect(screen.queryByTestId("composer-model-pending")).toBeNull();
     expect(screen.queryByTestId("composer-config-error")).toBeNull();
     await openSessionModels();
     expect(sessionsApi.retrySession).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    await waitFor(() => expect(useChatStore.getState().setModel).toHaveBeenCalledTimes(1));
-    expect(sessionsApi.retrySession).toHaveBeenCalledTimes(2);
   });
+
+  it.each(["startup", "switch"] as const)(
+    "clears pending state and retains a %s failure while the composer is unmounted",
+    async (phase) => {
+      const startup = pendingStartup();
+      const confirmation = pendingChange("model");
+      const view = renderPicker();
+      await selectSetting("model");
+      if (phase === "switch") {
+        await act(async () => startup.resolve({ queued: false, recovered: true }));
+      }
+      view.unmount();
+      await act(async () => {
+        if (phase === "startup") startup.reject(new Error("Host is offline"));
+        else confirmation.reject(new Error("Model change was not applied"));
+      });
+
+      renderPicker();
+      expect(screen.queryByTestId("composer-model-pending")).toBeNull();
+      expect(useChatStore.getState().sessionConfigPhase).toBeNull();
+      expect(screen.getByTestId("composer-config-gear")).toBeEnabled();
+      expect(screen.getByTestId("composer-config-error")).toHaveAccessibleName(
+        `Couldn't update configuration: ${phase === "startup" ? "Host is offline" : "Model change was not applied"}`,
+      );
+      useChatStore.setState({ setModel: vi.fn().mockResolvedValue(undefined) });
+      await selectSetting("model");
+      await waitFor(() => expect(useChatStore.getState().setModel).toHaveBeenCalledTimes(1));
+      expect(screen.queryByTestId("composer-config-error")).toBeNull();
+      expect(useChatStore.getState().sessionConfigPhase).toBeNull();
+    },
+  );
 });
 
 describe("Composer config gear", () => {
@@ -4916,7 +5034,9 @@ describe("Composer config gear", () => {
       );
       expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
       fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
-      await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("alternate", expect.anything(), "conv_test"),
+      );
       act(() =>
         useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }),
       );
@@ -4924,9 +5044,11 @@ describe("Composer config gear", () => {
       await openSessionModels();
       fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
       await waitFor(() =>
-        expect(setModel).toHaveBeenLastCalledWith("primary", {
-          expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
-        }),
+        expect(setModel).toHaveBeenLastCalledWith(
+          "primary",
+          { expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex" },
+          "conv_test",
+        ),
       );
       expect(setModel).toHaveBeenCalledTimes(2);
     },
@@ -5077,7 +5199,7 @@ describe("Composer config gear", () => {
 
     // Model fires first and effort waits for its promise to resolve.
     await waitFor(() =>
-      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }, "conv_test"),
     );
     expect(setEffort).not.toHaveBeenCalled();
     resolveModel();
@@ -5088,7 +5210,7 @@ describe("Composer config gear", () => {
     );
     await openSessionEfforts();
     fireEvent.click(screen.getByTestId("composer-agent-effort-low"));
-    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
+    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low", "conv_test"));
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
     expect(calls).toEqual(["model", "effort"]);
   });
@@ -5190,7 +5312,9 @@ describe("Composer config gear", () => {
 
     // The picked ultra is dropped (back to Default) and no longer offered,
     // while Luna's own max stays.
-    await waitFor(() => expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null));
+    await waitFor(() =>
+      expect(useChatStore.getState().setEffort).toHaveBeenCalledWith(null, "conv_test"),
+    );
     act(() => useChatStore.setState({ llmModel: "gpt-5.6-luna", sessionReasoningEffort: null }));
     await openSessionEfforts();
     expect(screen.queryByTestId("composer-agent-effort-default")).toBeNull();
@@ -5234,9 +5358,9 @@ describe("Composer config gear", () => {
     fireEvent.click(document.querySelector('[data-testid="composer-agent-model-opus"]') as Element);
     // The pin must be re-applied AND routing cleared.
     await waitFor(() =>
-      expect(setModel).toHaveBeenCalledWith("opus", { expectConfirmation: true }),
+      expect(setModel).toHaveBeenCalledWith("opus", { expectConfirmation: true }, "conv_test"),
     );
-    expect(setCostControlMode).toHaveBeenCalledWith("off");
+    expect(setCostControlMode).toHaveBeenCalledWith("off", "conv_test");
   });
 
   it("keeps Claude models in the primary picker alongside Smart Routing", async () => {
@@ -5306,7 +5430,7 @@ describe("Composer config gear", () => {
       const setModel = await openModalOnRoutedSession();
       fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
       await waitFor(() =>
-        expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+        expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }, "conv_test"),
       );
     });
   });
@@ -5451,9 +5575,11 @@ describe("saved sandbox inference policy", () => {
       );
       fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Fast" }));
       await waitFor(() =>
-        expect(useChatStore.getState().setModel).toHaveBeenCalledWith("private/fast", {
-          expectConfirmation: false,
-        }),
+        expect(useChatStore.getState().setModel).toHaveBeenCalledWith(
+          "private/fast",
+          { expectConfirmation: false },
+          "conv_policy",
+        ),
       );
     },
   );
