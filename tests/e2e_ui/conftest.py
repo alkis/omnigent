@@ -457,11 +457,16 @@ def _store_browser_coverage(nodeid: str, raw: Any) -> None:
     record = _coverage_records.setdefault(
         nodeid, {"status": "missing", "frontend_modules": [], "message": "missing"}
     )
-    record["frontend_modules"] = sorted(set(record["frontend_modules"]) | set(modules))
     if error:
+        if record.get("status") == "captured":
+            return
+        record["frontend_modules"] = sorted(set(record["frontend_modules"]) | set(modules))
         record["status"] = "malformed" if "malformed" in error else "missing"
         record["message"] = error
-    elif record.get("status") != "malformed":
+        return
+
+    record["frontend_modules"] = sorted(set(record["frontend_modules"]) | set(modules))
+    if record.get("status") != "malformed":
         record["status"] = "captured"
         record.pop("message", None)
 
@@ -471,7 +476,8 @@ def _capture_sync_page(nodeid: str, page: Any) -> None:
         raw = page.evaluate("() => globalThis.__coverage__ ?? null")
     except Exception as exc:  # Playwright raises several closed/target error types.
         _store_browser_coverage(nodeid, None)
-        _coverage_records[nodeid]["message"] = f"browser coverage read failed: {exc}"
+        if _coverage_records[nodeid].get("status") != "captured":
+            _coverage_records[nodeid]["message"] = f"browser coverage read failed: {exc}"
         return
     _store_browser_coverage(nodeid, raw)
 
@@ -481,16 +487,23 @@ async def _capture_async_page(nodeid: str, page: Any) -> None:
         raw = await page.evaluate("() => globalThis.__coverage__ ?? null")
     except Exception as exc:  # Playwright raises several closed/target error types.
         _store_browser_coverage(nodeid, None)
-        _coverage_records[nodeid]["message"] = f"browser coverage read failed: {exc}"
+        if _coverage_records[nodeid].get("status") != "captured":
+            _coverage_records[nodeid]["message"] = f"browser coverage read failed: {exc}"
         return
     _store_browser_coverage(nodeid, raw)
 
 
 @pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(item: pytest.Item) -> Iterator[None]:
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[Any]) -> Iterator[None]:
     """Capture sync browser coverage after the test call, including failures."""
     yield
     if os.environ.get(_COVERAGE_INDEX_ENV) != "1":
+        return
+    if call.when == "teardown":
+        _coverage_sync_contexts.pop(item.nodeid, None)
+        _coverage_sync_pages.pop(item.nodeid, None)
+        return
+    if call.when != "call":
         return
     for context in _coverage_sync_contexts.get(item.nodeid, []):
         for page in context.pages:
