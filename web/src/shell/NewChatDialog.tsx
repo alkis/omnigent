@@ -156,7 +156,11 @@ import {
   writeLastSandboxProvider,
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
-import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import {
+  readLastHarness,
+  resolveHarnessPreference,
+  writeLastHarness,
+} from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -1598,6 +1602,7 @@ export function AgentHarnessPicker({
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
     const unavailable = !readiness.selectable && readiness.fallbackRelevant;
+    const broken = readiness.state === "broken";
     const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
     return (
       <HarnessPickerEntry
@@ -1626,6 +1631,7 @@ export function AgentHarnessPicker({
         active={active}
         editable={editable}
         isMobile={isMobile}
+        disabled={broken}
         summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
         editTestId={`new-chat-landing-agent-config-${agent.id}`}
         warning={
@@ -1640,7 +1646,27 @@ export function AgentHarnessPicker({
                   <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
                 </span>
               </TooltipTrigger>
-              <TooltipContent>{warning}</TooltipContent>
+              <TooltipContent
+                className={
+                  broken
+                    ? "w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
+                    : undefined
+                }
+              >
+                {broken ? (
+                  <>
+                    <strong className="font-medium">
+                      {readiness.explanation?.label ?? "Harness unavailable"}
+                    </strong>
+                    <span className="text-xs leading-5 text-muted-foreground">
+                      {readiness.explanation?.description ??
+                        "Choose another harness or repair this harness before continuing."}
+                    </span>
+                  </>
+                ) : (
+                  warning
+                )}
+              </TooltipContent>
             </Tooltip>
           )
         }
@@ -2321,6 +2347,7 @@ export function NewChatLandingScreen() {
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
     () => restoredDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
   );
+  const agentExplicitlySelectedRef = useRef(false);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => restoredDraft?.selectedHostId ?? null,
   );
@@ -2763,6 +2790,7 @@ export function NewChatLandingScreen() {
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    agentExplicitlySelectedRef.current = false;
     setWorkspace("");
     setBranchName("");
     setAutoSeededBranch("");
@@ -3010,7 +3038,30 @@ export function NewChatLandingScreen() {
     pickedAgentId !== null &&
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((a) => a.id === pickedAgentId);
-  const effectiveAgentId =
+  const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
+  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
+  const rememberedNativeAgent = harnessEntries.find((agent) => agent.id === pickedAgentId);
+  const rememberedHarnessResolution = useMemo(
+    () =>
+      resolveHarnessPreference(
+        harnessEntries.map((agent) => ({
+          harness: nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? "",
+          readiness: harnessReadinessOnHost(agent.harness, harnessWarningHost),
+          value: agent,
+        })),
+        rememberedNativeAgent?.harness,
+      ),
+    [harnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
+  );
+  const automaticHarnessFallback =
+    projectParam === "" &&
+    !sandboxSelected &&
+    !agentExplicitlySelectedRef.current &&
+    rememberedNativeAgent != null &&
+    rememberedHarnessResolution.source === "fallback"
+      ? rememberedHarnessResolution
+      : null;
+  const defaultEffectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
@@ -3021,6 +3072,7 @@ export function NewChatLandingScreen() {
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
             : (agentList[0]?.id ?? null);
+  const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -3122,13 +3174,6 @@ export function NewChatLandingScreen() {
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
-  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
-
-  // Warn-only readiness signal for the agent picker: only meaningful when
-  // a connected host is selected (a sandbox provisions its own tooling).
-  // Selection stays allowed — the host re-checks at launch and the create
-  // call surfaces a specific error if the harness really can't run.
-  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   // Smart Routing as a Model choice is offered on the two native harnesses
   // whose running CLI accepts a per-turn model switch (the server injects
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
@@ -4854,6 +4899,7 @@ export function NewChatLandingScreen() {
   // so a return visit starts on Smart Routing again. A restored sentinel with no
   // row behind it degrades to the default pick (see the guard above).
   const handleSelectSmartRoutingHarness = () => {
+    agentExplicitlySelectedRef.current = true;
     setSmartRoutingDropped(null);
     const placeholder = smartRoutingWrappers.claude;
     if (placeholder == null) return;
@@ -4871,6 +4917,7 @@ export function NewChatLandingScreen() {
   // returning user lands on the harness they used last); explicit picks
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
+    agentExplicitlySelectedRef.current = true;
     setSmartRoutingDropped(null);
     if (agent.id !== effectiveAgentId) {
       const remembered = readLastHarness(agent.id);
@@ -4902,6 +4949,7 @@ export function NewChatLandingScreen() {
     }
   };
   const handleSelectPending = () => {
+    agentExplicitlySelectedRef.current = true;
     setPickerEdits(null);
     agentFromConfigRef.current = false;
     setPickedAgentId(PENDING_AGENT_ID);
@@ -6410,6 +6458,7 @@ export function NewChatLandingScreen() {
                       <ComposerPermissionPicker
                         label="Permission mode"
                         value="No host selected"
+                        harness={selectedNativeHarness}
                         disabled
                         options={directModeOptions}
                         onSelect={selectDirectMode}
@@ -6424,6 +6473,20 @@ export function NewChatLandingScreen() {
                       <ComposerPermissionPicker
                         label={visiblePermissionRow.label}
                         value={visiblePermissionRow.value}
+                        harness={selectedNativeHarness}
+                        selectedValue={
+                          selectedNativeHarness === "claude-native"
+                            ? permissionMode
+                            : selectedNativeHarness === "codex-native"
+                              ? bypassSandbox
+                                ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                                : approvalMode
+                              : selectedNativeHarness === "cursor-native"
+                                ? cursorExecMode
+                                : selectedNativeHarness === "antigravity-native"
+                                  ? agySkipMode
+                                  : undefined
+                        }
                         loading={pickerLoading}
                         interactiveWhileLoading={interactiveWhileLoading}
                         options={directModeOptions}
@@ -6832,6 +6895,21 @@ export function NewChatLandingScreen() {
                   hostName: harnessWarningHost?.name,
                   fallbackAgentName: selectedAgent?.display_name,
                 })}
+              </span>
+            </p>
+          )}
+
+          {automaticHarnessFallback?.candidate && automaticHarnessFallback.rejectedPreference && (
+            <p
+              className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="new-chat-landing-harness-fallback"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" />
+              <span>
+                {automaticHarnessFallback.rejectedPreference.readiness.explanation?.label ??
+                  "Preferred harness unavailable"}
+                . Using {automaticHarnessFallback.candidate.value.display_name} instead. You can
+                choose another harness from the picker.
               </span>
             </p>
           )}

@@ -4740,6 +4740,25 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-more")).toBeNull();
   });
 
+  it("falls back from an unavailable remembered native harness to the first ready harness", () => {
+    localStorage.setItem(LAST_AGENT_KEY, "a1");
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": false, "codex-native": true },
+      } as Host,
+    ]);
+
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Codex, Model GPT-5.5",
+    );
+    expect(screen.getByTestId("new-chat-landing-harness-fallback")).toHaveTextContent(
+      "Setup required. Using Codex instead",
+    );
+  });
+
   // Polly is a bundle agent whose brain harness (claude-sdk) is overridable, so
   // its Edit submenu lists every brain harness — each badged when unconfigured.
   function mockPollyWithBrainReadiness() {
@@ -5393,6 +5412,21 @@ describe("NewChatLandingScreen", () => {
     expect(warning).not.toHaveAttribute("title");
     fireEvent.focus(warning);
     expect(await screen.findByRole("tooltip")).toHaveTextContent("needs setup");
+  });
+
+  it("disables broken harness rows and explains the actionable failure", async () => {
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "future-error" } } as Host,
+    ]);
+    renderLanding();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const row = screen.getByTestId("new-chat-landing-agent-a2");
+    expect(row.closest("[data-harness-menu-row]")).toHaveAttribute("data-disabled");
+    fireEvent.focus(screen.getByTestId("new-chat-landing-agent-warning-a2"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Harness is not working");
+    expect(tooltip).toHaveTextContent("reported a harness readiness error");
   });
 
   it("gates Set up auth until the harness is installed (no auth-before-install)", () => {
@@ -8674,7 +8708,11 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
       // Exactly what an empty store would have given: the default harness pick.
       const chip = screen.getByTestId("new-chat-landing-agent-select");
       expect(chip.textContent).not.toContain("Smart Routing");
-      expect(chip).toHaveAccessibleName("Claude Code, Model Default");
+      expect(chip).toHaveAccessibleName(
+        configured?.["claude-native"] === false
+          ? "Codex, Model GPT-5.5"
+          : "Claude Code, Model Default",
+      );
       expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
       openPicker();
       expectSmartRoutingHidden();

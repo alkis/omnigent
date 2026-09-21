@@ -144,6 +144,41 @@ describe("shared composer controls", () => {
     expect(onSelect).toHaveBeenCalledWith("plan");
   });
 
+  it("exposes shared permission concepts without changing harness wire values", () => {
+    const { rerender } = render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Plan"
+        harness="claude-native"
+        selectedValue="plan"
+        options={[{ value: "plan", label: "Plan" }]}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Permission mode: Plan" })).toHaveAttribute(
+      "data-permission-concept",
+      "read-only",
+    );
+
+    rerender(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Read only"
+        harness="codex-native"
+        selectedValue="read-only"
+        options={[{ value: "default", label: "Automatic" }]}
+        onSelect={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Permission mode: Read only" });
+    expect(trigger).toHaveAttribute("data-permission-concept", "read-only");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(screen.getByRole("menuitem", { name: "Automatic" })).toHaveAttribute(
+      "data-permission-concept",
+      "automatic",
+    );
+  });
+
   it.each([false, true])(
     "restores permission focus unless another menu has opened (next menu=%s)",
     async (nextMenuOpen) => {
