@@ -32,7 +32,12 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      started_at: ${{ steps.lane_start.outputs.epoch }}
     steps:
+      - name: Record impacted lane start after security gate
+        id: lane_start
+        run: echo "epoch=$(date -u +%s)" >> "$GITHUB_OUTPUT"
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Set up Rust toolchain
@@ -66,8 +71,6 @@ jobs:
     timeout-minutes: 25
     continue-on-error: true
     steps:
-      - name: Record lane start
-        run: echo "IMPACTED_E2E_STARTED_AT=$(date -u +%s)" >> "$GITHUB_ENV"
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -243,8 +246,9 @@ jobs:
           REASON: ${{ steps.selection.outputs.reason }}
           SELECTED_COUNT: ${{ steps.selection.outputs.selected_count }}
           FULL_COUNT: ${{ steps.selection.outputs.full_count }}
+          STARTED_AT: ${{ needs.build-sidecar.outputs.started_at }}
         run: |
-          elapsed="$(( $(date -u +%s) - IMPACTED_E2E_STARTED_AT ))"
+          elapsed="$(( $(date -u +%s) - STARTED_AT ))"
           {
             echo "## Impacted E2E signal"
             echo
@@ -252,7 +256,7 @@ jobs:
             echo "- Confidence: \`${CONFIDENCE:-none}\`"
             echo "- Fallback/selection reasons: ${REASON:-selection step did not complete}"
             echo "- Selected tests: ${SELECTED_COUNT:-unknown} / ${FULL_COUNT:-unknown}"
-            echo "- Time to first E2E signal: ${elapsed}s"
+            echo "- Time to first E2E signal (measured after security gate): ${elapsed}s"
             echo "- Merge gating: nonblocking; the five authoritative E2E UI shards remain unchanged"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload impacted-lane diagnostics
