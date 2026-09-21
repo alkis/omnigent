@@ -63,7 +63,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { iconForAgent } from "@/components/AgentCard";
-import claudeLogo from "@/assets/claude.svg";
+import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
@@ -107,6 +107,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
+  harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
@@ -155,7 +156,11 @@ import {
   writeLastSandboxProvider,
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
-import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import {
+  readLastHarness,
+  resolveHarnessPreference,
+  writeLastHarness,
+} from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -258,7 +263,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import {
   useHostWorktrees,
-  useVerifiedGithubWorktrees,
+  useVerifiedGitWorktrees,
   type HostWorktree,
 } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
@@ -1256,10 +1261,14 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * every required parameter. Hitting send POSTs /v1/sessions and
  * navigates to the new session — there is no modal.
  */
-const COMPOSER_HARNESS_ICONS: Record<string, { src: string; invertInDark: boolean }> = {
+const COMPOSER_HARNESS_ICONS: Record<
+  string,
+  { src: string; invertInDark: boolean; className?: string }
+> = {
   claude: {
-    src: claudeLogo,
+    src: claudeCodeLogo,
     invertInDark: false,
+    className: "-translate-y-[0.5px]",
   },
   cursor: {
     src: "data:image/svg+xml,%3csvg%20fill='currentColor'%20fill-rule='evenodd'%20height='1em'%20style='flex:none;line-height:1'%20viewBox='0%200%2024%2024'%20width='1em'%20xmlns='http://www.w3.org/2000/svg'%3e%3ctitle%3eCursor%3c/title%3e%3cpath%20d='M22.106%205.68L12.5.135a.998.998%200%2000-.998%200L1.893%205.68a.84.84%200%2000-.419.726v11.186c0%20.3.16.577.42.727l9.607%205.547a.999.999%200%2000.998%200l9.608-5.547a.84.84%200%2000.42-.727V6.407a.84.84%200%2000-.42-.726zm-.603%201.176L12.228%2022.92c-.063.108-.228.064-.228-.061V12.34a.59.59%200%2000-.295-.51l-9.11-5.26c-.107-.062-.063-.228.062-.228h18.55c.264%200%20.428.286.296.514z'%3e%3c/path%3e%3c/svg%3e",
@@ -1298,7 +1307,11 @@ export function ComposerAgentIcon({ agent }: { agent: Pick<AvailableAgent, "name
       src={product.src}
       alt=""
       aria-hidden="true"
-      className={cn("size-4 shrink-0 object-contain", product.invertInDark && "dark:invert")}
+      className={cn(
+        "size-4 shrink-0 object-contain",
+        product.className,
+        product.invertInDark && "dark:invert",
+      )}
     />
   ) : (
     <FallbackIcon className="size-4 shrink-0" aria-hidden="true" />
@@ -1595,11 +1608,10 @@ export function AgentHarnessPicker({
       : "";
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
-    const unavailable = harnessUnconfiguredOnHost(agent.harness, host);
-    const warning = harnessWarningBadgeText(
-      harnessUnavailableReasonOnHost(agent.harness, host),
-      collapsedBadge,
-    );
+    const readiness = harnessReadinessOnHost(agent.harness, host);
+    const unavailable = !readiness.selectable && readiness.fallbackRelevant;
+    const broken = readiness.state === "broken";
+    const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -1627,18 +1639,43 @@ export function AgentHarnessPicker({
         active={active}
         editable={editable}
         isMobile={isMobile}
+        disabled={broken}
         summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
         editTestId={`new-chat-landing-agent-config-${agent.id}`}
         warning={
           unavailable && (
-            <span
-              title={warning}
-              aria-label={warning}
-              data-testid={`new-chat-landing-agent-warning-${agent.id}`}
-              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
-            >
-              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
-            </span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  aria-label={warning}
+                  data-testid={`new-chat-landing-agent-warning-${agent.id}`}
+                  className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+                >
+                  <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent
+                className={
+                  broken
+                    ? "w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
+                    : undefined
+                }
+              >
+                {broken ? (
+                  <>
+                    <strong className="font-medium">
+                      {readiness.explanation?.label ?? "Harness unavailable"}
+                    </strong>
+                    <span className="text-xs leading-5 text-muted-foreground">
+                      {readiness.explanation?.description ??
+                        "Choose another harness or repair this harness before continuing."}
+                    </span>
+                  </>
+                ) : (
+                  warning
+                )}
+              </TooltipContent>
+            </Tooltip>
           )
         }
       />
@@ -1657,7 +1694,9 @@ export function AgentHarnessPicker({
     const secondaryOrder = ["opencode", "pi"];
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
-      if (!selected && hideUnconfigured && harnessUnconfiguredOnHost(agent.harness, host)) continue;
+      const readiness = harnessReadinessOnHost(agent.harness, host);
+      if (!selected && hideUnconfigured && !readiness.selectable && readiness.fallbackRelevant)
+        continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
       if (primaryOrder.includes(key) || agent.id === promotedHarnessId) {
         ready.push(agent);
@@ -2316,6 +2355,7 @@ export function NewChatLandingScreen() {
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
     () => restoredDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
   );
+  const agentExplicitlySelectedRef = useRef(false);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => restoredDraft?.selectedHostId ?? null,
   );
@@ -2718,6 +2758,7 @@ export function NewChatLandingScreen() {
     setSandboxSelected(false);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    agentExplicitlySelectedRef.current = false;
     setWorkspace("");
     setBranchName("");
     setAutoSeededBranch("");
@@ -2965,7 +3006,32 @@ export function NewChatLandingScreen() {
     pickedAgentId !== null &&
     pickedAgentId !== PENDING_AGENT_ID &&
     !agentList.some((a) => a.id === pickedAgentId);
-  const effectiveAgentId =
+  const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
+  // Readiness is meaningful only for a connected host; managed sandboxes
+  // provision their own tooling and should not drive fallback warnings.
+  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
+  const rememberedNativeAgent = harnessEntries.find((agent) => agent.id === pickedAgentId);
+  const rememberedHarnessResolution = useMemo(
+    () =>
+      resolveHarnessPreference(
+        harnessEntries.map((agent) => ({
+          harness: nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? "",
+          readiness: harnessReadinessOnHost(agent.harness, harnessWarningHost),
+          value: agent,
+        })),
+        rememberedNativeAgent?.harness,
+      ),
+    [harnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
+  );
+  const automaticHarnessFallback =
+    projectParam === "" &&
+    !sandboxSelected &&
+    !agentExplicitlySelectedRef.current &&
+    rememberedNativeAgent != null &&
+    rememberedHarnessResolution.source === "fallback"
+      ? rememberedHarnessResolution
+      : null;
+  const defaultEffectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
@@ -2976,6 +3042,7 @@ export function NewChatLandingScreen() {
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
             : (agentList[0]?.id ?? null);
+  const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -2990,8 +3057,9 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  // The selected native harness persists and restores harness-specific model,
+  // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
-  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
   // Wait for readiness before prefetching. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings.
   const canLoadHostModels = (harness: string) =>
@@ -3151,12 +3219,6 @@ export function NewChatLandingScreen() {
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
   const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-
-  // Warn-only readiness signal for the agent picker: only meaningful when
-  // a connected host is selected (a sandbox provisions its own tooling).
-  // Selection stays allowed — the host re-checks at launch and the create
-  // call surfaces a specific error if the harness really can't run.
-  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   // Smart Routing as a Model choice is offered on the two native harnesses
   // whose running CLI accepts a per-turn model switch (the server injects
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
@@ -4287,13 +4349,13 @@ export function NewChatLandingScreen() {
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
-  const verifiedGithubWorktrees = useVerifiedGithubWorktrees({
+  const verifiedGitWorktrees = useVerifiedGitWorktrees({
     hostId: selectedHostId,
     requestedPath: worktreesEnabled ? workspaceTrimmed : null,
     worktrees: hostWorktrees,
     resolved: !hostWorktreesArePlaceholder && hostWorktrees !== undefined,
   });
-  const workspaceHasVerifiedGithubRemote = verifiedGithubWorktrees.length > 0;
+  const workspaceIsGit = verifiedGitWorktrees.length > 0;
   const workspaceIsNonGit =
     worktreesEnabled && !hostWorktreesArePlaceholder && hostWorktrees?.length === 0;
 
@@ -4309,12 +4371,12 @@ export function NewChatLandingScreen() {
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
   const linkedWorktrees = useMemo(
-    () => verifiedGithubWorktrees.filter((worktree) => !worktree.is_main),
-    [verifiedGithubWorktrees],
+    () => verifiedGitWorktrees.filter((worktree) => !worktree.is_main),
+    [verifiedGitWorktrees],
   );
   const mainWorktree = useMemo(
-    () => verifiedGithubWorktrees.find((worktree) => worktree.is_main) ?? null,
-    [verifiedGithubWorktrees],
+    () => verifiedGitWorktrees.find((worktree) => worktree.is_main) ?? null,
+    [verifiedGitWorktrees],
   );
   // The worktree the picked directory currently points at, if any. Set when
   // the user navigated the picker straight into a worktree folder, or clicked
@@ -4346,18 +4408,18 @@ export function NewChatLandingScreen() {
   // the workspace is a worktree and the branch field still holds its
   // prefilled branch (the user hasn't edited it to request a new worktree).
   const startInExistingWorktree =
-    workspaceHasVerifiedGithubRemote &&
+    workspaceIsGit &&
     activeWorktree !== null &&
     prefilledBranch !== "" &&
     branchName.trim() === prefilledBranch;
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree =
-    workspaceHasVerifiedGithubRemote && branchName.trim() !== "" && !startInExistingWorktree;
+    workspaceIsGit && branchName.trim() !== "" && !startInExistingWorktree;
   const worktreeVerificationPending =
     worktreesEnabled &&
     !workspaceIsNonGit &&
-    !workspaceHasVerifiedGithubRemote &&
+    !workspaceIsGit &&
     (hostWorktreesArePlaceholder || hostWorktrees === undefined);
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a
@@ -4459,7 +4521,7 @@ export function NewChatLandingScreen() {
     // Need the git-ness probe for the CURRENT workspace resolved (not the
     // anti-flicker placeholder from a previous path).
     if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
-    if (!workspaceHasVerifiedGithubRemote) return;
+    if (!workspaceIsGit) return;
     worktreeSeededForRef.current = workspaceTrimmed;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
@@ -4473,7 +4535,7 @@ export function NewChatLandingScreen() {
     prefilledBranch,
     hostWorktrees,
     hostWorktreesArePlaceholder,
-    workspaceHasVerifiedGithubRemote,
+    workspaceIsGit,
     generateBranchName,
   ]);
 
@@ -4833,7 +4895,7 @@ export function NewChatLandingScreen() {
         : (selectedHostDisplayName ?? "No host selected");
   const worktreeControlAvailable =
     !sandboxSelected &&
-    workspaceHasVerifiedGithubRemote &&
+    workspaceIsGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
@@ -4895,6 +4957,7 @@ export function NewChatLandingScreen() {
   // so a return visit starts on Smart Routing again. A restored sentinel with no
   // row behind it degrades to the default pick (see the guard above).
   const handleSelectSmartRoutingHarness = () => {
+    agentExplicitlySelectedRef.current = true;
     setSmartRoutingDropped(null);
     const placeholder = smartRoutingWrappers.claude;
     if (placeholder == null) return;
@@ -4912,6 +4975,7 @@ export function NewChatLandingScreen() {
   // returning user lands on the harness they used last); explicit picks
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
+    agentExplicitlySelectedRef.current = true;
     setSmartRoutingDropped(null);
     if (agent.id !== effectiveAgentId) {
       const remembered = readLastHarness(agent.id);
@@ -4943,6 +5007,7 @@ export function NewChatLandingScreen() {
     }
   };
   const handleSelectPending = () => {
+    agentExplicitlySelectedRef.current = true;
     setPickerEdits(null);
     agentFromConfigRef.current = false;
     setPickedAgentId(PENDING_AGENT_ID);
@@ -5710,10 +5775,10 @@ export function NewChatLandingScreen() {
       kind="directory"
       label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
       icon={
-        workspaceHasVerifiedGithubRemote ? (
+        workspaceIsGit ? (
           <FolderGit2Icon
             className="size-3.5 shrink-0"
-            data-testid="new-chat-landing-workspace-icon-github"
+            data-testid="new-chat-landing-workspace-icon-git"
           />
         ) : (
           <FolderIcon
@@ -5849,7 +5914,7 @@ export function NewChatLandingScreen() {
               </Popover>
               {/* Worktree selection stays a separate real action from the directory picker. */}
               {(!workspaceLoading || cachedWorkspace !== null) &&
-                (noExecutionTargetSelected || workspaceHasVerifiedGithubRemote) && (
+                (noExecutionTargetSelected || workspaceIsGit) && (
                   <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                     <PopoverTrigger asChild>
                       <ComposerWorkspaceTrigger
@@ -6451,6 +6516,7 @@ export function NewChatLandingScreen() {
                       <ComposerPermissionPicker
                         label="Permission mode"
                         value="No host selected"
+                        harness={selectedNativeHarness}
                         disabled
                         options={directModeOptions}
                         onSelect={selectDirectMode}
@@ -6465,6 +6531,22 @@ export function NewChatLandingScreen() {
                       <ComposerPermissionPicker
                         label={visiblePermissionRow.label}
                         value={visiblePermissionRow.value}
+                        harness={selectedNativeHarness}
+                        selectedValue={
+                          selectedNativeHarness === "claude-native"
+                            ? permissionMode
+                            : selectedNativeHarness === "codex-native"
+                              ? bypassSandbox
+                                ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                                : approvalMode
+                              : selectedNativeHarness === "cursor-native"
+                                ? cursorExecMode
+                                : selectedNativeHarness === "antigravity-native"
+                                  ? agySkipMode
+                                  : selectedNativeHarness === "devin-native"
+                                    ? devinPermissionMode
+                                    : undefined
+                        }
                         loading={pickerLoading}
                         interactiveWhileLoading={interactiveWhileLoading}
                         options={directModeOptions}
@@ -6873,6 +6955,21 @@ export function NewChatLandingScreen() {
                   hostName: harnessWarningHost?.name,
                   fallbackAgentName: selectedAgent?.display_name,
                 })}
+              </span>
+            </p>
+          )}
+
+          {automaticHarnessFallback?.candidate && automaticHarnessFallback.rejectedPreference && (
+            <p
+              className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="new-chat-landing-harness-fallback"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" />
+              <span>
+                {automaticHarnessFallback.rejectedPreference.readiness.explanation?.label ??
+                  "Preferred harness unavailable"}
+                . Using {automaticHarnessFallback.candidate.value.display_name} instead. You can
+                choose another harness from the picker.
               </span>
             </p>
           )}

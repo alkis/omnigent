@@ -28,9 +28,10 @@ import {
   FolderIcon,
   Loader2Icon,
   MessagesSquareIcon,
+  TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -45,6 +46,7 @@ import {
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
+import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -1129,7 +1131,12 @@ export function ChatPage() {
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
   if (urlConvId) {
-    if (loadingConversation || activeConversationId !== urlConvId) return <HydratingPlaceholder />;
+    const promotingTempConversation =
+      isTempConvId(urlConvId) &&
+      activeConversationId !== null &&
+      !isTempConvId(activeConversationId);
+    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
+      return <HydratingPlaceholder />;
     if (conversationLoadError) {
       return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
     }
@@ -3677,6 +3684,7 @@ function ComposerImpl(
               tokensUsed={composerTokensUsed}
             />
             <BackgroundTaskIndicator />
+            <SubagentTaskIndicator conversationId={conversationId} />
           </div>
         </ComposerWorkspaceBar>
       </div>
@@ -3970,6 +3978,10 @@ function ComposerImpl(
                 <ComposerPermissionPicker
                   label="Permission mode"
                   value={permissionLabel || "Permission mode"}
+                  harness={sessionHarness}
+                  selectedValue={
+                    showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
+                  }
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}
@@ -4979,9 +4991,30 @@ function SessionHarnessPicker({
         )}
       </HarnessPicker>
       {error && (
-        <span role="alert" className="max-w-40 text-xs text-destructive">
-          {error}
-        </span>
+        <TooltipProvider delayDuration={0}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label={`Couldn't update configuration: ${error}`}
+                className="flex size-7 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/10"
+                data-testid="composer-config-error"
+              >
+                <TriangleAlertIcon className="size-4" aria-hidden="true" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent
+              side="top"
+              className="w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
+              data-testid="composer-config-error-tooltip"
+            >
+              <strong className="font-medium">Couldn’t update configuration</strong>
+              <span className="text-xs leading-5 text-muted-foreground">
+                {error} Try again, or reconnect the session if the problem continues.
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       )}
     </>
   );
