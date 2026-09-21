@@ -1,0 +1,31 @@
+{
+  "capture_errors": [],
+  "complete": true,
+  "coverage": {
+    "api_routes": false,
+    "css": false,
+    "frontend_modules": true
+  },
+  "generated_at": "2026-09-21T00:00:00+00:00",
+  "modules": {
+    "web/src/components/Consumer.tsx": [
+      "tests/e2e_ui/chat/test_consumer.py::test_consumer"
+    ],
+    "web/src/components/Direct.tsx": [
+      "tests/e2e_ui/chat/test_direct.py::test_direct"
+    ]
+  },
+  "repository_sha": "fixture-sha",
+  "schema_version": 1,
+  "shards": ["0/5", "1/5", "2/5", "3/5", "4/5"],
+  "tests": {
+    "tests/e2e_ui/chat/test_consumer.py::test_consumer": {
+      "frontend_modules": ["web/src/components/Consumer.tsx"],
+      "status": "captured"
+    },
+    "tests/e2e_ui/chat/test_direct.py::test_direct": {
+      "frontend_modules": ["web/src/components/Direct.tsx"],
+      "status": "captured"
+    }
+  }
+}
