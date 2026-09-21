@@ -242,20 +242,14 @@ export interface RecoverableUnsentMessage extends UnsentMessage {
 /**
  * The oldest recoverable message for `conversationId` that this page has not
  * yet recovered, or `undefined`. Does not mark it: the caller decides whether
- * it can be shown, then calls `markUnsentRecovered`. A previous page's record
- * whose POST got no answer is dropped instead: the server may have processed
- * it, and this page can never learn the outcome.
+ * it can be shown, then calls `markUnsentRecovered`. A record whose POST got no
+ * answer is never offered — the server may have processed it — but it is kept
+ * in storage rather than destroyed: it may be the only copy of the text.
  */
 export function peekUnsentMessage(conversationId: string): RecoverableUnsentMessage | undefined {
-  const stored = loadUnsentMessages();
-  const uncertain = (recordId: string, message: UnsentMessage): boolean =>
-    message.postedAt !== undefined && !unsentThisPage.has(recordId);
-  const messages = Object.fromEntries(
-    Object.entries(stored).filter(([recordId, message]) => !uncertain(recordId, message)),
-  );
-  if (Object.keys(messages).length !== Object.keys(stored).length) saveUnsentMessages(messages);
-  for (const [recordId, message] of Object.entries(messages)) {
+  for (const [recordId, message] of Object.entries(loadUnsentMessages())) {
     if (message.conversationId !== conversationId || unsentThisPage.has(recordId)) continue;
+    if (message.postedAt !== undefined) continue;
     return { ...message, recordId };
   }
   return undefined;

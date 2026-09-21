@@ -2467,8 +2467,12 @@ describe("chatStore — send (first-send ordering)", () => {
       JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
     expect(Object.values(stored()).every((r) => r.postedAt === undefined)).toBe(true);
 
-    // No answer at all: the server may have processed it, so the copy keeps
-    // its posted mark and a later page will not offer it for resend.
+    // No answer at all, or a 502 (the server raises it when the runner's
+    // response was lost, possibly after the runner took the message): the
+    // outcome is unknown, so the copy keeps its posted mark and a later page
+    // will not offer it for resend.
+    status = 502;
+    await useChatStore.getState().send("did the gateway drop it?", "agent_xyz");
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
         return Promise.reject(new TypeError("Failed to fetch"));
@@ -2477,7 +2481,7 @@ describe("chatStore — send (first-send ordering)", () => {
     });
     await useChatStore.getState().send("did it land?", "agent_xyz");
     const uncertain = Object.values(stored()).filter((r) => r.postedAt !== undefined);
-    expect(uncertain).toHaveLength(1);
+    expect(uncertain).toHaveLength(2);
   });
 
   it("retires a slash command's durable copy on a definitive rejection", async () => {

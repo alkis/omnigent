@@ -152,10 +152,10 @@ describe("unsent messages", () => {
     expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_other"]);
   });
 
-  it("drops a previous page's record whose POST got no answer instead of offering it", async () => {
-    // The server may have processed that message; this page can never learn
-    // the outcome, so the message must not be resent. A record the server
-    // answered with a rejection is recoverable again.
+  it("never offers a record whose POST got no answer, but keeps it stored", async () => {
+    // The server may have processed that message, so it must not be resent —
+    // yet the record may be the only copy of the text, so it is not destroyed.
+    // A record the server answered with a rejection is recoverable again.
     sessionStorage.setItem(
       unsentKey,
       JSON.stringify({
@@ -166,7 +166,10 @@ describe("unsent messages", () => {
     const { peekUnsentMessage, markUnsentPosted, markUnsentAnswered, recordUnsentMessage } =
       await import("./sessionDrafts");
     expect(peekUnsentMessage("conv")?.recordId).toBe("sid_safe");
-    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_safe"]);
+    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual([
+      "sid_lost",
+      "sid_safe",
+    ]);
 
     recordUnsentMessage("sid_now", { conversationId: "conv", text: "posted now" });
     markUnsentPosted("sid_now");

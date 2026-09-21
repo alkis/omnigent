@@ -3154,14 +3154,16 @@ function pendingRetryIdentity(
 }
 
 /**
- * Settle a message's durable copy after its POST failed. A response from the
- * server means the message was not processed: the copy stays recoverable, and
- * a definitive rejection (a 4xx other than 401, which only sends the user
- * through login) retires it. No response — a network failure — leaves the
- * outcome unknown, so the copy keeps its `postedAt` and is never resent.
+ * Settle a message's durable copy after its POST failed. Only an answer the
+ * server gives before dispatching proves the message was not processed: a 4xx,
+ * or a 503 (no runner took it). Such a copy stays recoverable, and a definitive
+ * 4xx (other than 401, which only sends the user through login) retires it.
+ * Anything else — no response, or a 500/502/504 the server can also raise
+ * after the runner already received the message — leaves the outcome unknown,
+ * so the copy keeps its `postedAt` and is never offered for resend.
  */
 function settleUnsentRecord(recordId: string, err: unknown): void {
-  if (!(err instanceof ApiError)) return;
+  if (!(err instanceof ApiError) || (err.status >= 500 && err.status !== 503)) return;
   markUnsentAnswered(recordId);
   if (isDefinitiveRequestError(err) && err.status !== 401) clearUnsentMessage(recordId);
 }
