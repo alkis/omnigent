@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useWorkspaceLayoutStore } from "@/store/workspaceLayout";
 import { WorkspacePage } from "./WorkspacePage";
@@ -97,6 +98,8 @@ describe("WorkspacePage", () => {
     resizeObserverCallback = null;
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
     localStorage.clear();
+    writeSessionWorkspaceState("session-a", { open: true });
+    writeSessionWorkspaceState("session-b", { open: true });
     useWorkspaceLayoutStore.getState().reset("session-a");
   });
 

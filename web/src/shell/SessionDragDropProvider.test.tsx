@@ -12,11 +12,14 @@ import {
 let dndProps: Record<string, (event: unknown) => void> = {};
 
 vi.mock("@dnd-kit/core", () => ({
+  closestCenter: () => [],
   DndContext: ({ children, ...props }: { children: React.ReactNode }) => {
     dndProps = props as typeof dndProps;
     return children;
   },
   DragOverlay: ({ children }: { children: React.ReactNode }) => children,
+  KeyboardSensor: function KeyboardSensor() {},
+  MeasuringStrategy: { Always: "always" },
   MouseSensor: function MouseSensor() {},
   pointerWithin: () => [],
   TouchSensor: function TouchSensor() {},
@@ -37,6 +40,15 @@ function SidebarDropProbe({
   useEffect(
     () => registerSidebarDropHandler((drag, target) => onDrop(drag, target)),
     [onDrop, registerSidebarDropHandler],
+  );
+  return null;
+}
+
+function ProjectOrderDropProbe({ onDrop }: { onDrop: (from: string, to: string) => void }) {
+  const { registerProjectOrderDropHandler } = useSessionDragDrop();
+  useEffect(
+    () => registerProjectOrderDropHandler((from, to) => onDrop(from, to)),
+    [onDrop, registerProjectOrderDropHandler],
   );
   return null;
 }
@@ -103,6 +115,32 @@ describe("SessionDragDropProvider", () => {
       expect.objectContaining({ id: "session-a", label: "Session A" }),
       target,
     );
+  });
+
+  it("delegates project ordering without treating the project as a session", () => {
+    const onDrop = vi.fn();
+    render(
+      <MemoryRouter>
+        <SessionDragDropProvider>
+          <ProjectOrderDropProbe onDrop={onDrop} />
+        </SessionDragDropProvider>
+      </MemoryRouter>,
+    );
+
+    const active = {
+      id: "project:Alpha",
+      data: { current: { type: "project-order", name: "Alpha" } },
+    };
+
+    act(() => {
+      dndProps.onDragStart?.({ active });
+      dndProps.onDragEnd?.({
+        active,
+        over: { data: { current: { type: "project-order", name: "Beta" } } },
+      });
+    });
+
+    expect(onDrop).toHaveBeenCalledWith("Alpha", "Beta");
   });
 
   it("moves the dragged session into the pane on a center drop", () => {
