@@ -39,6 +39,8 @@ from typing import Any
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.fork_session import _wait_for_new_session_id, list_session_ids
+
 # Repository the SOURCE session records. The dialog must prefill from it, and
 # the fork request must carry it back composed with its branch.
 _SOURCE_REPO_URL = "https://github.com/omnigent-ai/fixture-repo"
@@ -225,17 +227,17 @@ def test_fork_onto_managed_sandbox_with_no_host_online(
     # The host-directory chrome is gone: a sandbox has no path to browse yet.
     expect(page.get_by_test_id("fork-session-branch-input")).to_have_count(0)
 
+    before_ids = list_session_ids(base_url)
     submit = page.get_by_test_id("fork-session-submit")
     expect(submit).to_be_enabled()
     submit.click()
 
-    # Land in a DIFFERENT session — still on the source means navigation never
-    # fired; a visible dialog means the fork call failed.
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    expect(dialog).not_to_be_visible()
+    # Async fork: the dialog closes and the user stays on the source (no
+    # navigation); the forwarded (non-managed) clone materializes in the
+    # background. A visible dialog would mean the fork call failed.
+    expect(dialog).not_to_be_visible(timeout=30_000)
+    expect(page).to_have_url(re.compile(rf".*/c/{re.escape(session_id)}(\?.*)?$"))
+    _wait_for_new_session_id(base_url, before_ids, timeout_ms=30_000)
 
     # (3) The request the dialog actually produced.
     assert len(fork_bodies) == 1, f"expected exactly one fork request, got {fork_bodies}"

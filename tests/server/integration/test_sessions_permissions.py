@@ -413,6 +413,22 @@ async def _list_permissions(
     )
 
 
+async def _fork_as(
+    client: httpx.AsyncClient,
+    source_id: str,
+    user: str,
+) -> str:
+    """Fork as *user* (synchronous 201) and return the fork id.
+
+    The deep-copy + owner grant run inline; the finished session is returned.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/fork", json={}, headers={"X-Forwarded-Email": user}
+    )
+    assert resp.status_code == 201, f"fork should be created, got {resp.status_code}: {resp.text}"
+    return resp.json()["id"]
+
+
 # ── Critical CUJ: full grant/revoke/list lifecycle ──────────
 
 
@@ -2289,11 +2305,12 @@ async def test_stream_session_denied_without_access(
 
 async def test_fork_session_requires_read_access(
     auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A user with no access cannot fork; a user with read access can.
 
     Bryan creates S1. Nobody tries to fork -> 404 (no access).
-    Bryan grants corey read. Corey forks -> 201.
+    Bryan grants corey read. Corey forks -> 202 (then materializes).
     """
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(
@@ -2324,25 +2341,21 @@ async def test_fork_session_requires_read_access(
     )
     assert resp.status_code == 200
 
-    # Corey forks -> succeeds.
-    resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/fork",
-        json={},
-        headers={"X-Forwarded-Email": "corey"},
+    # Corey forks -> accepted, then materializes.
+    fork_id = await _fork_as(auth_client, session_id, "corey")
+    assert fork_id != session_id, "Fork should have a new session id."
+    fork_snap = await auth_client.get(
+        f"/v1/sessions/{fork_id}", headers={"X-Forwarded-Email": "corey"}
     )
-    assert resp.status_code == 201, (
-        f"Corey with read access should be able to fork, got {resp.status_code}."
-    )
-    fork = resp.json()
-    assert fork["id"] != session_id, "Fork should have a new session id."
-    assert fork["permission_level"] == LEVEL_OWNER, (
-        f"Forking user should be the owner of the new session, "
-        f"got permission_level={fork['permission_level']}."
+    assert fork_snap.status_code == 200, fork_snap.text
+    assert fork_snap.json()["permission_level"] == LEVEL_OWNER, (
+        "Forking user should be the owner of the new session, got "
+        f"permission_level={fork_snap.json()['permission_level']}."
     )
 
     # Bryan should NOT have access to Corey's fork.
     resp = await auth_client.get(
-        f"/v1/sessions/{fork['id']}",
+        f"/v1/sessions/{fork_id}",
         headers={"X-Forwarded-Email": "bryan"},
     )
     assert resp.status_code == 404, (
@@ -2798,6 +2811,7 @@ async def test_create_session_rejects_other_users_host(
 
 async def test_read_only_collaborator_can_fork_and_owns_the_fork(
     auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A read-only collaborator can fork a shared session; the fork is
     owned by the forking user and its permissions are isolated from the
@@ -2813,13 +2827,7 @@ async def test_read_only_collaborator_can_fork_and_owns_the_fork(
     assert grant.status_code == 200
 
     # A read-only collaborator can fork.
-    fork_resp = await auth_client.post(
-        f"/v1/sessions/{source_id}/fork",
-        json={},
-        headers={"X-Forwarded-Email": "corey"},
-    )
-    assert fork_resp.status_code == 201, fork_resp.text
-    fork_id = fork_resp.json()["id"]
+    fork_id = await _fork_as(auth_client, source_id, "corey")
 
     # Fork: corey owns it, bryan has no grant on it.
     fork_perms = {

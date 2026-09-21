@@ -18,6 +18,7 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -30,6 +31,32 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
   },
+}));
+
+// fork_status handling: mock the runner-bind lookup + launch, the reopen
+// opener, and the toast surface so the provider's branches are observable.
+const takePendingForkBind = vi.fn();
+const reopenForkDialogForSource = vi.fn();
+vi.mock("@/lib/forkOperations", () => ({
+  takePendingForkBind: (...a: unknown[]) => takePendingForkBind(...a),
+  reopenForkDialogForSource: (...a: unknown[]) => reopenForkDialogForSource(...a),
+  registerPendingForkBind: vi.fn(),
+  setForkDialogReopener: vi.fn(),
+}));
+const launchRunner = vi.fn((..._a: unknown[]) => Promise.resolve({ runnerId: "r1" }));
+vi.mock("@/lib/sessionsApi", async (importActual) => ({
+  ...(await importActual<typeof SessionsApiModule>()),
+  launchRunner: (...a: Parameters<typeof SessionsApiModule.launchRunner>) => launchRunner(...a),
+}));
+const toastSuccess = vi.fn();
+const toastError = vi.fn();
+const toastLoading = vi.fn();
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), {
+    success: (...a: unknown[]) => toastSuccess(...a),
+    error: (...a: unknown[]) => toastError(...a),
+    loading: (...a: unknown[]) => toastLoading(...a),
+  }),
 }));
 
 import { SidebarDataProvider, useSidebarView } from "./useSidebarData";
@@ -98,6 +125,12 @@ function lastWatched(): string[] {
 beforeEach(() => {
   setWatched.mockClear();
   subscribe.mockClear();
+  takePendingForkBind.mockReset();
+  reopenForkDialogForSource.mockReset();
+  launchRunner.mockClear();
+  toastSuccess.mockReset();
+  toastError.mockReset();
+  toastLoading.mockReset();
 });
 
 afterEach(() => {
@@ -626,4 +659,120 @@ it("keeps a directly opened shared session watched and permission-aware with the
     client.clear();
     vi.unstubAllGlobals();
   }
+});
+
+describe("SessionUpdatesProvider fork_status frames", () => {
+  function frameListener(client: QueryClient): (frame: unknown) => void {
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const fn = subscribe.mock.calls.at(-1)?.[0] as unknown as (frame: unknown) => void;
+    expect(fn).toBeTypeOf("function");
+    return fn;
+  }
+
+  it("on ready with a pending coding-fork bind, launches the runner and shows success", () => {
+    const client = new QueryClient();
+    takePendingForkBind.mockReturnValue({
+      hostId: "host_1",
+      workspace: "/repo",
+      git: { branchName: "feature/x" },
+    });
+    const dispatch = frameListener(client);
+
+    act(() =>
+      dispatch({
+        type: "fork_status",
+        operation_id: "op-1",
+        source_id: "conv_src",
+        status: "ready",
+        fork_id: "conv_fork",
+        error: null,
+      }),
+    );
+
+    // The deferred bind is consumed and fired with the just-arrived fork id.
+    expect(takePendingForkBind).toHaveBeenCalledWith("op-1");
+    expect(launchRunner).toHaveBeenCalledWith("host_1", "conv_fork", "/repo", {
+      branchName: "feature/x",
+    });
+    expect(toastSuccess).toHaveBeenCalledWith(
+      "Session cloned",
+      expect.objectContaining({ id: "op-1" }),
+    );
+  });
+
+  it("on ready with NO pending bind (sandbox/chat), shows success without launching", () => {
+    const client = new QueryClient();
+    takePendingForkBind.mockReturnValue(undefined);
+    const dispatch = frameListener(client);
+
+    act(() =>
+      dispatch({
+        type: "fork_status",
+        operation_id: "op-2",
+        source_id: "conv_src",
+        status: "ready",
+        fork_id: "conv_fork",
+        error: null,
+      }),
+    );
+
+    expect(launchRunner).not.toHaveBeenCalled();
+    expect(toastSuccess).toHaveBeenCalledWith(
+      "Session cloned",
+      expect.objectContaining({ id: "op-2" }),
+    );
+  });
+
+  it("on failed, clears the pending bind and shows an error toast with a retry action", () => {
+    const client = new QueryClient();
+    takePendingForkBind.mockReturnValue(undefined);
+    const dispatch = frameListener(client);
+
+    act(() =>
+      dispatch({
+        type: "fork_status",
+        operation_id: "op-3",
+        source_id: "conv_src",
+        status: "failed",
+        fork_id: null,
+        error: "Couldn't clone the session. Try again.",
+      }),
+    );
+
+    // The orphaned bind is dropped and the error toast reuses the operation id.
+    expect(takePendingForkBind).toHaveBeenCalledWith("op-3");
+    expect(launchRunner).not.toHaveBeenCalled();
+    const [msg, opts] = toastError.mock.calls.at(-1) as [
+      string,
+      { id: string; action: { onClick: () => void } },
+    ];
+    expect(msg).toBe("Couldn't clone the session. Try again.");
+    expect(opts.id).toBe("op-3");
+    // "Try again" reopens the dialog for the SOURCE session.
+    opts.action.onClick();
+    expect(reopenForkDialogForSource).toHaveBeenCalledWith("conv_src");
+  });
+
+  it("on cloning (reconnect replay / other tab), shows the loading toast", () => {
+    const client = new QueryClient();
+    const dispatch = frameListener(client);
+
+    act(() =>
+      dispatch({
+        type: "fork_status",
+        operation_id: "op-4",
+        source_id: "conv_src",
+        status: "cloning",
+        fork_id: null,
+        error: null,
+      }),
+    );
+
+    expect(toastLoading).toHaveBeenCalledWith(
+      "Cloning session…",
+      expect.objectContaining({ id: "op-4" }),
+    );
+    expect(launchRunner).not.toHaveBeenCalled();
+  });
 });

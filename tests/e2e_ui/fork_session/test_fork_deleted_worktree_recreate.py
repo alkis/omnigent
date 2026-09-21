@@ -59,6 +59,7 @@ import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry
+from tests.e2e_ui.fork_session import _wait_for_new_session_id, list_session_ids
 
 # Unique marker so other tests' transcripts can't satisfy this test's
 # content assertions.
@@ -226,9 +227,12 @@ def test_fork_deleted_worktree_same_name_succeeds(
     # ── Submit WITHOUT changing anything ─────────────────────────────────
     # The branch field still matches the source branch → usingSourceWorktree
     # is true → effectiveWorkspace is the (deleted) worktree directory.
-    # The pre-flight for that path will 404.  Without the fix the dialog
-    # surfaces an error here; with the fix it falls back to the create path.
+    # The pre-flight (still synchronous in handleFork, before the fork POST)
+    # for that path will 404.  Without the fix the dialog surfaces an error
+    # here; with the fix it falls back to the create path and stashes the
+    # runner bind, which fires once the async fork reports ready.
 
+    before_ids = list_session_ids(base_url)
     submit.click()
 
     # ── Assert 1: no error toast ──────────────────────────────────────────
@@ -240,18 +244,19 @@ def test_fork_deleted_worktree_same_name_succeeds(
     # may already be in the DOM but hidden; we just need it not displayed.
     expect(error_locator).not_to_be_visible(timeout=5_000)
 
-    # ── Assert 2: navigation to a new session ────────────────────────────
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})(conv_)?[0-9a-f]+"),
-        timeout=30_000,
-    )
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # ── Assert 2: async accept — dialog closes, no navigation ────────────
+    # The fork POST is async now: the dialog closes and the user stays on the
+    # source. The clone materializes in the background; resolve its id.
+    dialog = page.get_by_test_id("fork-session-dialog")
+    expect(dialog).not_to_be_visible(timeout=30_000)
+    expect(page).to_have_url(re.compile(rf".*/c/{re.escape(session_id)}(\?.*)?$"))
+    fork_id = _wait_for_new_session_id(base_url, before_ids, timeout_ms=30_000)
     assert fork_id != session_id
 
     # ── Assert 3: runner launched with git options ────────────────────────
-    # The fix must take the create-new-worktree path (not just skip the
-    # pre-flight): the runner POST must carry git options so the host
-    # actually recreates the worktree at the original path + branch.
+    # The deferred coding-fork bind fires on the ready event (client-side),
+    # taking the create-new-worktree path: the runner POST must carry git
+    # options so the host recreates the worktree at the original path + branch.
     deadline = time.monotonic() + 30.0
     while not runner_bodies and time.monotonic() < deadline:
         time.sleep(0.2)

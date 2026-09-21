@@ -411,7 +411,8 @@ async def test_fork_is_unbound_and_only_forker_can_bind_runner(
     )
     assert grant.status_code == 200, grant.text
 
-    # Bob (read-only) forks Alice's session.
+    # Bob (read-only) forks Alice's session. Synchronous fork: the POST
+    # materializes the clone (with Bob's owner grant) and returns 201.
     fork_resp = await auth_client.post(
         f"/v1/sessions/{alice_session['id']}/fork",
         json={},

@@ -668,10 +668,13 @@ async def test_saved_profile_fork_accepts_an_alias_for_the_same_harness(env: _En
     )
     snapshot = await env.catalog.prepare("agent_sandbox", source_harness, "local")
     source = env.store.create_conversation(agent_id=source_agent_id, inference_snapshot=snapshot)
+    # Synchronous fork (no async_operation_id) — a same-harness alias is
+    # accepted and the finished session is returned.
     response = await env.client.post(
         f"/v1/sessions/{source.id}/fork", json={"agent_id": target_agent_id}
     )
     assert response.status_code == 201, response.text
+    assert env.store.get_conversation(response.json()["id"]) is not None
 
 
 @pytest.mark.parametrize("unbound_harness", [False, True])
@@ -752,6 +755,7 @@ async def test_same_harness_fork_validates_model_against_saved_policy(
     original = env.store.get_conversation(session_id)
     response = await env.client.post(f"/v1/sessions/{session_id}/fork", json=selection)
     if expected is None:
+        # A disallowed model is rejected synchronously (400), nothing created.
         assert response.status_code == 400, response.text
         assert "configured model list" in response.text
         assert env.persisted() == before

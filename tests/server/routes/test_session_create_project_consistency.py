@@ -191,6 +191,7 @@ async def test_explicit_agent_differing_from_pin_is_allowed_silently(
 
 async def test_fork_of_mismatched_session_stays_clean(
     project_create_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forking a session whose agent differs from its project files into the
     same project and surfaces no warning."""
@@ -206,6 +207,8 @@ async def test_fork_of_mismatched_session_stays_clean(
         headers=_headers(),
     )
     assert moved.status_code == 200, moved.text
+
+    # Synchronous fork (201) returns the finished session directly.
     fork = await project_create_client.post(
         f"/v1/sessions/{session_id}/fork", json={}, headers=_headers()
     )

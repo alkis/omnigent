@@ -769,6 +769,14 @@ export async function createBundledSession(
  * `options.title` is only sent when provided; omitted, the server derives
  * `"Fork of <source title>"`.
  *
+ * The deep-copy is a background operation (a large source took 66s), so a
+ * normal fork returns `{ accepted: true }` with an operation id as soon as
+ * the server accepts it: the destination session enters the sidebar via the
+ * session-updates stream, and a `fork_status` event flips to `ready`/`failed`
+ * once materialization finishes. A `sideChat` fork instead needs its id at
+ * once (it opens a Workspace-rail tab), so the server runs it synchronously
+ * and this returns `{ accepted: false, session }`.
+ *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param options.title - Optional title for the new fork.
  * @param options.agentId - Optional built-in agent to switch the fork to
@@ -812,9 +820,20 @@ export async function forkSession(
     sandbox?: { provider?: string | null; workspace?: string | null };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
+    /**
+     * Opt into asynchronous materialization: the POST returns 202 immediately
+     * with this operation id and progress arrives as `fork_status` events on
+     * the session-updates stream. The CALLER generates this id and registers
+     * its pending state (toast, deferred runner bind) BEFORE calling, so a fast
+     * `ready` event can't race the registration. Omitted → synchronous 201 +
+     * the finished session (the contract non-web clients rely on).
+     */
+    asyncOperationId?: string;
   } = {},
-): Promise<Session> {
-  const { title, agentId, upToResponseId, config, sandbox, sideChat } = options;
+): Promise<
+  { accepted: true; operationId: string; sourceId: string } | { accepted: false; session: Session }
+> {
+  const { title, agentId, upToResponseId, config, sandbox, sideChat, asyncOperationId } = options;
   const body: {
     title?: string;
     agent_id?: string;
@@ -827,9 +846,13 @@ export async function forkSession(
     sandbox_provider?: string;
     workspace?: string | null;
     side_chat?: boolean;
+    async_operation_id?: string;
   } = {};
   if (sideChat) {
     body.side_chat = true;
+  }
+  if (asyncOperationId !== undefined) {
+    body.async_operation_id = asyncOperationId;
   }
   if (title !== undefined) {
     body.title = title;
@@ -871,7 +894,16 @@ export async function forkSession(
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  // 202: opted-in async materialization (asyncOperationId set) — an operation
+  // handle. 201: synchronous fork (the default) — the finished session.
+  if (res.status === 202) {
+    const wire = await readJsonOrThrow<{ operation_id: string; source_id: string }>(res);
+    return { accepted: true, operationId: wire.operation_id, sourceId: wire.source_id };
+  }
+  return {
+    accepted: false,
+    session: sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+  };
 }
 
 /**
@@ -899,7 +931,12 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
     // caller shows an error instead of opening a dead tab.
     throw new Error("This session has no host to run a side chat on.");
   }
-  const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
+  const result = await forkSession(sourceId, { title: "Side chat", sideChat: true });
+  // A side-chat fork is synchronous, so the server always returns the session.
+  if (result.accepted) {
+    throw new Error("Side chat fork unexpectedly returned an async handle.");
+  }
+  const fork = result.session;
   await launchRunner(
     hostId,
     fork.id,
@@ -957,16 +994,19 @@ export async function switchSessionAgent(sessionId: string, agentId: string): Pr
  * @throws Error carrying the server's failure detail (e.g. a duplicate
  *   branch or an offline host) so the picker can surface it inline.
  */
+/** Worktree/branch options for {@link launchRunner}. */
+export interface LaunchRunnerGitOptions {
+  branchName: string;
+  baseBranch?: string;
+  existingWorktree?: boolean;
+  existingBranch?: boolean;
+}
+
 export async function launchRunner(
   hostId: string,
   sessionId: string,
   workspace: string,
-  git?: {
-    branchName: string;
-    baseBranch?: string;
-    existingWorktree?: boolean;
-    existingBranch?: boolean;
-  },
+  git?: LaunchRunnerGitOptions,
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;

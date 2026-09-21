@@ -21,12 +21,11 @@ CLI needed).
 
 from __future__ import annotations
 
-import re
-
 import httpx
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.fork_session import list_session_ids, submit_fork_and_open_clone
 
 # Two distinct code words with no shared substring, so the kept/dropped
 # assertions can't satisfy each other. Only the KEPT word is part of the
@@ -97,6 +96,7 @@ def test_fork_from_middle_truncates_history(
     # two-turn conversation). The action lives inside that bubble's action
     # bar (dimmed until hover but clickable); scoping the locator to the
     # first bubble guarantees we pass turn 1's response id, not turn 2's.
+    before_ids = list_session_ids(base_url)
     first_assistant = assistant.nth(0)
     first_assistant.hover()
     first_assistant.get_by_test_id("fork-from-response").click()
@@ -108,16 +108,10 @@ def test_fork_from_middle_truncates_history(
     expect(dialog.get_by_text("Fork from this response")).to_be_visible()
     submit = page.get_by_test_id("fork-session-submit")
     expect(submit).to_have_text("Clone")
-    submit.click()
 
-    # Land in a DIFFERENT session — a URL still on the source means
-    # navigation never fired; a visible dialog means the fork call failed.
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    expect(dialog).not_to_be_visible()
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # Async fork: submit closes the dialog WITHOUT navigating (the user stays
+    # on the source); the clone appears in the session list, then we open it.
+    fork_id = submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
     assert fork_id != session_id
 
     # (1) DOM truncation: the kept user turn is present, the dropped one is

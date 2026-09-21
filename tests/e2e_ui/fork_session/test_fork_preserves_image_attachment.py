@@ -19,11 +19,12 @@ the API level in ``tests/e2e/test_cross_family_fork_image_attachment_e2e.py``
 from __future__ import annotations
 
 import base64
-import re
 import time
 from pathlib import Path
 
 from playwright.sync_api import Page, Response, expect
+
+from tests.e2e_ui.fork_session import list_session_ids, submit_fork_and_open_clone
 
 _COMPOSER_LABEL = "Message the agent"
 _SCREENSHOT_NAME = "fork-attachment.png"
@@ -96,18 +97,14 @@ def test_fork_carries_image_reference_and_its_resource(
     # Fork via the header menu's "Fork" item — a full clone of the whole
     # session, not anchored to any one response, so it doesn't depend on
     # the assistant turn having produced renderable text.
+    before_ids = list_session_ids(base_url)
     page.get_by_test_id("header-conversation-actions").click()
     page.get_by_role("menuitem", name="Fork", exact=True).click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
-    page.get_by_test_id("fork-session-submit").click()
 
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    expect(dialog).not_to_be_visible()
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # Async fork: submit closes the dialog without navigating; open the clone.
+    fork_id = submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
     assert fork_id != session_id
 
     # The forked transcript renders a user bubble with an <img> tag — the

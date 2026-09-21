@@ -34,13 +34,13 @@ the native CLI to take a turn.
 from __future__ import annotations
 
 import os
-import re
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _FILES_PROBE_ENV_AGENT_NAME
+from tests.e2e_ui.fork_session import list_session_ids, submit_fork_and_open_clone
 
 # Unique marker so the copied-transcript assertion can't match UI chrome or
 # another test's message.
@@ -135,6 +135,7 @@ def test_fork_switch_agent_carries_history(
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
     expect(assistant).to_be_visible(timeout=60_000)
 
+    before_ids = list_session_ids(base_url)
     assistant.hover()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
@@ -147,15 +148,10 @@ def test_fork_switch_agent_carries_history(
     option = page.get_by_test_id(f"fork-session-agent-option-{target_agent_id}")
     expect(option).to_be_visible()
     option.click()
-    page.get_by_test_id("fork-session-submit").click()
 
-    # The switch fork succeeds and navigates to a NEW session id.
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    expect(dialog).not_to_be_visible()
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # Fork materialization is async: submit closes the dialog WITHOUT
+    # navigating; the clone appears in the session list, then we open it.
+    fork_id = submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
     assert fork_id != session_id
 
     # The copied transcript carries the source's marked user turn (history
@@ -233,6 +229,7 @@ def test_fork_into_pi_labels_model_picker_pi(
     expect(assistant).to_be_visible(timeout=60_000)
 
     # Fork from the response, switching the agent to Pi.
+    before_ids = list_session_ids(base_url)
     assistant.hover()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
@@ -241,14 +238,9 @@ def test_fork_into_pi_labels_model_picker_pi(
     option = page.get_by_test_id(f"fork-session-agent-option-{pi_agent_id}")
     expect(option).to_be_visible()
     option.click()
-    page.get_by_test_id("fork-session-submit").click()
 
-    # Land on the new Pi-bound fork (a distinct session id).
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # Async fork: submit closes the dialog without navigating; open the clone.
+    fork_id = submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
     assert fork_id != session_id
 
     # The fork clones the target under its own name (no "(fork …)" suffix —

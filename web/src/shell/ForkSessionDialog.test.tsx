@@ -11,7 +11,9 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
-import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { forkSession } from "@/lib/sessionsApi";
+import { registerPendingForkBind, takePendingForkBind } from "@/lib/forkOperations";
+import { toast } from "sonner";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -34,6 +36,15 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("@/lib/forkOperations", () => ({
+  registerPendingForkBind: vi.fn(),
+  takePendingForkBind: vi.fn(),
+  reopenForkDialogForSource: vi.fn(),
+  setForkDialogReopener: vi.fn(),
+}));
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), { loading: vi.fn(), success: vi.fn(), error: vi.fn() }),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -69,7 +80,22 @@ vi.mock("./WorkspacePicker", async (importActual) => ({
 }));
 
 const forkSessionMock = vi.mocked(forkSession);
-const launchRunnerMock = vi.mocked(launchRunner);
+const registerPendingForkBindMock = vi.mocked(registerPendingForkBind);
+const takePendingForkBindMock = vi.mocked(takePendingForkBind);
+const toastLoadingMock = vi.mocked(toast.loading);
+const toastErrorMock = vi.mocked(toast.error);
+
+// The dialog generates the operation id via crypto.randomUUID(); pin it so the
+// id-based assertions (toast id, registerPendingForkBind key) are stable.
+const OP_ID = "forkop_conv_src_ab12";
+
+// A successful fork returns an async operation handle (202), not the finished
+// session — materialization runs in the background.
+const FORK_ACCEPTED = {
+  accepted: true as const,
+  operationId: OP_ID,
+  sourceId: "conv_src",
+};
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 const useHostsMock = vi.mocked(useHosts);
@@ -209,8 +235,15 @@ function openAdvanced(): void {
 
 beforeEach(() => {
   forkSessionMock.mockReset();
-  launchRunnerMock.mockReset();
+  registerPendingForkBindMock.mockReset();
+  takePendingForkBindMock.mockReset();
+  toastLoadingMock.mockReset();
+  toastErrorMock.mockReset();
   navigateMock.mockReset();
+  // The dialog owns the operation id (crypto.randomUUID); pin it for assertions.
+  vi.spyOn(crypto, "randomUUID").mockReturnValue(
+    OP_ID as `${string}-${string}-${string}-${string}-${string}`,
+  );
   // The submit pre-flight passes by default; the nonexistent-directory
   // test overrides it with a failure message.
   checkHostDirectoryMock.mockReset();
@@ -266,12 +299,10 @@ describe("ForkSessionDialog", () => {
     expect(input).toHaveAttribute("placeholder", "Name the cloned session");
   });
 
-  it("forks with the edited title, refreshes the list, and navigates into the fork", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+  it("forks with the edited title, closes, and shows a Cloning toast without navigating", async () => {
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
 
-    const { invalidateSpy } = renderDialog();
+    renderDialog();
 
     openAdvanced();
     fireEvent.change(screen.getByTestId("fork-session-title-input"), {
@@ -289,14 +320,19 @@ describe("ForkSessionDialog", () => {
       agentId: undefined,
       upToResponseId: undefined,
       config: {},
+      asyncOperationId: OP_ID,
       sandbox: undefined,
     });
-    // Session list refreshed so the fork shows in the sidebar, then navigated.
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
-    // A fork inherits the source's project, so the project-folder lists must
-    // refetch too — otherwise a filed fork stays missing from its folder.
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    // The fork is async now: a non-modal "Cloning…" toast keyed to the
+    // operation, and the user stays put (no navigation). The finished session
+    // enters the sidebar via the session-updates stream, not from here.
+    await waitFor(() =>
+      expect(toastLoadingMock).toHaveBeenCalledWith(
+        "Cloning session…",
+        expect.objectContaining({ id: "forkop_conv_src_ab12" }),
+      ),
+    );
+    expect(navigateMock).not.toHaveBeenCalled();
   });
 
   it("spins the submit button while the fork is in flight", async () => {
@@ -318,14 +354,18 @@ describe("ForkSessionDialog", () => {
     expect(submit).toBeDisabled();
     expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
 
-    settle({ id: "conv_fork" } as Fork);
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    settle(FORK_ACCEPTED);
+    // Once accepted, the "Cloning…" toast fires and the dialog closes.
+    await waitFor(() =>
+      expect(toastLoadingMock).toHaveBeenCalledWith(
+        "Cloning session…",
+        expect.objectContaining({ id: "forkop_conv_src_ab12" }),
+      ),
+    );
   });
 
   it("passes the truncation point through on a 'fork from here' and retitles the dialog", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
     renderDialog({ sourceTitle: "My session", upToResponseId: "resp_cut" });
 
     // A truncated fork renames the dialog so the user knows history after
@@ -342,14 +382,13 @@ describe("ForkSessionDialog", () => {
       agentId: undefined,
       upToResponseId: "resp_cut",
       config: {},
+      asyncOperationId: OP_ID,
       sandbox: undefined,
     });
   });
 
   it("omits the title (server derives it) when the field is cleared", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
     renderDialog();
 
     openAdvanced();
@@ -365,14 +404,13 @@ describe("ForkSessionDialog", () => {
       agentId: undefined,
       upToResponseId: undefined,
       config: {},
+      asyncOperationId: OP_ID,
       sandbox: undefined,
     });
   });
 
   it("pressing Enter in the title input submits the fork", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
 
     renderDialog();
 
@@ -382,18 +420,26 @@ describe("ForkSessionDialog", () => {
     });
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    await waitFor(() => expect(toastLoadingMock).toHaveBeenCalledTimes(1));
   });
 
-  it("surfaces the server error inline on failure and does not navigate", async () => {
+  it("rolls back and surfaces a rejected fork as the operation's error toast", async () => {
+    // The dialog closes and registers its pending state BEFORE the POST, so a
+    // 4xx (validation / access) rejection can't go back to an inline error —
+    // it rolls back the optimistic bind and reuses the operation's toast id.
     forkSessionMock.mockRejectedValue(new Error("403 forbidden"));
     renderDialog();
 
     fireEvent.click(screen.getByTestId("fork-session-submit"));
 
     await waitFor(() =>
-      expect(screen.getByTestId("fork-session-error")).toHaveTextContent("403 forbidden"),
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "403 forbidden",
+        expect.objectContaining({ id: OP_ID }),
+      ),
     );
+    // The optimistic registration is undone so no orphaned bind lingers.
+    expect(takePendingForkBindMock).toHaveBeenCalledWith(OP_ID);
     // A failed fork must not navigate the user away from the source session.
     expect(navigateMock).not.toHaveBeenCalled();
   });
@@ -583,9 +629,7 @@ describe("ForkSessionDialog", () => {
   });
 
   it("passes the chosen agent_id when switching agent", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
     renderDialog();
 
     openAgentSelect();
@@ -605,14 +649,13 @@ describe("ForkSessionDialog", () => {
       agentId: "ag_claude_native",
       upToResponseId: undefined,
       config: {},
+      asyncOperationId: OP_ID,
       sandbox: undefined,
     });
   });
 
   it("emits only the run-config fields the user actually changed", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
     renderDialog();
 
     // Switch to claude-native so the run-config section renders.
@@ -633,14 +676,13 @@ describe("ForkSessionDialog", () => {
       agentId: "ag_claude_native",
       upToResponseId: undefined,
       config: { terminalLaunchArgs: ["--permission-mode", "plan"] },
+      asyncOperationId: OP_ID,
       sandbox: undefined,
     });
   });
 
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
-    forkSessionMock.mockResolvedValue({
-      id: "conv_fork",
-    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+    forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
     renderDialog();
 
     // Switch to codex-native so the Approval row (with the 4th bypass option)
@@ -662,6 +704,7 @@ describe("ForkSessionDialog", () => {
       agentId: "ag_codex_native",
       upToResponseId: undefined,
       config: { terminalLaunchArgs: [], codexBypassSandbox: true },
+      asyncOperationId: OP_ID,
       sandbox: undefined,
     });
   });
@@ -752,15 +795,10 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-advanced-content")).not.toBeInTheDocument();
     });
 
-    it("forks, navigates immediately, and fires the runner launch in the background", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      // Launch never resolves: proves navigation does NOT await it (the old
-      // awaited flow blocked the modal here — the freeze report).
-      launchRunnerMock.mockReturnValue(new Promise(() => {}));
+    it("closes and shows a Cloning toast, deferring the runner bind to the ready event", async () => {
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
 
-      const { invalidateSpy } = renderDialog(CODING);
+      renderDialog(CODING);
 
       // Host (source host, online) and directory (source workspace) are
       // prefilled, so the button is enabled without further input.
@@ -774,20 +812,28 @@ describe("ForkSessionDialog", () => {
         agentId: undefined,
         upToResponseId: undefined,
         config: {},
+        asyncOperationId: OP_ID,
         sandbox: undefined,
       });
-      // Navigation happens even though the launch promise is still pending.
-      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
-      // The launch was kicked off (in the background) on the prefilled host/dir.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/repo", undefined);
-      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+      // The user stays put; a "Cloning…" toast keyed to the operation appears.
+      await waitFor(() =>
+        expect(toastLoadingMock).toHaveBeenCalledWith(
+          "Cloning session…",
+          expect.objectContaining({ id: "forkop_conv_src_ab12" }),
+        ),
+      );
+      expect(navigateMock).not.toHaveBeenCalled();
+      // The runner bind is deferred (fired on the ready event, not here) with
+      // the prefilled host/dir and no git options.
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/repo",
+        git: undefined,
+      });
     });
 
-    it("forwards git worktree options when a branch is named", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+    it("defers a git-worktree bind when a branch is named", async () => {
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
 
       renderDialog({ ...CODING, sourceGitBranch: "main" });
 
@@ -798,12 +844,16 @@ describe("ForkSessionDialog", () => {
       });
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
       // The base ref is sent automatically from the source's branch ("main");
       // the named branch makes the host create an isolated worktree.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/repo", {
-        branchName: "feature/x",
-        baseBranch: "main",
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/repo",
+        git: {
+          branchName: "feature/x",
+          baseBranch: "main",
+        },
       });
     });
 
@@ -827,24 +877,20 @@ describe("ForkSessionDialog", () => {
     });
 
     it("binds the clone to the source's existing worktree when left untouched", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog(WORKTREE_CODING);
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
       // The prefilled branch already exists, so no git options are sent —
       // the clone binds straight to the source's worktree directory. The
       // pre-flight probed that same directory.
-      expect(launchRunnerMock).toHaveBeenCalledWith(
-        "host_1",
-        "conv_fork",
-        "/Users/a/repo-worktrees/fix-1",
-        undefined,
-      );
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/Users/a/repo-worktrees/fix-1",
+        git: undefined,
+      });
       expect(checkHostDirectoryMock).toHaveBeenCalledWith(
         "host_1",
         "/Users/a/repo-worktrees/fix-1",
@@ -852,10 +898,7 @@ describe("ForkSessionDialog", () => {
     });
 
     it("recreates the source worktree when its directory was deleted and the name is untouched", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       // The worktree pre-flight fails — the directory is gone — but the
       // miss is a 404, so the fork recreates the worktree at the same
       // branch instead of erroring. The repo path itself is intact.
@@ -869,23 +912,22 @@ describe("ForkSessionDialog", () => {
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-      // Launched from the REPO path with the prefilled branch (which already
-      // exists) — the host adds the worktree back at the conventional path.
-      // existingBranch (not baseBranch): the branch survives its deleted
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
+      // Bind is deferred from the REPO path with the prefilled branch (which
+      // already exists) — the host adds the worktree back at the conventional
+      // path. existingBranch (not baseBranch): the branch survives its deleted
       // directory, so it is checked out rather than re-created.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
-        branchName: "fix-1",
-        existingBranch: true,
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/Users/a/repo",
+        git: { branchName: "fix-1", existingBranch: true },
       });
       // Both the worktree path and the repo fallback path were pre-flighted.
       expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/Users/a/repo");
     });
 
     it("still errors when the repo path is also missing (nothing to recreate from)", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       // Worktree gone (404 miss) AND the repo itself gone: the recreate
       // fallback has nothing to launch from, so the fork must abort.
       checkHostDirectoryMock.mockResolvedValue(
@@ -897,13 +939,11 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
       await waitFor(() => expect(screen.getByText(/doesn't exist on this host/i)).toBeTruthy());
-      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(registerPendingForkBindMock).not.toHaveBeenCalled();
     });
 
     it("still errors when the pre-flight fails for a reason other than a missing directory", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       // Host unreachable: NOT a 404 miss, so no worktree-recreate fallback.
       checkHostDirectoryMock.mockResolvedValue(
         "Couldn't verify the working directory. Check your connection and try again.",
@@ -916,14 +956,11 @@ describe("ForkSessionDialog", () => {
       await waitFor(() =>
         expect(screen.getByText(/Couldn't verify the working directory/i)).toBeTruthy(),
       );
-      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(registerPendingForkBindMock).not.toHaveBeenCalled();
     });
 
     it("creates a fresh worktree off the source branch when the branch is renamed", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog(WORKTREE_CODING);
 
       openAdvanced();
@@ -932,12 +969,13 @@ describe("ForkSessionDialog", () => {
       });
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
       // A NEW branch name → worktree created off the original repo, based on
       // the source's branch so the clone starts from where it left off.
-      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
-        branchName: "feature/x",
-        baseBranch: "fix-1",
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/Users/a/repo",
+        git: { branchName: "feature/x", baseBranch: "fix-1" },
       });
     });
 
@@ -946,10 +984,7 @@ describe("ForkSessionDialog", () => {
       // bind sends no git options), so forking the fork must recover both
       // the repo and the branch from the worktree path convention — the
       // branch falls back to the worktree's directory name.
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog({ ...WORKTREE_CODING, sourceGitBranch: null });
 
       openAdvanced();
@@ -958,15 +993,14 @@ describe("ForkSessionDialog", () => {
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
       // Untouched → same aliasing as a gitBranch-carrying source: bind the
       // exact source worktree directory with no git options.
-      expect(launchRunnerMock).toHaveBeenCalledWith(
-        "host_1",
-        "conv_fork",
-        "/Users/a/repo-worktrees/fix-1",
-        undefined,
-      );
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/Users/a/repo-worktrees/fix-1",
+        git: undefined,
+      });
     });
 
     it("enables the submit for a typed tilde path without opening the browser", async () => {
@@ -976,10 +1010,7 @@ describe("ForkSessionDialog", () => {
       // the user discovered the tree browser. The dialog now resolves ~
       // against the host's home (from the home listing) so the typed path is
       // directly submittable.
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       // Home listing: the first entry's parent (/Users/a) resolves the host's
       // home, so "~/git/omnigent" expands to "/Users/a/git/omnigent".
       useHostFilesystemMock.mockReturnValue({
@@ -999,25 +1030,21 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(screen.getByTestId("fork-session-submit")).toBeEnabled());
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-      // Launched with the resolved absolute path, not the raw tilde.
-      expect(launchRunnerMock).toHaveBeenCalledWith(
-        "host_1",
-        "conv_fork",
-        "/Users/a/git/omnigent",
-        undefined,
-      );
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
+      // Bind deferred with the resolved absolute path, not the raw tilde.
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/Users/a/git/omnigent",
+        git: undefined,
+      });
     });
 
     it("adopts an absolute path picked from the tree browser", async () => {
       // The browse route: open the tree browser and click "Select". The
       // picker commits an absolute path (onSelect), which enables the submit
-      // and launches on it. (Typed ~-paths resolve directly, tested above —
-      // this covers the still-live browser path.)
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      // and defers the bind on it. (Typed ~-paths resolve directly, tested
+      // above — this covers the still-live browser path.)
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog(CODING);
 
       openAdvanced();
@@ -1036,13 +1063,12 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toBeEnabled();
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
-      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
-      expect(launchRunnerMock).toHaveBeenCalledWith(
-        "host_1",
-        "conv_fork",
-        "/Users/a/git/omnigent",
-        undefined,
-      );
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
+      expect(registerPendingForkBindMock).toHaveBeenCalledWith("forkop_conv_src_ab12", {
+        hostId: "host_1",
+        workspace: "/Users/a/git/omnigent",
+        git: undefined,
+      });
     });
 
     it("refuses to create the fork when the directory doesn't exist", async () => {
@@ -1056,10 +1082,10 @@ describe("ForkSessionDialog", () => {
       await waitFor(() =>
         expect(screen.getByTestId("fork-session-error")).toHaveTextContent("doesn't exist"),
       );
-      // Nothing was created: no fork, no launch, no navigation — the inputs
-      // stay editable so the user can fix the path and resubmit.
+      // Nothing was created: no fork, no deferred bind, no navigation — the
+      // inputs stay editable so the user can fix the path and resubmit.
       expect(forkSessionMock).not.toHaveBeenCalled();
-      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(registerPendingForkBindMock).not.toHaveBeenCalled();
       expect(navigateMock).not.toHaveBeenCalled();
     });
 
@@ -1128,21 +1154,19 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
     });
 
-    it("still navigates when the background launch rejects (failure doesn't block)", async () => {
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      // The launch fails in the background; the dialog must NOT surface it
-      // (it has closed + navigated) — recovery is the session page's picker.
-      launchRunnerMock.mockRejectedValue(new Error("host busy"));
+    it("hands off cleanly once the fork is accepted (bind failure is the stream's concern)", async () => {
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog(CODING);
 
       fireEvent.click(screen.getByTestId("fork-session-submit"));
 
-      // We navigated into the clone regardless of the launch outcome.
-      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
-      // Forked exactly once; the dialog showed no inline error (it handed off).
+      // Forked exactly once; the dialog deferred the bind, showed the Cloning
+      // toast, and surfaced no inline error (it handed off). A later bind
+      // failure is surfaced by the session-updates stream, not this dialog.
+      await waitFor(() => expect(registerPendingForkBindMock).toHaveBeenCalledTimes(1));
       expect(forkSessionMock).toHaveBeenCalledTimes(1);
+      expect(toastLoadingMock).toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
       expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
     });
 
@@ -1249,9 +1273,7 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog({
         ...CODING,
         info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
@@ -1272,13 +1294,16 @@ describe("ForkSessionDialog", () => {
         agentId: undefined,
         upToResponseId: undefined,
         config: {},
+        asyncOperationId: OP_ID,
         sandbox: { provider: "modal", workspace: "https://github.com/org/repo#release-1.2" },
       });
-      // The server provisions the host, so the dialog must NOT also try to
-      // bind one — a launchRunner here would 404 on a host that doesn't exist.
-      expect(launchRunnerMock).not.toHaveBeenCalled();
+      // The server provisions the host, so the dialog must NOT defer a bind —
+      // a launchRunner here would 404 on a host that doesn't exist.
+      expect(registerPendingForkBindMock).not.toHaveBeenCalled();
       expect(checkHostDirectoryMock).not.toHaveBeenCalled();
-      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+      // Async fork: Cloning toast, no navigation.
+      await waitFor(() => expect(toastLoadingMock).toHaveBeenCalledTimes(1));
+      expect(navigateMock).not.toHaveBeenCalled();
     });
 
     it("inherits ALL repositories from a multi-repo sandbox source", async () => {
@@ -1295,9 +1320,7 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       // A multi-repo source can only inherit all repos onto a multi-repo dest.
       renderDialog({
         ...CODING,
@@ -1368,9 +1391,7 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      forkSessionMock.mockResolvedValue(FORK_ACCEPTED);
       renderDialog({ ...CODING, info: { managed_sandboxes_enabled: true } });
 
       selectSandbox();

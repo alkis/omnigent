@@ -25,6 +25,7 @@ Usage::
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
@@ -191,12 +192,35 @@ def _fork_session(
     :param runner_id: Registered runner id to bind the fork to.
     :param body: Fork request body (e.g. ``{"up_to_response_id": ...}``,
         ``{"agent_id": ...}``); ``None`` → ``{}`` (full same-agent fork).
-    :returns: The 201 response body (``SessionResponse`` shape).
+    :returns: The fork's ``SessionResponse`` body once materialized.
     """
+
+    # Fork is now async: POST returns 202 and the clone materializes in the
+    # background, entering the session list only when ready. Snapshot the ids
+    # first, then poll for the new one (the announce fires on completion).
+    def _session_ids() -> set[str]:
+        listed = client.get("/v1/sessions", params={"limit": 1000})
+        listed.raise_for_status()
+        return {row["id"] for row in listed.json()["data"]}
+
+    before = _session_ids()
     resp = client.post(f"/v1/sessions/{source_id}/fork", json=body or {})
-    assert resp.status_code == 201, f"fork failed: {resp.status_code} {resp.text}"
-    fork = resp.json()
-    patch = client.patch(f"/v1/sessions/{fork['id']}", json={"runner_id": runner_id})
+    assert resp.status_code == 202, f"fork failed: {resp.status_code} {resp.text}"
+
+    deadline = time.monotonic() + 60.0
+    new_ids: set[str] = set()
+    while time.monotonic() < deadline:
+        new_ids = _session_ids() - before
+        if new_ids:
+            break
+        time.sleep(0.25)
+    assert len(new_ids) == 1, f"expected exactly one new fork session, got {new_ids}"
+    fork_id = next(iter(new_ids))
+
+    snapshot = client.get(f"/v1/sessions/{fork_id}")
+    snapshot.raise_for_status()
+    fork = snapshot.json()
+    patch = client.patch(f"/v1/sessions/{fork_id}", json={"runner_id": runner_id})
     patch.raise_for_status()
     return fork
 

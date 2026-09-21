@@ -33,6 +33,7 @@ import re
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.fork_session import list_session_ids, submit_fork_and_open_clone
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _FOLD = '[data-testid="turn-worked-fold"]'
@@ -139,18 +140,15 @@ def test_fork_retains_worked_for_duration(
 
     # Fork from the turn's response — the last (only) response, so the
     # "truncated" fork copies everything: the shared copy path under test.
+    before_ids = list_session_ids(base_url)
     bubble = assistant.filter(has_text=_DONE_SENTINEL).first
     bubble.hover()
     bubble.get_by_test_id("fork-from-response").click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
-    page.get_by_test_id("fork-session-submit").click()
 
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    expect(dialog).not_to_be_visible()
+    # Async fork: submit closes the dialog without navigating; open the clone.
+    submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
 
     # Render the fork purely from its stored (copied) items.
     page.reload()

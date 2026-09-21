@@ -35,6 +35,7 @@ import time
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_items
+from tests.e2e_ui.fork_session import _wait_for_new_session_id, list_session_ids
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
@@ -110,13 +111,17 @@ def test_fork_large_session_response_is_not_full_transcript(
     expect(last_assistant).to_be_visible(timeout=60_000)
 
     # ── Open the fork dialog from the last assistant response ─────────
+    before_ids = list_session_ids(base_url)
     last_assistant.hover()
     last_assistant.get_by_test_id("fork-from-response").click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
     submit = page.get_by_test_id("fork-session-submit")
 
-    # ── Submit and capture the response the dialog blocks on ──────────
+    # ── Submit and capture the ACCEPT response ────────────────────────
+    # Fork materialization is async now: the POST returns a small 202
+    # operation handle (no transcript), the dialog closes immediately, and
+    # the app does NOT navigate. The copy runs server-side in the background.
     started = time.monotonic()
     with page.expect_response(
         lambda r: r.url.endswith(f"/v1/sessions/{session_id}/fork"),
@@ -124,35 +129,34 @@ def test_fork_large_session_response_is_not_full_transcript(
     ) as resp_info:
         submit.click()
     response = resp_info.value
-    # The dialog awaits the whole body, so include the download in the wait.
     response.finished()
     elapsed = time.monotonic() - started
-    # Body size via the network event, not Response.body(): a full-transcript
-    # response is large enough to be evicted from the inspector cache.
     body_bytes = response.request.sizes()["responseBodySize"]
     if body_bytes <= 0:
         body_bytes = int(response.headers.get("content-length", "0"))
 
-    assert response.status == 201, f"fork failed: HTTP {response.status}"
+    assert response.status == 202, f"fork not accepted async: HTTP {response.status}"
 
-    # The journey itself completes: the dialog navigates into the clone.
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})(conv_)?[0-9a-f]+"),
-        timeout=120_000,
-    )
+    # The dialog closes on accept without navigating — the user stays on the
+    # source while the clone copies in the background (the whole point of the
+    # non-blocking change; before, the dialog awaited a ~30MB body first).
+    expect(dialog).not_to_be_visible(timeout=30_000)
+    expect(page).to_have_url(re.compile(rf".*/c/{re.escape(session_id)}(\?.*)?$"))
 
-    # Evidence for the log: how long the user stared at the blocked dialog.
     print(
-        f"fork of {_N_ITEMS}-item (~30MB) session: dialog blocked "
-        f"{elapsed:.2f}s; blocking response body = {body_bytes / 1e6:.1f}MB"
+        f"fork of {_N_ITEMS}-item (~30MB) session: 202 accept returned in "
+        f"{elapsed:.2f}s; accept body = {body_bytes} bytes"
     )
 
-    # Regression pin: the user-blocking fork response must not ship the
-    # full transcript. While the bug is live this is the whole ~30MB
-    # history; a fixed fork returns bounded metadata (+ at most one page).
+    # Regression pin: the accept the dialog waits on must not ship the copied
+    # transcript. It is now a tiny operation handle regardless of source size
+    # (before OMNI-7212 the 201 carried the whole ~30MB history).
     assert body_bytes < _MAX_FORK_RESPONSE_BYTES, (
-        f"fork response carried {body_bytes / 1e6:.1f}MB for a ~30MB source "
-        f"-- the full copied transcript rides the response the fork dialog "
-        f"blocks on, so fork latency scales with history size "
-        f"(expected < {_MAX_FORK_RESPONSE_BYTES / 1e6:.0f}MB)"
+        f"fork accept carried {body_bytes} bytes for a ~30MB source -- the "
+        f"async accept must be a small operation handle, not the transcript "
+        f"(expected < {_MAX_FORK_RESPONSE_BYTES} bytes)"
     )
+
+    # The background copy still completes: the clone materializes as a new
+    # session (proving the async path actually forked, not just accepted).
+    _wait_for_new_session_id(base_url, before_ids, timeout_ms=120_000)

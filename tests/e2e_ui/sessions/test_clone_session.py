@@ -1,8 +1,9 @@
 """Browser e2e for the Clone session flow (ForkSessionDialog).
 
 Drives the real chain the unit layer can't: per-message "Fork from
-here" action → Radix dialog → ``POST /v1/sessions/{id}/fork`` → close +
-navigate into the clone → the copied transcript renders from the fork's
+here" action → Radix dialog → ``POST /v1/sessions/{id}/fork`` → close
+WITHOUT navigating → the clone appears in the sidebar when the background
+copy finishes → opening it renders the copied transcript from the fork's
 snapshot. (The desktop header has no Clone button — the per-message
 action is the desktop entry point; mobile keeps a three-dot menu entry.)
 
@@ -29,6 +30,7 @@ import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, seed_committed_turn
+from tests.e2e_ui.fork_session import list_session_ids, submit_fork_and_open_clone
 
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
@@ -44,17 +46,18 @@ def test_clone_session_copies_transcript_and_navigates(
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Clone a session from a message's Fork action and land in a fork with history.
+    """Clone from a message's Fork action; the clone appears async, then carries history.
 
     Failure modes this catches that the mocked dialog tests can't:
 
     - The dialog submits but the fork request 4xxs (client/server wire
       shape drift on ``SessionForkRequest`` — e.g. ``extra="forbid"``
       rejecting a new field).
-    - The fork succeeds but navigation doesn't happen or lands on the
-      SOURCE session (the dialog's close+navigate ordering broke).
-    - The fork navigates but renders an empty chat (the server-side
-      transcript deep-copy or the fork snapshot hydration broke).
+    - The fork is accepted but the dialog navigates anyway, or never closes
+      (the async close-without-nav flow broke).
+    - The clone never materializes into the sidebar (background task /
+      announce regressed), or opening it renders an empty chat (the
+      server-side transcript deep-copy or fork snapshot hydration broke).
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -88,24 +91,19 @@ def test_clone_session_copies_transcript_and_navigates(
     # full clone, so this covers the same copy-everything path the old
     # header button drove. Non-coding source → the submit button reads
     # "Clone" (no host/directory section).
+    before_ids = list_session_ids(base_url)
     assistant.hover()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
     submit = page.get_by_test_id("fork-session-submit")
     expect(submit).to_have_text("Clone")
-    submit.click()
 
-    # ONE call → dialog closes and the URL moves to a DIFFERENT /c/<id>.
-    # A URL still on the source id means navigation never fired (or
-    # landed back on the source); a visible dialog means the fork call
-    # failed and surfaced an inline error instead.
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    expect(dialog).not_to_be_visible()
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # Submit → dialog closes, the page STAYS on the source (async, no nav),
+    # the clone appears as a new session in the background, and the helper
+    # opens it. A visible dialog would mean the fork 4xx'd inline; a URL that
+    # moved off the source would mean the old navigate-on-fork behavior is back.
+    fork_id = submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
     assert fork_id != session_id
 
     # The clone's transcript carries the source's marked user turn —
@@ -185,6 +183,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
     expect(assistant).to_be_visible(timeout=60_000)
 
+    before_ids = list_session_ids(base_url)
     assistant.hover()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
@@ -207,14 +206,9 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     perm.click()
     page.get_by_role("option", name="Plan", exact=True).click()
 
-    page.get_by_test_id("fork-session-submit").click()
-
-    # The fork succeeds and navigates to a NEW session id.
-    expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
-        timeout=30_000,
-    )
-    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    # Submit → async accept: dialog closes, no navigation, clone appears in
+    # the background; the helper resolves and opens it.
+    fork_id = submit_fork_and_open_clone(page, base_url, session_id, before_ids=before_ids)
     assert fork_id != session_id
 
     # Server-side gating made observable: the fork must carry history into

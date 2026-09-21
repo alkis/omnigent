@@ -2161,6 +2161,7 @@ async def test_sdk_subagent_heal_skips_session_init(
 async def test_fork_of_child_promotes_it_into_the_sidebar(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forking a sub-agent yields a session the sidebar lists.
 
@@ -2182,6 +2183,8 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
         agent_id=parent["agent_id"],
     )
 
+    # Promoting a sub-agent is a synchronous fork (201) — the promoted
+    # top-level session is returned directly.
     resp = await client.post(f"/v1/sessions/{child.id}/fork", json={"title": "Promoted"})
     assert resp.status_code == 201, f"promoting a sub-agent failed: {resp.text}"
     promoted = resp.json()
