@@ -186,9 +186,25 @@ jobs:
           SELECTION_MODE: ${{ steps.selection.outputs.mode }}
         run: |
           test_targets=(tests/e2e_ui)
-          if [[ "$SELECTION_MODE" == "selected" ]]; then
-            mapfile -t test_targets < /tmp/impacted-e2e-nodeids.txt
-          fi
+          marker="not visual and not nightly"
+          case "$SELECTION_MODE" in
+            selected)
+              mapfile -t test_targets < /tmp/impacted-e2e-nodeids.txt
+              ;;
+            snapshots)
+              test_targets=(tests/e2e_ui/visual)
+              marker="visual"
+              ;;
+            none)
+              echo "::notice::Selector found no runtime-impacting E2E tests."
+              exit 0
+              ;;
+            full)
+              ;;
+            *)
+              echo "::notice::Unknown selection mode '$SELECTION_MODE'; running the full non-visual suite."
+              ;;
+          esac
           uv run pytest "${test_targets[@]}" \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
@@ -198,7 +214,25 @@ jobs:
             --screenshot=only-on-failure \
             --video=retain-on-failure \
             --junitxml=/tmp/impacted-e2e-junit.xml \
-            -m "not visual and not nightly"
+            -m "$marker"
+
+      - name: Cluster impacted-lane failures
+        if: always()
+        run: |
+          inputs=()
+          [[ -f /tmp/impacted-e2e-junit.xml ]] && inputs+=(--junit /tmp/impacted-e2e-junit.xml)
+          while IFS= read -r log; do
+            inputs+=(--log "$log")
+          done < <(find /tmp/pytest-of-runner -type f \( -name server.log -o -name runner.log \) -print 2>/dev/null || true)
+          if (( ${#inputs[@]} == 0 )); then
+            echo "No JUnit XML or server logs were available for failure clustering." > /tmp/impacted-e2e-failure-clusters.md
+            exit 0
+          fi
+          .github/scripts/ci/e2e_failure_clusters.py \
+            "${inputs[@]}" \
+            --json-output /tmp/impacted-e2e-failure-clusters.json \
+            --markdown-output /tmp/impacted-e2e-failure-clusters.md
+          cat /tmp/impacted-e2e-failure-clusters.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish impacted-lane summary
         if: always()
@@ -229,6 +263,8 @@ jobs:
             /tmp/impacted-e2e-selection.json
             /tmp/impacted-e2e-changed-files.txt
             /tmp/impacted-e2e-junit.xml
+            /tmp/impacted-e2e-failure-clusters.json
+            /tmp/impacted-e2e-failure-clusters.md
             test-results/
           retention-days: 3
           if-no-files-found: ignore

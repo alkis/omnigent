@@ -219,6 +219,7 @@ jobs:
         # so never run it under xdist or alongside the live server.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          OMNIGENT_E2E_COVERAGE_INDEX: "1"
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
@@ -273,6 +274,7 @@ jobs:
           # uses this instead of running cargo build. Absolute path: the
           # fixture runs with cwd at the repo root but be explicit.
           CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
+          OMNIGENT_E2E_COVERAGE_INDEX: "1"
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
@@ -303,6 +305,15 @@ jobs:
             --video=retain-on-failure \
             -m "$MARKER" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+
+      - name: Upload E2E coverage shard
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: e2e-ui-coverage-shard-${{ matrix.shard_id }}
+          path: artifacts/e2e-ui-coverage/shards/*.json
+          retention-days: 3
+          if-no-files-found: warn
 
       - name: Upload Playwright traces / videos / screenshots on failure
         id: upload_playwright
@@ -384,3 +395,36 @@ jobs:
               echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  merge-coverage-index:
+    name: Merge E2E UI coverage index
+    if: always()
+    needs: e2e-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+      - name: Download coverage shards
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: e2e-ui-coverage-shard-*
+          path: artifacts/e2e-ui-coverage/shards
+          merge-multiple: true
+      - name: Merge coverage index
+        run: |
+          python -m tests.e2e_ui.coverage_index merge \
+            --input-dir artifacts/e2e-ui-coverage/shards \
+            --output artifacts/e2e-ui-coverage/index.json \
+            --expected-shards 1,2,3,4,5
+      - name: Upload coverage index
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: e2e-ui-coverage-index
+          path: artifacts/e2e-ui-coverage/index.json
+          retention-days: 14
+          if-no-files-found: error
