@@ -228,6 +228,10 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
             try:
                 head = await _wait_for_read(asyncio.shield(state.head_future), read_timeout)
             except asyncio.TimeoutError:
+                # Disarm the abandoned future: an abort that captured this
+                # state before cleanup would otherwise set an exception on
+                # it that no waiter ever retrieves.
+                state.head_future.cancel()
                 raise httpx.ReadTimeout(
                     f"runner {self._runner_id!r} did not answer within {read_timeout:g}s",
                     request=request,
