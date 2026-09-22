@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -743,7 +744,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     )
 
     initial_activity = registry.session_activity_epoch("conv_idle")
-    # The agent worked, then its turn completed (pane quiesced → idle).
+    # The agent worked, then its turn completed (pane became quiet → idle).
     on_activity = callbacks["on_activity"]
     on_idle = callbacks["on_idle"]
     assert callable(on_activity) and callable(on_idle)
@@ -1633,3 +1634,37 @@ async def test_cleanup_session_preserves_live_native_bridge_dir(
     assert bridge_dir.exists()
     assert (bridge_dir / "bridge.json").exists()
     assert permission_hook.exists()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_logs_input_ready_once_from_existing_snapshot(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "omnigent.harnesses.claude_native.bridge.claude_pane_text_ready",
+            Mock(side_effect=RuntimeError("readiness observation failed")),
+        )
+        watcher_continues = instance._fire_watch_callback(on_tick, "tick")
+        assert watcher_continues
+        assert pollers[0].ticks == 1
+    instance._remember_pane_snapshot("Sign in to Claude")
+    on_tick()
+    assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+    instance._remember_pane_snapshot("────────────────────\n❯ \n────────────────────")
+    on_tick()
+    on_tick()
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+    assert len(events) == 1
+    assert events[0].session_id == "child"
+    assert events[0].attributes["harness"] == "claude-native"
+    assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id

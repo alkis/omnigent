@@ -1984,6 +1984,11 @@ def build_hook_settings(
     """
     Build invocation-local Claude Code hook settings.
 
+    Besides the hooks, the fragment pre-approves every project ``.mcp.json``
+    server (``enableAllProjectMcpServers``): the "New MCP server found"
+    dialog is another unhookable startup gate that a host-spawned terminal
+    can never answer.
+
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
@@ -2277,6 +2282,10 @@ def build_hook_settings(
         # the org policy (``disableBypassPermissionsMode``) BEFORE this
         # consent gate, so a managed host still strips bypass regardless.
         settings["skipDangerousModePermissionPrompt"] = True
+    # Project ``.mcp.json`` servers raise a blocking "New MCP server found"
+    # approval dialog in every new directory (each worktree included). It
+    # fires no hook either, so pre-approve them like the other consent gates.
+    settings["enableAllProjectMcpServers"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -2471,7 +2480,9 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
-    return args
+    from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
+
+    return augment_claude_debug_args(args, bridge_dir)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
@@ -4984,6 +4995,15 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return False
     pane = _capture_pane(socket_path, tmux_target)
+    if _MODEL_PICKER_OPEN_HINT in pane:
+        return False
+    if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
+        return False
+    return _claude_prompt_rendered(pane)
+
+
+def claude_pane_text_ready(pane: str) -> bool:
+    """Recognize input readiness for logging without capturing another pane."""
     if _MODEL_PICKER_OPEN_HINT in pane:
         return False
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
