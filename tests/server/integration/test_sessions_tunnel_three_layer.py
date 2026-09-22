@@ -1180,54 +1180,6 @@ async def _reconnect_fires_connect_hook(
                 await communicator.wait(timeout=budget(2.0))
 
 
-async def test_reconnect_reaps_deleted_session_without_a_conversation_row(
-    tunnel_three_layer_stack: _TunnelStack,
-) -> None:
-    """A real tunnel hello must replay cleanup even when no live rows remain."""
-    from omnigent.runner.native.orchestration import _AUTO_FORWARDER_TASKS
-
-    stack = tunnel_three_layer_stack
-    session_id = "deleted-native-child"
-    stopped = asyncio.Event()
-
-    async def producer() -> None:
-        try:
-            await asyncio.Event().wait()
-        finally:
-            stopped.set()
-
-    producer_task = asyncio.create_task(producer())
-    _AUTO_FORWARDER_TASKS[session_id] = producer_task
-    await asyncio.sleep(0)
-    journal = stack.ap_app.state.runner_session_cleanup.store
-    (command,) = journal.enqueue([(_RUNNER_ID, session_id)])
-    journal.complete([command.command_id])
-    stack.ap_app.state.tunnel_registry.deregister(_RUNNER_ID)
-    communicator = await _connect_runner_tunnel(stack.ap_app, _RUNNER_ID)
-    await _send_hello_and_wait(
-        communicator, stack.ap_app, _RUNNER_ID, harnesses=[_TEST_HARNESS_NAME]
-    )
-    runner_app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
-    pump = asyncio.create_task(_forward_requests_to_runner(communicator, runner_app))
-    try:
-        await asyncio.wait_for(stopped.wait(), timeout=budget(5))
-
-        async def acknowledged() -> None:
-            while await asyncio.to_thread(journal.pending, _RUNNER_ID):
-                await asyncio.sleep(0.01)
-
-        await asyncio.wait_for(acknowledged(), timeout=budget(5))
-        assert producer_task.done()
-    finally:
-        producer_task.cancel()
-        pump.cancel()
-        await asyncio.gather(producer_task, pump, return_exceptions=True)
-        _AUTO_FORWARDER_TASKS.pop(session_id, None)
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-        with contextlib.suppress(asyncio.CancelledError):
-            await communicator.wait(timeout=budget(2))
-
-
 async def _bind_failed_session(
     ap_client: httpx.AsyncClient,
     *,

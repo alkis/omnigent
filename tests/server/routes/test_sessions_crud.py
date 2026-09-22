@@ -309,6 +309,44 @@ async def test_delete_session_calls_full_runner_teardown(
     )
 
 
+@pytest.mark.parametrize("child_cleanup_fails", [False, True])
+async def test_delete_session_tears_down_idle_descendants(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    child_cleanup_fails: bool,
+) -> None:
+    """Full teardown reaches idle descendants even if one runner rejects cleanup."""
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(parent_conversation_id=session_id)
+    grandchild = store.create_conversation(parent_conversation_id=child.id)
+    deleted_paths: list[str] = []
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        deleted_paths.append(request.url.path)
+        status = 503 if child_cleanup_fails and request.url.path.endswith(child.id) else 200
+        return httpx.Response(status, json={"deleted": status == 200})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(capture), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(
+            sessions_module,
+            "_get_runner_client_for_resource_access",
+            AsyncMock(return_value=runner),
+        )
+        response = await client.delete(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200
+    assert deleted_paths == [
+        f"/v1/sessions/{sid}" for sid in (session_id, child.id, grandchild.id)
+    ]
+    assert all(
+        store.get_conversation(sid) is None for sid in (session_id, child.id, grandchild.id)
+    )
+
+
 @pytest.mark.posix_only
 async def test_delete_session_reaps_child_that_ignores_sigterm(
     client: httpx.AsyncClient,

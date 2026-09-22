@@ -338,16 +338,6 @@ class RunnerRouter:
         """
         return self._runner_absent_code(host_id) == ErrorCode.WRONG_REPLICA
 
-    def client_for_cleanup(self, runner_id: str) -> httpx.AsyncClient:
-        """Route an authorized cleanup command after its conversation row is gone.
-
-        Only the durable cleanup journal supplies this binding; missing session
-        lookups must never be used to infer a teardown command.
-        """
-        if self._registry.get(runner_id) is None:
-            raise OmnigentError("Runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
-        return self._client_for_runner(runner_id)
-
     def _client_for_runner(self, runner_id: str) -> httpx.AsyncClient:
         """
         Return a cached tunnel-backed client for *runner_id*.

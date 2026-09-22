@@ -2527,59 +2527,61 @@ def register_events_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
-        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
-        descendants = await asyncio.to_thread(conversation_store.get_conversations, descendant_ids)
-        targets = [conv, *(descendants[sid] for sid in descendant_ids if sid in descendants)]
-        cleanup = request.app.state.runner_session_cleanup
-        # Persist the exact authorized bindings before rows or tunnels disappear.
-        commands = await asyncio.to_thread(
-            cleanup.store.enqueue,
-            [(target.runner_id, target.id) for target in targets if target.runner_id],
-        )
-        commands_by_session = {command.session_id: command for command in commands}
-        delivered_commands: list[str] = []
+        cleanup_ids = [
+            session_id,
+            *await _collect_descendant_conversation_ids(conversation_store, session_id),
+        ]
         await _best_effort_stop(session_id, conversation_store, runner_router)
-        for target in targets:
+        # Idle descendants can still own transcript forwarders. Fully tear down
+        # every node before deleting the tree; each runner remains best-effort.
+        for cleanup_id in cleanup_ids:
+            runner_client: httpx.AsyncClient | None = None
             try:
-                runner_client = await _get_runner_client_for_resource_access(target.id)
-                if runner_client is None:
-                    raise OmnigentError("Runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
-                response = await runner_client.delete(f"/v1/sessions/{target.id}", timeout=60.0)
-                response.raise_for_status()
-            except (OmnigentError, httpx.HTTPError, ConnectionError):
-                _logger.info("Runner cleanup deferred for %s", target.id)
+                runner_client = await _get_runner_client_for_resource_access(cleanup_id)
+            except OmnigentError as exc:
+                _logger.info(
+                    "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
+                    cleanup_id,
+                    exc,
+                )
+            if runner_client is not None:
+                try:
+                    # Allow initialization, forwarder, and resource cleanup to finish.
+                    response = await runner_client.delete(
+                        f"/v1/sessions/{cleanup_id}",
+                        timeout=60.0,
+                    )
+                    response.raise_for_status()
+                except (httpx.HTTPError, ConnectionError):
+                    _logger.warning("Runner cleanup failed for %s", cleanup_id)
+            else:
                 from omnigent.runtime import get_terminal_registry
 
                 with contextlib.suppress(RuntimeError):
-                    await get_terminal_registry().cleanup_conversation(target.id)
-            else:
-                if command := commands_by_session.get(target.id):
-                    delivered_commands.append(command.command_id)
-        # Remove the worktree after runner shutdown. A rejected opt-in delete
-        # retains the session, so it must not leave a reconnect cleanup command.
+                    await get_terminal_registry().cleanup_conversation(cleanup_id)
+        # Opt-in git worktree cleanup: only when delete_branch=true and
+        # the session has a server-created worktree. Runs after runner
+        # teardown but before the irreversible file cleanup below: an
+        # unreachable host fails the delete (409) with the session
+        # retained, so nothing irrecoverable may be destroyed first.
+        # Git errors on a reachable host stay best-effort.
         if (
             delete_branch
             and conv.git_branch is not None
             and conv.workspace is not None
             and conv.host_id is not None
         ):
-            try:
-                await _remove_session_worktree_best_effort(
-                    host_id=conv.host_id,
-                    worktree_path=conv.workspace,
-                    branch=conv.git_branch,
-                    delete_branch=True,
-                    request=request,
-                    reason="session-delete",
-                    conversation_store=conversation_store,
-                    exclude_conversation_id=conv.id,
-                    fail_if_unavailable=True,
-                )
-            except OmnigentError:
-                await asyncio.to_thread(
-                    cleanup.store.discard, [command.command_id for command in commands]
-                )
-                raise
+            await _remove_session_worktree_best_effort(
+                host_id=conv.host_id,
+                worktree_path=conv.workspace,
+                branch=conv.git_branch,
+                delete_branch=True,
+                request=request,
+                reason="session-delete",
+                conversation_store=conversation_store,
+                exclude_conversation_id=conv.id,
+                fail_if_unavailable=True,
+            )
         # Session file cleanup. delete_all_for_session returns only the blob
         # keys that became orphaned — a blob still shared by a fork in another
         # session is not returned, so the fork's attachment survives.
@@ -2594,13 +2596,6 @@ def register_events_routes(
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
-        await asyncio.to_thread(
-            cleanup.store.complete, [command.command_id for command in commands]
-        )
-        for command_id in delivered_commands:
-            await asyncio.to_thread(cleanup.store.acknowledge, command_id)
-        for runner_id in {command.runner_id for command in commands}:
-            cleanup.retry(runner_id)
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted

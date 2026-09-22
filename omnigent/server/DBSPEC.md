@@ -24,24 +24,6 @@ status.
 
 ---
 
-## runner_session_cleanup
-
-This operational table retains explicit session teardown commands independently
-of conversation rows. Its primary key is `(workspace_id, command_id)`; each
-command stores the original `runner_id`, opaque `session_id`, and a
-`delete_completed` flag. An index on `(workspace_id, runner_id)` supports replay
-when an authenticated runner connects to any server replica.
-
-Deletion records the entire known tree before cleanup starts. Successful runner
-DELETEs are acknowledged only after server deletion completes. Reconnect skips
-initialization of sessions with pending commands, replays their teardown, and
-retries delivery failures while the runner remains connected. An interrupted
-server deletion retains its command even if runner cleanup succeeded; this
-prevents reconnect from recreating resources during an unfinished deletion.
-Ordinary session lookups and event-post 404s never create cleanup commands.
-
----
-
 ## agents
 
 | Column | Type | Notes |

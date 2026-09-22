@@ -1109,26 +1109,6 @@ class SqlConversationLabel(ConversationBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
-class SqlRunnerSessionCleanup(OmnigentBase):
-    """Explicit runner cleanup commands retained until successful delivery."""
-
-    __tablename__ = "runner_session_cleanup"
-    __table_args__ = (Index("ix_runner_session_cleanup_runner", "workspace_id", "runner_id"),)
-
-    workspace_id: Mapped[int] = mapped_column(
-        BigInteger,
-        primary_key=True,
-        nullable=False,
-        server_default="0",
-        default=current_workspace_id,
-    )
-    command_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
-    runner_id: Mapped[str] = mapped_column(String(128))
-    # Alternate conversation stores can use non-UUID session identifiers.
-    session_id: Mapped[str] = mapped_column(String(128))
-    delete_completed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
-
-
 class SqlComment(OmnigentBase):
     """SQLAlchemy model for the ``comments`` table.
 

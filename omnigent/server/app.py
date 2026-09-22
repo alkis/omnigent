@@ -1530,12 +1530,6 @@ def create_app(
         conversation_store=conversation_store,
         file_store=file_store,
     )
-    from omnigent.server.runner_session_cleanup import RunnerSessionCleanup
-    from omnigent.stores.runner_session_cleanup_store import RunnerSessionCleanupStore
-
-    runner_session_cleanup = RunnerSessionCleanup(
-        RunnerSessionCleanupStore(conversation_store.storage_location), runner_router
-    )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
@@ -1790,7 +1784,6 @@ def create_app(
 
             await cancel_managed_launch_tasks()
             await background_title_coordinator.shutdown()
-            await runner_session_cleanup.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1824,7 +1817,6 @@ def create_app(
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
-    app.state.runner_session_cleanup = runner_session_cleanup
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
@@ -3453,11 +3445,6 @@ def create_app(
         # online before the first periodic sweep.
         session_live_state.touch_runner_liveness([runner_id])
 
-        # Cleanup uses its persisted runner binding after deleted rows disappear.
-        deleting_session_ids = await runner_session_cleanup.pending_sessions(runner_id)
-        if not await runner_session_cleanup.replay(runner_id):
-            runner_session_cleanup.retry(runner_id)
-
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent
         # search index in alternate store backends, which cannot see a
@@ -3470,7 +3457,6 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
-        convs = [conv for conv in convs if conv.id not in deleting_session_ids]
         # Restore each tree from its root before ordinary child initialization
         # can clear the interruption status or cache an init without continuation.
         bound_ids = {conv.id for conv in convs}
