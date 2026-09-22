@@ -59,7 +59,6 @@ export function TerminalClipboardPrompt(props: TerminalClipboardPromptProps) {
         dismissible: false,
         style: {
           width: "min(30rem, calc(100vw - 2rem))",
-          bottom: "max(0px, 100lvh - var(--omnigent-viewport-height, 100lvh))",
           touchAction: "auto",
         },
       },
@@ -107,7 +106,7 @@ function TerminalClipboardPromptContent({
       className="relative flex w-full flex-col overflow-hidden rounded-xl border-2 border-primary/50 bg-card-solid p-5 text-left text-ui text-card-foreground shadow-2xl"
       style={{
         maxHeight:
-          "calc(var(--omnigent-viewport-height, 100dvh) - var(--offset-bottom, 1rem) - var(--omnigent-inset-top, 0px) - var(--offset, 0px) - 1rem)",
+          "calc(var(--omnigent-viewport-height, 100dvh) - var(--offset-top, 1rem) - var(--omnigent-inset-top, 0px) - var(--offset, 0px) - 1rem)",
       }}
     >
       <Button

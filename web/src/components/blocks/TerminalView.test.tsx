@@ -115,7 +115,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
 beforeEach(() => {
   localStorage.clear();
   act(() => toast.dismiss());
-  render(<Toaster visibleToasts={100} />);
+  render(<Toaster position="top-center" visibleToasts={100} />);
   terminalSessionMock.instances = [];
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
 });
@@ -753,8 +753,8 @@ describe("terminal clipboard", () => {
 
     expect(input).toHaveFocus();
     expect(screen.getByTestId("terminal-view")).not.toContainElement(prompt);
-    expect(prompt.closest("[data-sonner-toaster]")).toHaveAttribute("data-x-position", "right");
-    expect(prompt.closest("[data-sonner-toaster]")).toHaveAttribute("data-y-position", "bottom");
+    expect(prompt.closest("[data-sonner-toaster]")).toHaveAttribute("data-x-position", "center");
+    expect(prompt.closest("[data-sonner-toaster]")).toHaveAttribute("data-y-position", "top");
     expect(prompt).toHaveAttribute("role", "region");
     uncheckRemember();
     // Click before Sonner's asynchronous update publishes the new callback.
