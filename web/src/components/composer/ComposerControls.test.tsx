@@ -140,8 +140,61 @@ describe("shared composer controls", () => {
     fireEvent.keyDown(trigger, {
       key: "ArrowDown",
     });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
+  });
+
+  it("marks the selected permission mode and leaves the rest unchecked", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Auto"
+        selectedValue="auto"
+        options={[
+          { value: "default", label: "Manual" },
+          { value: "auto", label: "Auto" },
+          { value: "plan", label: "Plan" },
+        ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Permission mode: Auto" }), {
+      key: "ArrowDown",
+    });
+    const selectedRow = screen.getByTestId("composer-permission-option-auto");
+    expect(selectedRow).toHaveAttribute("aria-checked", "true");
+    expect(
+      selectedRow.querySelector('[data-slot="dropdown-menu-radio-item-indicator"]'),
+    ).toBeInTheDocument();
+    for (const other of ["default", "plan"]) {
+      expect(screen.getByTestId(`composer-permission-option-${other}`)).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+    }
+  });
+
+  it("marks no permission mode when the selected value is unknown", () => {
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Permission mode"
+        options={[
+          { value: "default", label: "Manual" },
+          { value: "auto", label: "Auto" },
+        ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Permission mode: Permission mode" }), {
+      key: "ArrowDown",
+    });
+    for (const mode of ["default", "auto"]) {
+      expect(screen.getByTestId(`composer-permission-option-${mode}`)).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+    }
   });
 
   it("exposes shared permission concepts without changing harness wire values", () => {
@@ -173,7 +226,7 @@ describe("shared composer controls", () => {
     const trigger = screen.getByRole("button", { name: "Permission mode: Read only" });
     expect(trigger).toHaveAttribute("data-permission-concept", "read-only");
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
-    expect(screen.getByRole("menuitem", { name: "Automatic" })).toHaveAttribute(
+    expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute(
       "data-permission-concept",
       "automatic",
     );
@@ -197,7 +250,7 @@ describe("shared composer controls", () => {
         );
         const trigger = screen.getByRole("button", { name: "Permission mode: Manual" });
         fireEvent.keyDown(trigger, { key: "ArrowDown" });
-        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        fireEvent.click(screen.getByRole("menuitemradio", { name: "Plan" }));
         const nextMenu = screen.getByTestId("next-menu");
         if (nextMenuOpen) nextMenu.focus();
 
@@ -255,7 +308,7 @@ describe("shared composer controls", () => {
       } else {
         expect(trigger).toBeEnabled();
         fireEvent.keyDown(trigger, { key: "ArrowDown" });
-        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        fireEvent.click(screen.getByRole("menuitemradio", { name: "Plan" }));
         expect(onSelect).toHaveBeenCalledWith("plan");
       }
     },

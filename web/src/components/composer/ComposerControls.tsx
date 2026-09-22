@@ -12,7 +12,8 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
@@ -173,17 +174,19 @@ export function ComposerPermissionPicker({
         }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
-        {options.map((option) => (
-          <DropdownMenuItem
-            key={option.value}
-            onSelect={() => onSelect(option.value)}
-            data-testid={`${testIdPrefix}-permission-option-${option.value}`}
-            data-permission-concept={permissionModeConcept(harness, option.value)}
-            className="whitespace-normal break-words"
-          >
-            {option.label}
-          </DropdownMenuItem>
-        ))}
+        <DropdownMenuRadioGroup value={selectedValue ?? undefined} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+              data-permission-concept={permissionModeConcept(harness, option.value)}
+              className="whitespace-normal break-words"
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );
