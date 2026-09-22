@@ -10,6 +10,7 @@ import pytest
 
 from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -617,8 +618,10 @@ def test_title_cache_preserves_newer_timeout_marker(
 
 
 def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+    # Lock wait is incidental: the test asserts data integrity, not write speed.
+    # budget() keeps the guard loose enough on loaded CI runners.
     def write(number: int) -> None:
-        store = SessionPrRegistry("conv_a", root=tmp_path)
+        store = SessionPrRegistry("conv_a", root=tmp_path, lock_timeout=budget(5))
         store.record(
             [PullRequestRef.from_url(f"https://github.com/example/one/pull/{number}")],
             relationship="created",

@@ -99,10 +99,13 @@ class _Registry(BaseModel):
 class SessionPrRegistry:
     """Atomic per-session files shared by the host and its session runners."""
 
-    def __init__(self, session_id: str, *, root: Path | None = None) -> None:
+    def __init__(
+        self, session_id: str, *, root: Path | None = None, lock_timeout: float = 1.0
+    ) -> None:
         # Conversation IDs are globally allocated; hashing also confines disk paths.
         key = hashlib.sha256(session_id.encode()).hexdigest()
         self.path = (root or data_dir() / "github" / "session-prs") / f"{key}.json"
+        self._lock_timeout = lock_timeout
 
     def _read(self) -> _Registry:
         try:
@@ -138,7 +141,7 @@ class SessionPrRegistry:
         if not references:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(str(self.path) + ".lock", timeout=1):
+        with FileLock(str(self.path) + ".lock", timeout=self._lock_timeout):
             state = self._read()
             if observation_id and observation_id in state.observations:
                 return
@@ -181,7 +184,7 @@ class SessionPrRegistry:
         if not titles:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(str(self.path) + ".lock", timeout=1):
+        with FileLock(str(self.path) + ".lock", timeout=self._lock_timeout):
             state = self._read()
             now = time.time() if timestamp is None else timestamp
             changed = False
@@ -201,7 +204,7 @@ class SessionPrRegistry:
         """Remember removal so subsequent hook replay cannot attach the PR again."""
         reference = PullRequestRef.from_url(url)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(str(self.path) + ".lock", timeout=1):
+        with FileLock(str(self.path) + ".lock", timeout=self._lock_timeout):
             state = self._read()
             state.prs = [pr for pr in state.prs if pr.url != reference.url]
             if reference.url not in state.excluded:
