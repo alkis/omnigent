@@ -63,6 +63,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native.session_lifecycle import is_session_deleted
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -2982,7 +2983,7 @@ async def _handle_event(
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
     )
-    if route_session_id is None:
+    if route_session_id is None or is_session_deleted(route_session_id):
         return
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
@@ -4400,6 +4401,8 @@ async def _post_codex_elicitation_request(
     deadline = loop.time() + _CODEX_ELICITATION_REQUEST_TIMEOUT_SECONDS
     backoff_s = _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS
     while True:
+        if is_session_deleted(session_id):
+            return None
         response: httpx.Response | None = None
         attempt_started = loop.time()
         try:
@@ -5392,6 +5395,8 @@ async def _ensure_child_session(
         if child_session_id is None:
             return
         forwarder_state.note_child_thread(child_thread_id, child_session_id)
+    if is_session_deleted(child_session_id):
+        return
     # Backfill is done via the codex_client stored on the state.
     codex_client = forwarder_state.codex_client
     if codex_client is not None and forwarder_state.needs_child_thread_backfill(child_thread_id):
@@ -5501,7 +5506,7 @@ async def _backfill_child_thread(
     response = await _resume_child_thread_or_log(
         client, codex_client, child_session_id=child_session_id, child_thread_id=child_thread_id
     )
-    if response is None:
+    if response is None or is_session_deleted(child_session_id):
         return
     await _apply_child_resume(
         client,
@@ -5696,7 +5701,7 @@ async def _post_collab_agent_statuses(
         if not isinstance(thread_id, str) or not isinstance(state, dict):
             continue
         child_session_id = forwarder_state.session_for_child_thread(thread_id)
-        if child_session_id is None:
+        if child_session_id is None or is_session_deleted(child_session_id):
             continue
         ap_status = _omnigent_status_from_collab_state(state)
         if ap_status is not None:
@@ -7432,6 +7437,8 @@ async def _post_session_event_inner(
     payload = {"type": event_type, "data": data}
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
+        if is_session_deleted(session_id):
+            return _PostResult(response=None, transport_error="session_deleted")
         attempt += 1
         try:
             if timeout is None:

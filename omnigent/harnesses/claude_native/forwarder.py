@@ -55,6 +55,7 @@ from omnigent.native._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
+from omnigent.native.session_lifecycle import is_session_deleted
 from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
@@ -582,6 +583,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -1607,6 +1609,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            deleted=row.get("deleted") is True,
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1630,6 +1633,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "deleted": entry.deleted,
             }
             for entry in state.subagents.values()
         },
@@ -2050,6 +2054,11 @@ async def _forward_one_subagent(
     status_capability: _SubagentStatusCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
+    if entry.deleted:
+        return
+    if is_session_deleted(entry.child_conversation_id):
+        await checkpoint.put(replace(entry, deleted=True))
+        return
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
     if not jsonl_path.exists():
         return
@@ -2074,6 +2083,9 @@ async def _forward_one_subagent(
     now = time.time()
     had_item = False
     for batch in batches:
+        if is_session_deleted(entry.child_conversation_id):
+            await checkpoint.put(replace(new_entry, deleted=True))
+            return
         retry_key = f"subagent_batch:{entry.child_conversation_id}:{batch[0].item.source_id}"
         item_retry_keys = [
             f"subagent_item:{entry.child_conversation_id}:{pending.item.source_id}"
@@ -2223,6 +2235,9 @@ async def _forward_one_subagent(
                 item_retry_tracker.clear(retry_key)
         if retry_individually and drop_reason is None:
             for pending_item, item_retry_key in zip(batch, item_retry_keys, strict=True):
+                if is_session_deleted(entry.child_conversation_id):
+                    await checkpoint.put(replace(new_entry, deleted=True))
+                    return
                 item = pending_item.item
                 try:
                     await _post_external_conversation_item(
@@ -2321,6 +2336,9 @@ async def _forward_one_subagent(
         if stop_after_batch:
             break
 
+    if is_session_deleted(entry.child_conversation_id):
+        await checkpoint.put(replace(new_entry, deleted=True))
+        return
     delivery_pending = any(item.item.source_id not in seen for item in pending)
     desired_status: str | None = None
     if had_item:
@@ -2563,7 +2581,11 @@ async def _forward_available_subagents(
                 if parent_entry is None:
                     deferred.append((meta_path, meta, parent_subagent_id))
                     continue
-                if not parent_entry.child_conversation_id:
+                if (
+                    not parent_entry.child_conversation_id
+                    or parent_entry.deleted
+                    or is_session_deleted(parent_entry.child_conversation_id)
+                ):
                     # The parent was parked (registration exhausted its retries),
                     # so its conversation will never exist and this child can never
                     # attach. Park the child too rather than re-resolving it every

@@ -4693,6 +4693,8 @@ def create_runner_app(
             },
         )
 
+    _session_teardown_tasks: dict[str, asyncio.Task[None]] = {}
+
     @app.post("/v1/sessions")
     async def create_session(request: Request) -> JSONResponse:
         body = await request.json()
@@ -4721,6 +4723,11 @@ def create_runner_app(
         )
         task = _session_init_tasks.get(key)
         if task is None:
+            from omnigent.native.session_lifecycle import allow_session_forwarding
+
+            if teardown := _session_teardown_tasks.get(session_id):
+                await asyncio.shield(teardown)
+            allow_session_forwarding(session_id)
             task = asyncio.create_task(
                 _initialize_session(body),
                 name=f"session-init-{session_id}",
@@ -4851,6 +4858,55 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        await teardown_session(session_id)
+        return JSONResponse(
+            status_code=200,
+            content={"session_id": session_id, "object": "session.deleted", "deleted": True},
+        )
+
+    async def teardown_session(session_id: str) -> None:
+        from omnigent.native.session_lifecycle import mark_session_deleted
+
+        # Snapshot before teardown removes the parent/child bookkeeping.
+        targets = [session_id]
+        seen = {session_id}
+        for parent_id in targets:
+            children = set(_subagent_work_by_parent.get(parent_id, set()))
+            children.update(
+                child_id
+                for child_id, meta in list(_child_session_parents.items())
+                if meta.parent_id == parent_id
+            )
+            for child_id in children - seen:
+                seen.add(child_id)
+                targets.append(child_id)
+        # Schedule the whole tree before awaiting so caller cancellation cannot
+        # strand descendants after their parent has already been torn down.
+        tasks: list[asyncio.Task[None]] = []
+        for target_id in targets:
+            mark_session_deleted(target_id)
+            task = _session_teardown_tasks.get(target_id)
+            if task is None:
+                task = asyncio.create_task(_teardown_one_session(target_id))
+                _session_teardown_tasks[target_id] = task
+
+                def settled(done: asyncio.Task[None], sid: str = target_id) -> None:
+                    if _session_teardown_tasks.get(sid) is done:
+                        _session_teardown_tasks.pop(sid, None)
+                    if not done.cancelled() and (error := done.exception()) is not None:
+                        _logger.error("Session teardown failed: %s", sid, exc_info=error)
+
+                task.add_done_callback(settled)
+            tasks.append(task)
+        results = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        errors = [result for result in results if isinstance(result, Exception)]
+        if errors:
+            raise RuntimeError("Session tree teardown failed") from errors[0]
+
+    async def _teardown_one_session(session_id: str) -> None:
+        from omnigent.native.session_lifecycle import mark_session_deleted
+
+        mark_session_deleted(session_id)
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
@@ -4911,7 +4967,8 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
-        # Close any OpenCode server that no forwarder adopted.
+        # Close native servers that no forwarder adopted.
+        await _native_runtime.teardown_codex_native_app_server(session_id)
         await _native_runtime.teardown_opencode_native_server(session_id)
 
         if process_manager is not None:
@@ -4989,15 +5046,14 @@ def create_runner_app(
         stale_resp_ids = [rid for rid, cid in _resp_to_conv.items() if cid == session_id]
         for rid in stale_resp_ids:
             _resp_to_conv.pop(rid, None)
+        forwarder = _native_runtime._AUTO_FORWARDER_TASKS.get(session_id)
+        if forwarder is not None and not forwarder.done():
+            raise RuntimeError(f"Native transcript forwarder has not stopped: {session_id}")
 
-        return JSONResponse(
-            status_code=200,
-            content={
-                "session_id": session_id,
-                "object": "session.deleted",
-                "deleted": True,
-            },
-        )
+    from omnigent.runner.session_teardown import register_local_teardown
+
+    app.state.teardown_session = teardown_session
+    register_local_teardown(server_client, app)
 
     async def _seed_last_server_item_id(session_id: str) -> None:
         """

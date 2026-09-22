@@ -1959,8 +1959,16 @@ async def _teardown_failed_child(
         succeeded, otherwise a parent-visible warning string.
     """
     from omnigent.runner import app as _runner_app
+    from omnigent.runner.session_teardown import teardown_local_session
 
     entry = _runner_app.get_subagent_work(child_session_id)
+    if created_child:
+        # A failed server request may also mean its reverse tunnel is down.
+        # Reap local producers before asking the server to remove its records.
+        try:
+            await teardown_local_session(server_client, child_session_id)
+        except Exception:
+            _logger.exception("Local cleanup failed after child spawn: %s", child_session_id)
     _runner_app.unregister_child_session(child_session_id)
     _runner_app.unregister_subagent_work(child_session_id)
     if not created_child:

@@ -189,8 +189,11 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
-    task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
-    if task is None or task.done():
+    task = _AUTO_FORWARDER_TASKS.get(session_id)
+    if task is None:
+        return
+    if task.done():
+        _AUTO_FORWARDER_TASKS.pop(session_id, None)
         return
     task.cancel()
     # asyncio.wait absorbs the CancelledError and bounds the wait on a hung cancellation.
@@ -201,6 +204,8 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
             session_id,
             _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
         )
+    elif _AUTO_FORWARDER_TASKS.get(session_id) is task:
+        _AUTO_FORWARDER_TASKS.pop(session_id, None)
 
 
 async def teardown_codex_native_app_server(session_id: str) -> None:
@@ -288,6 +293,11 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     :param task: Freshly created forwarder task for this session.
     :returns: None.
     """
+    from omnigent.native.session_lifecycle import is_session_deleted
+
+    if is_session_deleted(session_id):
+        task.cancel()
+        return
     incumbent = _AUTO_FORWARDER_TASKS.get(session_id)
     if incumbent is not None and incumbent is not task:
         incumbent.cancel()
