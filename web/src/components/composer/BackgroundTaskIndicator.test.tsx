@@ -432,9 +432,9 @@ describe("BackgroundTaskIndicator", () => {
     const trigger = badge("Agent working — 1 background task still running");
     expect(trigger).toHaveTextContent("1");
     expect(screen.getByTestId("background-task-working")).toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Agent working — 1 background task still running",
-    );
+    // The working state renames the button only; the live region keeps the
+    // bare count so the transcript shimmer stays the sole working announcer.
+    expect(screen.getByRole("status")).toHaveTextContent(/^1 background task still running$/);
   });
 
   it("carries the working state while a local send is in flight", () => {

@@ -74,10 +74,9 @@ function TaskCommand({ command, label }: { command: string; label: string }) {
 }
 
 /**
- * Running shells and monitors, independent of foreground work; the count is
- * authoritative. While the agent's turn is active the badge doubles as the
- * working cue — a spinner replaces the terminal icon and the accessible name
- * says so — because on a phone the end-of-thread shimmer scrolls off screen.
+ * Running shells and monitors; the count is authoritative. While the agent's
+ * turn is active the badge doubles as the working cue (spinner + accessible
+ * name) — on a phone the end-of-thread shimmer scrolls off screen.
  */
 export function BackgroundTaskIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
@@ -122,10 +121,11 @@ export function BackgroundTaskIndicator() {
 
   return (
     <>
-      {/* Polite tally so count and working-state changes are announced with
-          the popover closed, replacing the old pill's role="status". */}
+      {/* Polite tally so count changes are announced with the popover closed.
+          The working state stays out of this live region — the shimmer is the
+          sole working-state announcer; the badge's accessible name carries it. */}
       <span role="status" className="sr-only">
-        {statusLabel}
+        {countLabel} still running
       </span>
       <Popover modal={false} open={open} onOpenChange={handleOpenChange}>
         <PopoverTrigger asChild>
