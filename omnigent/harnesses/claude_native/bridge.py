@@ -839,6 +839,9 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_category: Claude error category from a ``StopFailure``
+        hook payload's ``error`` field, e.g. ``"authentication_failed"``.
+        ``None`` for other events or when the hook carried none.
     """
 
     event_cursor: int
@@ -859,6 +862,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3630,6 +3634,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_category: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        raw_error = payload.get("error")
+        if isinstance(raw_error, str) and raw_error.strip():
+            failure_category = raw_error.strip()
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -3673,6 +3682,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_category=failure_category,
     )
 
 
