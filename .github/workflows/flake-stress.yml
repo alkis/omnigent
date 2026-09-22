@@ -136,7 +136,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -157,7 +157,7 @@ jobs:
       - name: Install dependencies
         # Matches ci.yml; ``--extra all`` pulls the harness SDKs so
         # executor adapters import at collection time.
-        run: uv sync --extra all --extra dev
+        run: uv sync --extra all --group test
 
       - name: Run pytest target
         # Inputs validated by prep. Word-splitting on $TEST_TARGET /

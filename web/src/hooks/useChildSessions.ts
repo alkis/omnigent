@@ -1,5 +1,6 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
  * Maximum depth of sub-agent nesting the Agents rail renders, counted
@@ -27,6 +28,8 @@ export interface ChildSessionInfo {
   id: string;
   /** Full title, ``"{tool}:{session_name}"``, e.g. ``"researcher:auth"``. */
   title: string | null;
+  /** Human-readable task-derived label, e.g. ``"Investigate auth flow"``. */
+  task_summary: string | null;
   /** Sub-agent type prefix, e.g. ``"researcher"``. */
   tool: string | null;
   /** Sub-agent instance name suffix, e.g. ``"auth"``. */
@@ -67,6 +70,7 @@ export interface ChildSessionInfo {
 interface ChildSessionWire {
   id: string;
   title: string | null;
+  task_summary?: string | null;
   tool: string | null;
   session_name: string | null;
   labels?: Record<string, string>;
@@ -179,6 +183,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   return json.data.map((row) => ({
     id: row.id,
     title: row.title,
+    task_summary: row.task_summary ?? null,
     tool: row.tool,
     session_name: row.session_name,
     labels: row.labels ?? {},
@@ -211,13 +216,14 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
     queryKey:
-      conversationId === null
+      sessionId === null
         ? ["conversation", null, "child_sessions"]
-        : childSessionsQueryKey(conversationId),
-    queryFn: () => fetchChildSessions(conversationId as string),
-    enabled: conversationId !== null,
+        : childSessionsQueryKey(sessionId),
+    queryFn: () => fetchChildSessions(sessionId as string),
+    enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
     refetchOnMount: false,

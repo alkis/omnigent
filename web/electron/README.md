@@ -34,6 +34,11 @@ adds native niceties:
   window can also be opened against a **different server** (see "Multiple
   servers" below). Notifications and the dock badge are app-wide (one badge
   for all windows); a notification click focuses the window that fired it.
+- **macOS Managed Preferences for MDM-provided servers.** Administrators can
+  publish an HTTPS `serverUrls` list in the `ai.omnigent.desktop` preference
+  domain. The connect screen and in-app switcher show those choices under
+  **Provided by your organization** without auto-connecting or preventing a
+  manually entered server. See [Managed Preferences](docs/managed-preferences.md).
 - **A dock / taskbar badge showing the number of unread sessions** at all
   times (macOS dock badge, Linux Unity launcher count, via
   `app.setBadgeCount`). A session becomes "unread" when it finishes a turn
@@ -42,8 +47,18 @@ adds native niceties:
   the badge.
 - **The standard native menu** (App / Edit / View / Window / Help) built from
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
-  C, V, X, Z — work inside the webview's text fields. Our custom actions —
-  **New Window**, **New Window on Different Server…**, and
+  C, V, X, Z — work inside the webview's text fields. **Settings…** uses the
+  native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
+  focused connected window through the SPA without reloading it. On macOS,
+  **About Omnigent** opens a shell-owned modal showing the platform app and
+  detected CLI versions; the CLI section points users to `omni update`.
+  **Check for Updates…** in
+  the Server menu opens the same modal and starts a check. **Update now** in the
+  shell update prompt opens the modal, hides the prompt, and starts the download;
+  the modal shows live progress and then offers **Restart to update**. Packaged macOS builds
+  resolve the running app's native icon so the modal uses the current
+  `Assets.car`/Liquid Glass appearance rather than the development PNG. Our other custom actions
+  — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
   **Notifications** submenu turns the notification sound on/off (**Play
   Notification Sound**, **off by default** — the user opts in) and picks which
@@ -82,8 +97,9 @@ adds native niceties:
 
 ## How it works (zero UI duplication)
 
-The desktop app does **not** ship a copy of the web UI. It bundles only a tiny
-"connect to server" page (`setup/index.html`). On launch:
+The desktop app does **not** ship a copy of the server web UI. It bundles small
+shell-owned pages for connecting to a server and native utilities such as the
+About modal. On launch:
 
 1. If no server URL is saved yet, it shows the setup page (one input +
    Connect). You enter your Omnigent server URL (default
@@ -110,6 +126,136 @@ Open another view with **Server → New Window** (`Cmd/Ctrl+N`). It clones the
 focused window's current URL onto a new window against the same server, so two
 conversations can be watched at once.
 
+## Databricks sign-in and embedded-auth rollback
+
+HTTPS Databricks workspace and account URLs use **system-browser OAuth** by
+default. Databricks Apps (`*.databricksapps.com`), localhost, and other servers
+keep their existing authentication behavior; the workspace session bridge is
+not used for them.
+
+The desktop completes browser sign-in and creates a DBAUTH cookie before loading
+the workspace. It renews the cookie before its known expiry and on cookie removal.
+If the workspace rejects the session, login requests are blocked while the shell
+tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
+and cancellation lead to the shell's connect/retry screen—not embedded workspace
+SSO. Failed connections stay blocked through the selector handoff so a late login
+redirect cannot replace it. Choose Connect to explicitly sign in through the system browser again.
+Saved-server launches, additional windows, server switches, and deep links use
+stored credentials without opening a browser automatically.
+
+For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:
+
+```bash
+# Quit Omnigent first, then set the preference and reopen it.
+defaults write ai.omnigent.desktop DatabricksBrowserAuthEnabled -bool false
+```
+
+This selects the entire legacy lifecycle: no browser OAuth, no OAuth-based cookie
+renewal, and the existing embedded login/return-banner behavior. It is not a
+fallback after a browser-auth failure. The preference is read once per process;
+restart the app after changing it. It does not delete saved credentials.
+
+To restore browser authentication, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DatabricksBrowserAuthEnabled
+```
+
+An explicit `-bool true` also enables browser authentication. Unset defaults and
+non-macOS platforms use browser mode. Development Electron uses its own bundle's
+NSUserDefaults domain, not the packaged app's `ai.omnigent.desktop` domain.
+
+### Manual verification
+
+The classic Connect screen shows a spinner with **Connecting…**, then
+**Authenticating…** during browser OAuth. Its trailing **×** button cancels the
+window's current attempt, closes the local callback listener/picker, and stops
+pending authentication requests. The URL stays entered for retry; late responses
+cannot navigate the window. The external browser tab may remain open—Cancel does
+not sign you out of that browser. The experimental React selector is unchanged.
+
+You can exercise the classic button states, cancel, and retry without Databricks
+configuration:
+
+```bash
+node --test web/electron/test/setup_connect.test.js
+node --test --test-name-pattern='interactive OAuth cancellation' web/electron/test/databricks-oauth.test.js
+```
+
+- Run `just electron-dev`, use **Server → Change Server…**, and connect to an
+  OAuth-enabled Databricks test workspace. Complete system-browser sign-in and
+  confirm the desktop opens Omnigent. Terminal output must include
+  `databricks session: signed in to ...`; merely reaching a login page is not success.
+- Before completing browser sign-in, click the trailing **×** beside
+  **Authenticating…**. The form should immediately return to Connect with the
+  same URL. Retry once and confirm that an old attempt cannot change the new
+  attempt's loading state or navigate the window.
+- Under **Debug → Authentication**, use **Simulate Session Expiry** to
+  clear DBAUTH without forcing a page reload. The existing cookie lifecycle
+  handles normal recovery in the background; it must not display workspace/IdP
+  login or the return banner. Removal affects windows sharing that session.
+- **Simulate OAuth Token Expiry** only marks the focused workspace's cached
+  access token expired. It does not request a refresh or reload the page.
+- **Invalidate Cached Refresh Token** removes the refresh token from that
+  workspace's local cache. It leaves the access token intact, makes no request,
+  and does not revoke the grant at Databricks.
+- To exercise the sign-in-required path, invalidate the cached refresh token,
+  expire the access token, then simulate session expiry. The first two actions
+  do not force renewal; the last triggers normal recovery, which should return
+  to the shell's Connect screen because no usable OAuth grant remains locally.
+  Normal runtime renewal is unchanged. All three actions are dev-build-only;
+  token actions require a connected Databricks workspace in browser-auth mode.
+- Test unavailable OAuth and cancel the account workspace picker: the shell
+  should offer Connect/retry without loading embedded SSO.
+- Build with `just electron-build` and open the packaged app. Verify account-first
+  sign-in shows a working workspace picker. Apply the macOS rollback preference,
+  restart, and verify embedded sign-in works without opening the browser. Remove
+  the preference and restart to verify browser-only behavior returns.
+
+### Databricks authentication diagnostics
+
+Run `just electron-dev` from a terminal and retain the `[omnigent] databricks`
+lines. For a packaged build, launch the app's executable from a terminal to see
+its stdout/stderr. No extra logging flag is required.
+
+The logs identify the selected mode, public OAuth client ID, requested scopes,
+whether a client secret is configured (not its value), token-exchange status,
+account/workspace routing, bridge redirects, final response phase/status, and
+cookie counts. Backend error codes and request IDs are included when available.
+Tokens, cookie values, client secrets, authorization codes, PKCE verifiers, full
+callback URLs, and raw response bodies are not logged. Token and account-API
+requests never follow redirects, so a 3xx from those endpoints is reported as a
+failure rather than carrying the grant or bearer to another destination. Workspace and client IDs
+are still deployment metadata; redact those before sharing logs publicly.
+
+- `bridge response` with `phase: 'session-create'` means the status came from
+  `/auth/session/create` itself, before following a redirect.
+- `phase: 'workspace landing'` means the bridge redirected and the status came
+  from the destination page; it is not a rejection from the session-create endpoint.
+- For a direct `403 PERMISSION_DENIED`, give the request ID and custom client ID
+  to the Databricks platform owner to check the denial reason (client enablement,
+  token scope, or workspace permissions). Do not infer the cause from status alone.
+
+## Debugging a packaged macOS build
+
+Developer Tools are disabled by default in the production app. To opt in, quit
+Omnigent, set its macOS user default, and reopen it:
+
+```bash
+defaults write ai.omnigent.desktop DeveloperMode -bool true
+```
+
+The **Debug → Developer Tools** menu is then available in the packaged app. To
+turn production debugging off again, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DeveloperMode
+```
+
+Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
+without this preference. The override is intentionally macOS-only and does not
+relax production update security checks.
+
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
 Electron shell at runtime (the preload exposes `window.omnigentDesktop`
@@ -124,13 +270,18 @@ electron/
   package.json             # Electron + electron-builder deps and build config
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/about_window.js      # shell-owned About modal + guarded update IPC
+  src/about_preload.js     # narrow contextBridge for the About modal
+  src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
   setup/index.html         # the bundled "connect to server" setup page
+  about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
+  docs/managed-preferences.md # public MDM configuration contract
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -245,6 +396,10 @@ against its local Chromium, and the result is posted back.
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
+  Page-initiated `window.open` / `target=_blank` never spawns a window: an
+  http(s) target navigates the same view in place (still allowlist-checked on
+  an agent-locked view), and right-click offers "Open Link in Browser" /
+  "Copy Link Address".
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it
@@ -367,6 +522,22 @@ server (see below), Connect, and you're in.
 > **not** run the Vite dev server. To develop the web UI itself with hot
 > reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
+### Test desktop updates
+
+To override the current version used by development update checks, launch the
+unpackaged app with a valid semantic version:
+
+```bash
+OMNIGENT_DESKTOP_VERSION_OVERRIDE=0.9.0 pnpm start
+```
+
+The override controls both the **Current version** shown in update prompts and
+the baseline `electron-updater` uses to decide whether a production release is
+newer. It does not change Electron's real app/package version. Packaged builds
+ignore it. `pnpm start` rebuilds the shell-owned update overlay before launching
+it. Unpackaged runs read `dev-app-update.yml`, which intentionally checks the
+same production HTTPS update server as packaged builds.
+
 ## Build a distributable
 
 From `web/electron/`:
@@ -374,7 +545,7 @@ From `web/electron/`:
 ```bash
 pnpm run build             # current platform
 pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
-pnpm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
+pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see below)
 pnpm run build:linux       # AppImage + .deb
 pnpm run build:win         # NSIS installer
 ```
@@ -394,7 +565,7 @@ build:
 | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
 | none                                                               | ad-hoc–signed app; runs locally, other Macs see a Gatekeeper warning |
 | Developer ID cert                                                  | signed app; downloads still warn until notarized                     |
-| Developer ID cert + Apple notarization creds (`build:mac:release`) | signed + notarized; installs cleanly everywhere                      |
+| Developer ID cert + Apple notarization creds (`build:mac:release`) | app and DMG signed + notarized; installs cleanly everywhere          |
 
 ### 1. Get a signing certificate
 
@@ -446,17 +617,21 @@ then:
 pnpm run build:mac:release
 ```
 
-This is the same build with `mac.notarize=true` switched on; expect the
-notarization step to add a few minutes (Apple-side processing). Verify the
+This release build signs and notarizes the app first so both the DMG and ZIP
+contain a trusted app. It then signs each finished DMG, submits it to Apple,
+and staples and validates the resulting ticket. Expect the notarization steps
+to add a few minutes per architecture (Apple-side processing). Verify the
 result with:
 
 ```bash
 spctl -a -vv dist/mac-arm64/Omnigent.app   # → "accepted, source=Notarized Developer ID"
+codesign --verify --verbose=2 dist/Omnigent-*-arm64.dmg
+xcrun stapler validate -v dist/Omnigent-*-arm64.dmg
 ```
 
-`build:mac:release` **fails loudly** if signing or notarization
-credentials are missing — that's intentional, so a release artifact can't
-silently ship unsigned.
+`build:mac:release` **fails loudly** if signing or notarization credentials
+are missing, if Apple rejects a DMG, or if stapling fails. That's intentional,
+so a release artifact can't silently ship unsigned or unnotarized.
 
 ## Getting a server to point at
 
@@ -638,13 +813,13 @@ server in the desktop app — the way a browser deep link opens a page:
 
 ```
 omnigent://localhost:8000/c/conv_abc              → http://localhost:8000/c/conv_abc
-omnigent://my-workspace.cloud.databricks.com/c/x → https://…/ml/omnigents/c/x
+omnigent://my-workspace.cloud.databricks.com/c/x → https://…/omnigent/c/x
 ```
 
 The link names a server by **host** (with port if non-default) and carries no
 `http`/`https` — the shell infers the scheme with the same rule the setup page
 uses (`http` for loopback, `https` for a remote host), so a deep link and a
-pasted URL can never disagree. The Databricks workspace mount (`/ml/omnigents`)
+pasted URL can never disagree. The Databricks workspace mount (`/omnigent`)
 is **not** in the link; it is server-determined and discovered the same way a
 pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
 ignored.

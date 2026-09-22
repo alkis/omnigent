@@ -15,6 +15,10 @@ reproduction test into **this** checkout.
 - Run it **from the root of your `omnigent-ai/omnigent` checkout** so the agent's
   working directory is this repo and it can author tests into `tests/e2e_ui/` or
   `tests/e2e/`.
+- Optional, for reproduction recordings (skipped gracefully when absent):
+  Playwright browsers (`playwright install chromium`) so the authored e2e_ui
+  test can run with `--video on`, [`vhs`](https://github.com/charmbracelet/vhs)
+  for CLI-journey tapes, and `ffmpeg` for `.mp4` conversion.
 
 ## Usage
 
@@ -56,14 +60,38 @@ with `git worktree remove <path>` when done.
 ## What it does
 
 1. Reconstructs the user journey from the linked bug report.
-2. Drives the running app through that journey — browser tools for UI bugs,
-   `sys_session_*` / HTTP for backend bugs — until it observes the failure.
-3. Authors a durable e2e test (`tests/e2e_ui/` for UI, `tests/e2e/` for backend)
-   keyed to the concrete failure, so a fix has a fail→pass regression guard.
-4. Emits a single fenced ```json block (the machine-readable handoff) whose
+2. Drives the running app through that journey — Playwright `tests/e2e_ui/` for
+   headless web UI runs (including CI), embedded-browser tools for local sessions
+   with a connected desktop, and `sys_session_*` / HTTP for backend bugs — until
+   it observes the failure. Headless CI does not probe or use desktop browser
+   tools, even when they appear in the tool list.
+3. Authors a durable e2e test (`tests/e2e_ui/` for UI, PTY/pexpect for CLI
+   journeys, `tests/e2e/` for backend) keyed to the concrete failure, so a fix
+   has a fail→pass regression guard.
+4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
+   — the e2e_ui test run with `--video on` for web/terminal facets, a rendered VHS
+   tape for CLI facets. A reproduced facet is filmed failing (before-fix footage
+   the fix step pairs with its after-fix re-recording); an already-fixed facet is
+   filmed passing (proof-it-works footage). Best-effort: skipped (and noted) when
+   the recorders aren't installed.
+5. Checkpoints the machine-readable handoff to
+   `.omnigent/repro-handoff.json` as soon as the verdict is known, updating it
+   as test and recording evidence lands so an interrupted final response does
+   not lose a completed reproduction.
+6. Presents a **Steps to reproduce** section with prerequisites, concrete
+   numbered actions, exact inputs, relevant waits/reloads, and expected versus
+   observed results at the step where each symptom appears. Verified results
+   are distinguished from reported or unverified outcomes so a reader can
+   repeat the steps manually without opening the test or recording. UI recipes
+   use visible controls and plain language; API setup, test selectors, and mock
+   details stay in evidence. Manual paths that were not driven are labeled
+   unverified.
+7. Emits a single fenced ```json block (the machine-readable handoff) whose
    `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
-   / `needs_more_info`, alongside the per-facet breakdown, test path, session id,
-   journey, and evidence. Parse `verdict` from that block to label the issue.
+   / `needs_more_info`, alongside the per-facet breakdown (each facet stamped
+   with its `surface`), test path, recordings list, session id, journey, and
+   evidence. The `journey` string preserves the full manual recipe with escaped
+   newlines. Parse `verdict` from that block to label the issue.
 
 It does **not** fix the bug, merge, or push — it produces a live-confirmed
 reproduction plus the test and hands off. The authored test lands in your working

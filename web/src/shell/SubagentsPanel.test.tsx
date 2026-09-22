@@ -79,6 +79,7 @@ function renderPanel({
 function childInfo(overrides: Partial<ChildSessionInfo> & { id: string }): ChildSessionInfo {
   return {
     title: null,
+    task_summary: null,
     tool: null,
     session_name: null,
     current_task_status: null,
@@ -450,6 +451,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -460,6 +462,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "in_progress",
@@ -488,12 +491,14 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "codex:auth-refactor",
+          task_summary: null,
           tool: "codex",
           session_name: "auth-refactor",
         }),
         childInfo({
           id: "conv_title_only",
           title: "codex:fix-sse-error",
+          task_summary: null,
           tool: "codex",
           session_name: null,
         }),
@@ -516,6 +521,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "codex-native-ui-subagent:thread_child_alpha",
+          task_summary: null,
           tool: "auth-auditor",
           session_name: "thread_child_alpha",
           labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
@@ -560,6 +566,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_codex",
           title: "codex:auth-refactor",
+          task_summary: null,
           tool: "codex",
           session_name: "auth-refactor",
           labels: { "omnigent.wrapper": "codex-native-ui" },
@@ -567,6 +574,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_opencode",
           title: "opencode:port-auth-refactor",
+          task_summary: null,
           tool: "opencode",
           session_name: "port-auth-refactor",
           labels: { "omnigent.wrapper": "opencode-native-ui" },
@@ -574,6 +582,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_claude",
           title: "claude_code:review-auth-refactor",
+          task_summary: null,
           tool: "claude_code",
           session_name: "review-auth-refactor",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
@@ -581,6 +590,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_kiro",
           title: "kiro:harden-auth",
+          task_summary: null,
           tool: "kiro",
           session_name: "harden-auth",
           labels: { "omnigent.wrapper": "kiro-native-ui" },
@@ -645,6 +655,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_custom",
           title: "codex:custom-review",
+          task_summary: null,
           tool: "codex",
           session_name: "custom-review",
         }),
@@ -666,6 +677,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_pi",
           title: "pi:review-auth",
+          task_summary: null,
           tool: "pi",
           session_name: "review-auth",
         }),
@@ -673,6 +685,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_pipeline",
           title: "pipeline:build",
+          task_summary: null,
           tool: "pipeline",
           session_name: "build",
         }),
@@ -699,6 +712,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_native_pi",
           title: "pi:port-fix",
+          task_summary: null,
           tool: "pi",
           session_name: "port-fix",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
@@ -740,6 +754,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -750,6 +765,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "completed",
@@ -780,6 +796,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "failed",
@@ -804,6 +821,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           last_task_error: {
@@ -844,6 +862,7 @@ describe("SubagentsPanel", () => {
           childInfo({
             id: "conv_child",
             title: "researcher:auth",
+            task_summary: null,
             tool: "researcher",
             session_name: "auth",
             current_task_status: "failed",
@@ -887,6 +906,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "failed",
@@ -1039,6 +1059,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -1305,10 +1326,12 @@ describe("SubagentsPanel", () => {
     renderPanel({
       rootSessionId: "conv_root",
       // Simulate stale session-scoped params carried over from the
-      // previous session — the bug condition the fix targets. All four
-      // are listed so any regression that drops a key from
-      // SESSION_SCOPED_PARAMS surfaces here.
-      initialEntries: ["/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed"],
+      // previous session — the bug condition the fix targets. All five
+      // are listed so any regression that drops a key from the shared
+      // session-scoped search-param list surfaces here.
+      initialEntries: [
+        "/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed&message=msg_1",
+      ],
     });
 
     const main = screen.getByTestId("subagent-main-row");
@@ -1363,12 +1386,14 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_added",
           title: "ui:claude-native-ui:jimmy",
+          task_summary: null,
           tool: "claude-native-ui",
           session_name: "jimmy",
         }),
         childInfo({
           id: "conv_llm",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
         }),
@@ -1383,6 +1408,44 @@ describe("SubagentsPanel", () => {
     const llmSpawned = childRow(container, "conv_llm");
     expect(llmSpawned).toHaveTextContent("auth");
     expect(llmSpawned).not.toHaveTextContent("researcher");
+  });
+
+  it("shows the Task description for Claude Code sub-agents, never the hex id", () => {
+    // A Claude sub-agent's title is "<agentType>:<subagentId>", a per-parent
+    // uniqueness key ending in an opaque hex id. Splitting it left the rail
+    // showing bare ids — in a 21-worker wave, 17 indistinguishable rows. The
+    // readable label rides on ``tool``: the Task description, else the agent
+    // type's trailing segment (plugin-namespaced types carry their own colon).
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_described",
+          title: "general-purpose:a09d1dd1d8dbc0151",
+          tool: "wave-worker-696",
+          session_name: "a09d1dd1d8dbc0151",
+          labels: {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "wave-worker-696",
+          },
+        }),
+        childInfo({
+          id: "conv_namespaced",
+          title: "rpw-published:debug-lead:a361e6a6aa05689cb",
+          tool: "debug-lead",
+          session_name: "a361e6a6aa05689cb",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const described = childRow(container, "conv_described");
+    expect(described).toHaveTextContent("wave-worker-696");
+    expect(described).not.toHaveTextContent("a09d1dd1d8dbc0151");
+    const namespaced = childRow(container, "conv_namespaced");
+    expect(namespaced).toHaveTextContent("debug-lead");
+    expect(namespaced).not.toHaveTextContent("a361e6a6aa05689cb");
   });
 
   it("renders grandchildren and deeper levels indented under their parents", () => {

@@ -23,12 +23,15 @@ import dataclasses
 
 from fastapi import Request
 
+from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation
+from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.permissions import (
     check_session_access,
@@ -290,52 +293,58 @@ def _require_access_and_level_sync(
             code=ErrorCode.UNAUTHORIZED,
         )
 
-    # Single round-trip: admin flag + the user's and public grants on the
-    # conversation the caller asked about. The displayed level is the direct
-    # grant (no parent walk), matching get_permission_level exactly.
-    access = permission_store.resolve_access(user_id, conversation_id)
-    level = resolved_level(access)
+    # One read-only burst: the permission resolve, the conversation lookup,
+    # and any parent-chain walk all share a single pool checkout instead of
+    # one per store call. On the per-streamed-event path this is re-run for a
+    # session whose data is stable for the turn, so the checkout — plus
+    # ``pool_pre_ping`` — is the cost that matters.
+    with shared_read_scope():
+        # Single round-trip: admin flag + the user's and public grants on the
+        # conversation the caller asked about. The displayed level is the direct
+        # grant (no parent walk), matching get_permission_level exactly.
+        access = permission_store.resolve_access(user_id, conversation_id)
+        level = resolved_level(access)
 
-    # Admins bypass the conversation lookup entirely (mirrors
-    # check_session_access's admin short-circuit, which never reads the
-    # conversation). A missing conversation is left for the snapshot builder
-    # to 404 on, exactly as today.
-    if access.is_admin:
-        return SessionAccess(level=level, conversation=None)
+        # Admins bypass the conversation lookup entirely (mirrors
+        # check_session_access's admin short-circuit, which never reads the
+        # conversation). A missing conversation is left for the snapshot builder
+        # to 404 on, exactly as today.
+        if access.is_admin:
+            return SessionAccess(level=level, conversation=None)
 
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is None:
-        raise OmnigentError(
-            "Conversation not found",
-            code=ErrorCode.NOT_FOUND,
-        )
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
+            raise OmnigentError(
+                "Conversation not found",
+                code=ErrorCode.NOT_FOUND,
+            )
 
-    if conv.parent_conversation_id is None:
-        # Top-level session: the access-governing grant lives on this same
-        # conversation, so reuse the rows already fetched — no extra reads.
-        allowed = resolved_allows(access, required_level)
-    else:
-        # Sub-agent: access delegates to the parent chain. Defer to the
-        # canonical recursive checker (its own reads); sub-agents are rare
-        # and the parent's grants are a different conversation's rows.
-        allowed = check_session_access(
-            user_id,
-            conv.parent_conversation_id,
-            required_level,
-            permission_store,
-            conversation_store,
-        )
-    if allowed:
-        return SessionAccess(level=level, conversation=conv)
+        if conv.parent_conversation_id is None:
+            # Top-level session: the access-governing grant lives on this same
+            # conversation, so reuse the rows already fetched — no extra reads.
+            allowed = resolved_allows(access, required_level)
+        else:
+            # Sub-agent: access delegates to the parent chain. Defer to the
+            # canonical recursive checker (its own reads); sub-agents are rare
+            # and the parent's grants are a different conversation's rows.
+            allowed = check_session_access(
+                user_id,
+                conv.parent_conversation_id,
+                required_level,
+                permission_store,
+                conversation_store,
+            )
+        if allowed:
+            return SessionAccess(level=level, conversation=conv)
 
-    # Denied — distinguish "has some access but not enough" (403) from
-    # "no access at all" (404, to avoid leaking session existence).
-    if conv.parent_conversation_id is None:
-        has_any = resolved_allows(access, 1)
-    else:
-        has_any = check_session_access(
-            user_id, conv.parent_conversation_id, 1, permission_store, conversation_store
-        )
+        # Denied — distinguish "has some access but not enough" (403) from
+        # "no access at all" (404, to avoid leaking session existence).
+        if conv.parent_conversation_id is None:
+            has_any = resolved_allows(access, 1)
+        else:
+            has_any = check_session_access(
+                user_id, conv.parent_conversation_id, 1, permission_store, conversation_store
+            )
     if has_any:
         level_name = _LEVEL_NAMES.get(required_level, str(required_level))
         raise OmnigentError(
@@ -401,3 +410,61 @@ def get_session_owner_id(
         if g.level >= LEVEL_OWNER:
             return g.user_id
     return None
+
+
+def require_agent_owner(
+    user_id: str | None,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Authorize mutation of a session-scoped agent: owner or admin only.
+
+    A session-scoped agent's bundle carries code that later runs with the
+    runner's authority, so only the user who created it (or a workspace
+    admin) may replace or edit it. A ``LEVEL_EDIT`` grant on the *request's*
+    session is deliberately insufficient: session sharing hands out EDIT to
+    collaborators, and agent reuse lets several sessions with different owners
+    reference one agent row.
+
+    A legacy row (``created_by`` NULL — created before ownership tracking, or
+    minted by a switch) records no trustworthy owner, and the reverse lookup to
+    an owning session is not dependable (reuse spreads the agent across roots,
+    and sessions can be deleted). Such rows are therefore admin-only: the owner
+    regains a mutable agent by re-uploading the bundle, which creates a fresh
+    row stamped with their identity.
+
+    Assumes the caller already rejected template agents (``session_id is
+    None``) as read-only, so this only sees session-scoped agents.
+
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param agent: The session-scoped agent being mutated. Its ``created_by``
+        is the authoritative owner when set; a ``None`` value is admin-only.
+    :param permission_store: Permission store, or ``None`` when auth is off.
+    :raises OmnigentError: 403 when the caller is neither the owner nor an
+        admin.
+    """
+    # Auth disabled entirely: no ownership model to enforce.
+    if permission_store is None:
+        return
+    # Local single-user (header auth): grants are keyed by the "local"
+    # sentinel and there is no second identity to forge against. Mirror
+    # validate_session_agent's local handling and allow.
+    if local_single_user_enabled():
+        return
+    # Workspace admins bypass, mirroring check_session_access / resolved_allows.
+    if user_id is not None and permission_store.is_admin(user_id):
+        return
+    # Legacy / unowned row: admins only (handled above); everyone else denied.
+    if agent.created_by is None:
+        raise OmnigentError(
+            f"agent {agent.id!r} predates ownership tracking; it can only be "
+            "updated by an admin, or re-uploaded by its owner",
+            code=ErrorCode.FORBIDDEN,
+        )
+    # Explicit owner.
+    if user_id is not None and user_id == agent.created_by:
+        return
+    raise OmnigentError(
+        f"{user_id!r} is not the owner of agent {agent.id!r}",
+        code=ErrorCode.FORBIDDEN,
+    )

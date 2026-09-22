@@ -11,6 +11,9 @@ from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
+# Host-launched runners delegate machine-global stale-process cleanup to the
+# host daemon. CLI-local runners leave this unset and retain standalone cleanup.
+RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR = "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP"
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
 # keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
@@ -25,6 +28,19 @@ RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
 # Host-launched runners use their binding token to obtain a short-lived,
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
+# Replica-routing key the runner stamps on its tunnel handshake so it
+# co-locates with the host that launched it (value = that host's host_id). The
+# host injects it when spawning the runner; absent for CLI-local runners, which
+# then leave routing to the default.
+RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
+# Canonical harness of the session this runner is being launched for (e.g.
+# "claude-native"), stamped by the host from the launch frame so the runner
+# can start harness-specific prewarms before session init arrives. Absent
+# for CLI-local runners and hosts that predate the stamp.
+RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
+# JSON-encoded ordered shell inventory discovered by the host daemon. The
+# runner uses this exact snapshot for native wrapper terminal declarations.
+RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,

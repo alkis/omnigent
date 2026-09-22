@@ -16,13 +16,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
@@ -32,6 +35,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
@@ -52,7 +56,7 @@ _HOST_NAME = "credential-test-laptop"
 @pytest.fixture(autouse=True)
 def _enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the feature flag for every test except the flag-off case."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -97,6 +101,18 @@ def cred_app(
     app = FastAPI()
     app.include_router(create_host_tunnel_router(registry, host_store), prefix="/v1")
     app.include_router(create_hosts_router(registry, host_store, conv_store), prefix="/v1")
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -117,14 +133,11 @@ async def cred_setup(
     comm = await _connect_mock_host(app, registry)
     received: list[HostStoreSecretFrame] = []
     replies: dict[str, dict[str, Any]] = {}
-    stop_drain = asyncio.Event()
 
     async def _drain() -> None:
-        while not stop_drain.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            # An idle receive timeout cancels the ASGI app; teardown owns cancellation.
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -169,11 +182,13 @@ async def cred_setup(
     try:
         yield app, registry, received, replies
     finally:
-        stop_drain.set()
+        drain_task.cancel()
         try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain_task
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=5.0)
 
 
 # ── Happy path ──────────────────────────────────────────
@@ -271,13 +286,18 @@ async def test_store_gateway_forwards_base_url(
     assert received[0].wire_api == "chat"
 
 
+@pytest.mark.parametrize(
+    "idle_seconds", [pytest.param(0.0, id="immediate"), pytest.param(0.75, id="idle")]
+)
 async def test_adopt_forwards_env_var_without_secret(
     cred_setup: tuple[
         FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
     ],
+    idle_seconds: float,
 ) -> None:
     """An adopt request forwards the env var name and no secret value."""
     app, _reg, received, _replies = cred_setup
+    await asyncio.sleep(idle_seconds)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
@@ -291,6 +311,7 @@ async def test_adopt_forwards_env_var_without_secret(
 
 async def test_concurrent_writes_to_one_host_are_serialized(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two overlapping credential writes to one host don't interleave.
 
@@ -305,17 +326,20 @@ async def test_concurrent_writes_to_one_host_are_serialized(
     conn = registry.get(_HOST_ID)
     assert conn is not None
 
-    arrivals: list[str] = []
-    release_first = asyncio.Event()
-    stop = asyncio.Event()
+    arrivals: asyncio.Queue[HostStoreSecretFrame] = asyncio.Queue()
+    second_write_waiting = asyncio.Event()
+    original_acquire = conn.credential_write_lock.acquire
+
+    async def observe_acquire() -> bool:
+        if conn.credential_write_lock.locked():
+            second_write_waiting.set()
+        return await original_acquire()
+
+    monkeypatch.setattr(conn.credential_write_lock, "acquire", observe_acquire)
 
     async def _drain() -> None:
-        first_seen = False
-        while not stop.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             if output.get("type") != "websocket.send":
                 continue
             text = output.get("text")
@@ -324,56 +348,61 @@ async def test_concurrent_writes_to_one_host_are_serialized(
             frame = decode_host_frame(text)
             if not isinstance(frame, HostStoreSecretFrame):
                 continue
-            arrivals.append(frame.kind)
-            # Hold the FIRST write's reply until released, so if the lock were
-            # missing the second frame would arrive while the first is pending.
-            if not first_seen:
-                first_seen = True
-                await release_first.wait()
-            await comm.send_input(
-                {
-                    "type": "websocket.receive",
-                    "text": encode_host_frame(
-                        HostStoreSecretResultFrame(
-                            request_id=frame.request_id,
-                            status="ok",
-                            configured_harnesses={frame.harness: True},
-                        )
-                    ),
-                }
-            )
+            arrivals.put_nowait(frame)
 
-    drain_task = asyncio.create_task(_drain())
+    async def reply(frame: HostStoreSecretFrame) -> None:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostStoreSecretResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        configured_harnesses={frame.harness: True},
+                    )
+                ),
+            }
+        )
+
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            first = asyncio.create_task(
+        async with (
+            AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
+            asyncio.TaskGroup() as tasks,
+        ):
+            drain_task = tasks.create_task(_drain())
+            first = tasks.create_task(
                 client.post(
                     f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
                     json={"kind": "key", "secret": "sk-1"},
                 )
             )
-            second = asyncio.create_task(
+            first_frame = await asyncio.wait_for(arrivals.get(), timeout=5.0)
+            assert first_frame.kind == "key"
+            second = tasks.create_task(
                 client.post(
                     f"/v1/hosts/{_HOST_ID}/harnesses/codex/credential",
                     json={"kind": "gateway", "secret": "sk-2", "base_url": "https://gw/v1"},
                 )
             )
-            # Give both requests time to reach the route; only the first frame
-            # should have been forwarded (the second is blocked on the lock).
-            await asyncio.sleep(0.2)
-            assert arrivals == ["key"], f"second write leaked past the lock: {arrivals}"
-            release_first.set()
-            r1, r2 = await asyncio.gather(first, second)
-            assert r1.status_code == 200 and r2.status_code == 200
-            # Both eventually processed, in order — no interleave.
-            assert arrivals == ["key", "gateway"]
-    finally:
-        stop.set()
-        release_first.set()
-        try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(second_write_waiting.wait(), timeout=5.0)
+            assert not first.done()
+            assert not second.done()
+            assert set(conn.pending_secret_writes) == {first_frame.request_id}
+            assert arrivals.empty()
+            await reply(first_frame)
+            second_frame = await asyncio.wait_for(arrivals.get(), timeout=5.0)
+            assert second_frame.kind == "gateway"
+            await reply(second_frame)
+            first_response, second_response = await asyncio.wait_for(
+                asyncio.gather(first, second), timeout=5.0
+            )
+            assert first_response.status_code == 200
+            assert second_response.status_code == 200
+            assert arrivals.empty()
             drain_task.cancel()
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5.0)
 
 
 # ── Validation / gating ─────────────────────────────────
@@ -381,12 +410,20 @@ async def test_concurrent_writes_to_one_host_are_serialized(
 
 async def test_route_hidden_when_flag_off(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the flag off the route is 404 — the feature is invisible."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = cred_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = cred_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
             json={"kind": "key", "secret": "x"},
@@ -464,9 +501,10 @@ async def test_unknown_host_returns_404(
 async def test_offline_host_returns_409(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
-    """A registered-but-offline host returns 409 (no live tunnel to forward on)."""
+    """An offline host returns 409 (no live tunnel to forward on)."""
     app, _reg, host_store, _cs = cred_app
     host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="local")
+    host_store.set_offline(_HOST_ID)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
@@ -533,11 +571,19 @@ async def test_detect_credentials_returns_non_secret_descriptors(
 
 async def test_detect_credentials_hidden_when_flag_off(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the flag off the detect route is 404."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = cred_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = cred_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
     assert resp.status_code == 404

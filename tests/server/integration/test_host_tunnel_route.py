@@ -13,15 +13,18 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
+    decode_host_frame,
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
+from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
 
@@ -67,7 +70,7 @@ async def _connect_route(
     """
     communicator = ApplicationCommunicator(app, _websocket_scope(path))
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
     return communicator
 
@@ -130,7 +133,7 @@ async def _send_hello_and_wait(
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
-        timeout=2.0,
+        timeout=budget(2.0),
     )
 
 
@@ -163,6 +166,19 @@ async def _wait_offline(
         await asyncio.sleep(0.01)
 
 
+async def _wait_deregistered(
+    registry: HostRegistry,
+    host_id: str,
+) -> None:
+    """Poll until the host is removed from the registry.
+
+    :param registry: Host registry to poll.
+    :param host_id: Host id expected to disappear.
+    """
+    while registry.get(host_id) is not None:
+        await asyncio.sleep(0.01)
+
+
 async def _wait_updated_at_at_least(
     store: HostStore,
     host_id: str,
@@ -187,7 +203,7 @@ async def _wait_updated_at_at_least(
                 return host.updated_at
             await asyncio.sleep(0.01)
 
-    return await asyncio.wait_for(_poll(), timeout=timeout_s)
+    return await asyncio.wait_for(_poll(), timeout=budget(timeout_s))
 
 
 async def test_host_tunnel_ping_loop_persists_heartbeat(
@@ -280,8 +296,10 @@ async def test_host_tunnel_deregisters_on_disconnect(
     assert registry.get(_HOST_ID) is not None
 
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-    # Give the handler a moment to process the disconnect.
-    await asyncio.sleep(0.1)
+    # Poll until deregistered — a fixed sleep flakes under load (the
+    # disconnect handler runs deregister asynchronously and may not
+    # complete within a fixed window).
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
     assert registry.get(_HOST_ID) is None
 
@@ -303,6 +321,63 @@ async def test_host_tunnel_upserts_db_on_connect(
     assert host is not None, "Host row should exist in DB after tunnel connect"
     assert host.name == "test-laptop"
     assert host.status == "online"
+
+
+async def test_host_tunnel_reports_registration_failure(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-registration server exception closes with an actionable stage."""
+    app, registry, store = host_app
+
+    def _fail_upsert(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "upsert_on_connect", _fail_upsert)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input(
+        {"type": "websocket.receive", "text": _make_hello()},
+    )
+
+    sent = await comm.receive_output(timeout=budget(1.0))
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert error == HostConnectionErrorFrame(
+        stage="registration",
+        error="database unavailable",
+        retryable=True,
+    )
+    close = await comm.receive_output(timeout=budget(1.0))
+    assert close["type"] == "websocket.close"
+    assert close["code"] == 4005
+    assert registry.get(_HOST_ID) is None
+
+
+async def test_registry_failure_marks_persisted_host_offline(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after the upsert must not leave a ghost-online host row."""
+    app, registry, store = host_app
+
+    def _fail_register(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(registry, "register", _fail_register)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input({"type": "websocket.receive", "text": _make_hello()})
+
+    sent = await comm.receive_output(timeout=budget(1.0))
+    error = decode_host_frame(sent["text"])
+    assert error == HostConnectionErrorFrame(
+        stage="registry",
+        error="registry unavailable",
+        retryable=True,
+    )
+    await _wait_offline(store, _HOST_ID)
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "offline"
 
 
 async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
@@ -339,7 +414,7 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
             ),
         }
     )
-    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=budget(2.0))
 
     await comm.send_input(
         {
@@ -357,7 +432,7 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
                 return
             await asyncio.sleep(0.01)
 
-    await asyncio.wait_for(_wait_until_ready(), timeout=0.5)
+    await asyncio.wait_for(_wait_until_ready(), timeout=budget(0.5))
 
     conn = registry.get(_HOST_ID)
     assert conn is not None
@@ -383,7 +458,7 @@ async def test_host_tunnel_sets_offline_on_disconnect(
     # Poll until status flips — avoids the fixed-sleep race that
     # causes flakes under load (set_offline runs via to_thread and
     # may not complete within a fixed 0.1 s window).
-    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=2.0)
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
 
     host = store.get_host(_HOST_ID)
     assert host is not None
@@ -413,7 +488,13 @@ async def test_host_tunnel_rejects_bad_protocol_version(
         {"type": "websocket.receive", "text": bad_hello},
     )
 
-    close = await comm.receive_output(timeout=1.0)
+    sent = await comm.receive_output(timeout=budget(1.0))
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert isinstance(error, HostConnectionErrorFrame)
+    assert error.stage == "protocol"
+    assert "frame_protocol_version mismatch" in error.error
+    close = await comm.receive_output(timeout=budget(1.0))
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4002
 
@@ -442,7 +523,15 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
         {"type": "websocket.receive", "text": result_frame},
     )
 
-    close = await comm.receive_output(timeout=1.0)
+    sent = await comm.receive_output(timeout=budget(1.0))
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert error == HostConnectionErrorFrame(
+        stage="hello",
+        error="expected host.hello frame",
+        retryable=False,
+    )
+    close = await comm.receive_output(timeout=budget(1.0))
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4001
 
@@ -484,7 +573,7 @@ async def test_host_tunnel_routes_launch_result_to_future(
     )
 
     # Future should resolve within a short time.
-    result = await asyncio.wait_for(future, timeout=2.0)
+    result = await asyncio.wait_for(future, timeout=budget(2.0))
     assert result["status"] == "launched"
     assert result["runner_id"] == "runner_token_xyz"
     assert result["error"] is None
@@ -558,10 +647,10 @@ async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
 
-    start = await comm.receive_output(timeout=1.0)
+    start = await comm.receive_output(timeout=budget(1.0))
     assert start["type"] == "websocket.http.response.start"
     assert start["status"] == 409
-    body = await comm.receive_output(timeout=1.0)
+    body = await comm.receive_output(timeout=budget(1.0))
     assert body["type"] == "websocket.http.response.body"
     assert b"already registered to a different account" in body["body"]
 
@@ -588,7 +677,7 @@ async def test_cross_owner_refused_with_close_when_no_denial_extension(db_uri: s
     comm = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
     await comm.send_input({"type": "websocket.connect"})
 
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     assert registry.get(_HOST_ID) is None
@@ -613,6 +702,47 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     assert host.status == "online"
 
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_malformed_host_id_refused_with_400_before_accept(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A non-UUID host_id is refused with HTTP 400 + body, not a bare close.
+
+    Regression for the customer case where a host dialed in with a
+    human-readable id (``superagent-databricks-host``). A pre-accept bare
+    close reaches the client as an opaque 403 with an empty body,
+    indistinguishable from an auth failure; a 400 denial response naming
+    the cause lets the host surface an actionable error.
+    """
+    app, registry, _store = host_app
+    scope = _websocket_scope("/v1/hosts/superagent-databricks-host/tunnel")
+    # Advertise the denial-response extension, as uvicorn does in prod.
+    scope["extensions"] = {"websocket.http.response": {}}
+    comm = ApplicationCommunicator(app, scope)
+    await comm.send_input({"type": "websocket.connect"})
+
+    start = await comm.receive_output(timeout=budget(1.0))
+    assert start["type"] == "websocket.http.response.start"
+    assert start["status"] == 400
+    body = await comm.receive_output(timeout=budget(1.0))
+    assert body["type"] == "websocket.http.response.body"
+    assert b"UUID" in body["body"]
+    assert registry.get("superagent-databricks-host") is None
+
+
+async def test_malformed_host_id_refused_with_close_when_no_denial_extension(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Without the denial-response extension, the refusal falls back to a close."""
+    app, registry, _store = host_app
+    comm = ApplicationCommunicator(app, _websocket_scope("/v1/hosts/not-a-uuid/tunnel"))
+    await comm.send_input({"type": "websocket.connect"})
+
+    closed = await comm.receive_output(timeout=budget(1.0))
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4009
+    assert registry.get("not-a-uuid") is None
 
 
 # ── Managed-host launch-token auth ──────────────────────────
@@ -676,7 +806,7 @@ async def test_managed_token_authenticates_as_record_owner(
 
     communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-ok"))
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     await _send_hello_and_wait(communicator, registry, name=f"managed-{_HOST_ID}")
@@ -687,6 +817,40 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.status == "online"
     # The managed binding survives the connect upsert.
     assert host.sandbox_id == "sb-tunnel-1"
+
+
+async def test_managed_token_is_revalidated_after_websocket_accept(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Detaching after handshake auth still blocks final host registration."""
+    app, registry, store = host_app
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-race")
+    registered = store.get_host(_HOST_ID)
+    assert registered is not None
+
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-race"))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    assert accepted["type"] == "websocket.accept"
+
+    assert store.detach_stale_managed_sandbox(
+        _HOST_ID,
+        sandbox_id="sb-tunnel-1",
+        expected_updated_at=registered.updated_at,
+    )
+    await communicator.send_input(
+        {"type": "websocket.receive", "text": _make_hello(name=f"managed-{_HOST_ID}")},
+    )
+    response = await communicator.receive_output(timeout=budget(1.0))
+    if response["type"] == "websocket.send":
+        response = await communicator.receive_output(timeout=budget(1.0))
+    assert response["type"] == "websocket.close"
+    assert registry.get(_HOST_ID) is None
+    detached = store.get_host(_HOST_ID)
+    assert detached is not None
+    assert detached.status == "offline"
+    assert detached.sandbox_id is None
+    assert detached.terminating_sandbox_id == "sb-tunnel-1"
 
 
 @pytest.mark.parametrize(
@@ -726,7 +890,7 @@ async def test_invalid_managed_token_refused_before_accept(
 
     communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, presented_token))
     await communicator.send_input({"type": "websocket.connect"})
-    closed = await communicator.receive_output(timeout=1.0)
+    closed = await communicator.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4004
     # Nothing registered on this replica, and the target host never

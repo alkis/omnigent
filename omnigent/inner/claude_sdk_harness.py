@@ -71,7 +71,7 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
   passes ``plugins=[{"type": "local", "path": <bundle_dir>}]``
-  to the SDK so any ``<bundle>/skills/<name>/SKILL.md`` files
+  to the SDK so any ``<bundle>/skills/<dir>/SKILL.md`` files
   surface as agent-bundled skills (regardless of
   ``skills_filter``). Unset for agents without a bundled-skills
   directory.
@@ -95,6 +95,7 @@ from fastapi import FastAPI
 from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -161,7 +162,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),

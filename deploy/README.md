@@ -90,8 +90,14 @@ deploy/
 ├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
 │   └── README.md         E2B template); NOT a server deploy target.
 │
+├── gensee/            ← Gensee managed sandbox-provider guide (ephemeral
+│   └── README.md         provider-managed runtimes); NOT a server deploy target.
+│
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
+│
+├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
+│   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
@@ -281,8 +287,8 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
-session with `"host_type": "managed"` (e.g.
+**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+*managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
 No laptop, no CLI steps per session; the sandbox is terminated when the
@@ -293,15 +299,31 @@ config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`):
 sandbox:
   provider: modal
   server_url: https://your-host        # public URL sandboxes dial back to
+  reaper:                              # optional, disabled by default
+    enabled: true
+    terminate_after_offline_days: 30   # default: 30 days
+    sweep_interval_s: 86400            # default: 1 day
 ```
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
+Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
+Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
+Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
+[`gensee/README.md`](gensee/README.md) for its managed-only configuration.
+All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
-**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. To use a custom image instead, build the same `host` target and point the provider config at it:
+The optional reaper runs once for the whole `sandbox:` deployment, including
+multi-provider configurations. It queries managed host rows directly and
+detaches a sandbox generation only after its host has stayed offline past
+`terminate_after_offline_days`. Provider termination failures remain recorded
+for a later sweep, while the session history and durable host binding stay
+available for a fresh sandbox generation. Both
+`terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
+
+**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
 ```bash
 docker build -f docker/Dockerfile --target host \
@@ -497,6 +519,40 @@ get right. Only choose `header` when you already operate a proxy you trust
 to set and sanitize the identity header, and read
 [`docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy`](docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy)
 first.
+
+## Branding (white-labeling)
+
+Customize the app name, landing heading, and logos with a `branding:` block in
+the server config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`
+— `/data/config.yaml` in the Docker stack). Takes effect on the next server
+start.
+
+```yaml
+branding:
+  app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
+  logo:                          # a bare string sets `main`; or per-variant:
+    main: logo.png               # branding-assets/logo.png
+    loading: loading.webp        # working indicator (falls back to main)
+    favicon: favicon.png         # browser-tab icon
+  powered_by: true               # "Powered by Omnigent" credit; false to hide
+```
+
+Logo files must live under a dedicated `branding-assets/` directory beside the
+config file (for example, `/data/branding-assets/logo.png`). PNG, JPEG, GIF,
+WebP, and ICO files up to 5 MiB are accepted only after full decoder validation.
+ICO files must contain only PNG-backed entries; every directory entry is bounded
+and decoded independently, while DIB/BMP-backed entries are rejected. Malformed,
+truncated, oversized, overlapping, trailing-payload, SVG, symlinked, escaped, and
+non-image files are ignored. Images are also bounded to 4096 pixels per side,
+128 frames, 16 megapixels per frame, and 64 megapixels across all decoded frames.
+The values are served over the unauthenticated `GET /v1/info` and
+`GET /v1/branding/logo/<variant>` endpoints so the login screen is branded before
+sign-in. Any unset field keeps its built-in default, so a partial block is fine.
+
+The small "Powered by Omnigent" credit under the landing composer appears only
+once you set custom branding; `powered_by: false` hides it even then. It always
+shows the Omnigent mascot, never your logo.
 
 ## Adding a new deploy target
 
