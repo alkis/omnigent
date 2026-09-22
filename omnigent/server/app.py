@@ -3388,6 +3388,7 @@ def create_app(
             restore_active_children,
         )
         from omnigent.server.routes._sessions.common import (
+            _RUNNER_SESSION_INIT_TIMEOUT,
             _session_sandbox_status_cache,
         )
         from omnigent.server.routes.sessions import (
@@ -3454,7 +3455,7 @@ def create_app(
                     init_response = await runner_session_initializer.initialize(
                         conv,
                         routed.client,
-                        timeout=10.0,
+                        timeout=_RUNNER_SESSION_INIT_TIMEOUT,
                     )
                     init_response.raise_for_status()
                     await restore_active_children(

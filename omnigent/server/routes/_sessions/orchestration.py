@@ -179,7 +179,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
-    _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _RUNNER_SESSION_INIT_TIMEOUT,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
@@ -4263,7 +4263,7 @@ async def _ensure_runner_session_initialized(
             resp = await initializer.initialize(
                 conv,
                 runner_client,
-                timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+                timeout=_RUNNER_SESSION_INIT_TIMEOUT,
                 suppress_recovery_turn=suppress_recovery_turn,
             )
         else:
@@ -4276,7 +4276,7 @@ async def _ensure_runner_session_initialized(
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
                 ),
-                timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+                timeout=_RUNNER_SESSION_INIT_TIMEOUT,
             )
         from omnigent.server.runner_session_init import runner_inference_verified
 
