@@ -2509,6 +2509,30 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
+class SessionForkAsyncBind(BaseModel):
+    """Runner-bind intent carried by an async fork so completion can bind the
+    fork's runner without the client holding the intent in memory.
+
+    Mirrors the ``launchRunner`` (``POST /v1/hosts/{id}/runners``) arguments the
+    Web UI would otherwise fire itself. Echoed back on the ``ready`` event so any
+    client (post-refresh, other tab) can perform the bind.
+
+    :param host_id: Host to launch the fork's runner on, e.g. ``"host_abc"``.
+    :param workspace: Working directory on the host (the source repo when
+        ``git`` creates a worktree).
+    :param git: Optional worktree/branch options (``branch_name`` plus
+        ``base_branch`` / ``existing_worktree`` / ``existing_branch``), matching
+        the runner-launch request's ``git`` field. ``None`` binds ``workspace``
+        directly.
+    """
+
+    host_id: str
+    workspace: str
+    git: dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class SessionForkRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
@@ -2600,6 +2624,14 @@ class SessionForkRequest(BaseModel):
     # keeps the synchronous 201 + SessionResponse contract every other client
     # (CLI, native hook, SDK/REPL) still depends on.
     async_operation_id: str | None = Field(default=None, max_length=128)
+    # Coding-fork runner-bind intent for the async path. The Web UI can't bind
+    # the runner itself until the fork id exists (it arrives with ``ready``), and
+    # keeping the intent only in the tab's memory loses it across a refresh. So
+    # the async request PERSISTS the intent here; the server echoes it back on
+    # the ``ready`` event, letting ANY client (the original tab, a reconnected
+    # one, or another tab) drive the bind — surviving refresh and disconnects.
+    # Only meaningful with ``async_operation_id`` and an external coding source.
+    async_bind: SessionForkAsyncBind | None = None
 
     model_config = ConfigDict(extra="forbid")
 

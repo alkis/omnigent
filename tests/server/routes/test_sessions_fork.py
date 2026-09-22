@@ -642,9 +642,9 @@ def _fork_status_spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | N
     statuses: list[tuple[str, str | None]] = []
     orig = routes_core._publish_fork_status
 
-    def _spy(user_id, source_id, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+    def _spy(user_id, source_id, op_id, status, *, fork_id=None, error=None, bind=None):  # type: ignore[no-untyped-def]
         statuses.append((status, error))
-        return orig(user_id, source_id, op_id, status, fork_id=fork_id, error=error)
+        return orig(user_id, source_id, op_id, status, fork_id=fork_id, error=error, bind=bind)
 
     monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
     return statuses
@@ -1127,9 +1127,9 @@ async def test_fork_unknown_up_to_response_id_fails_in_background(
     statuses: list[tuple[str, str | None]] = []
     orig = routes_core._publish_fork_status
 
-    def _spy(user_id, source_id, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+    def _spy(user_id, source_id, op_id, status, *, fork_id=None, error=None, bind=None):  # type: ignore[no-untyped-def]
         statuses.append((status, error))
-        return orig(user_id, source_id, op_id, status, fork_id=fork_id, error=error)
+        return orig(user_id, source_id, op_id, status, fork_id=fork_id, error=error, bind=bind)
 
     monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
 

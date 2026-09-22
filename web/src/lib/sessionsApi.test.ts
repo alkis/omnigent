@@ -449,6 +449,46 @@ describe("forkSession", () => {
     });
   });
 
+  it("serializes asyncBind to snake_case async_bind (with git sub-object)", async () => {
+    fetchMock.mockResolvedValueOnce(forkAccepted());
+
+    await forkSession("conv_src", {
+      asyncOperationId: "op-123",
+      asyncBind: {
+        hostId: "host_1",
+        workspace: "/repo",
+        git: { branchName: "feature/x", baseBranch: "main", existingBranch: true },
+      },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    // The bind rides the request so the server can echo it on `ready`; camelCase
+    // maps to snake_case and unset git fields are omitted.
+    expect(JSON.parse(init.body as string)).toEqual({
+      async_operation_id: "op-123",
+      async_bind: {
+        host_id: "host_1",
+        workspace: "/repo",
+        git: { branch_name: "feature/x", base_branch: "main", existing_branch: true },
+      },
+    });
+  });
+
+  it("omits git from async_bind when the bind has no worktree options", async () => {
+    fetchMock.mockResolvedValueOnce(forkAccepted());
+
+    await forkSession("conv_src", {
+      asyncOperationId: "op-123",
+      asyncBind: { hostId: "host_1", workspace: "/repo" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      async_operation_id: "op-123",
+      async_bind: { host_id: "host_1", workspace: "/repo" },
+    });
+  });
+
   it("returns the session for a synchronous (side-chat) fork (201)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse(

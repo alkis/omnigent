@@ -33,14 +33,15 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-// fork_status handling: mock the runner-bind lookup + launch, the reopen
-// opener, and the toast surface so the provider's branches are observable.
-const takePendingForkBind = vi.fn();
-const reopenForkDialogForSource = vi.fn();
+// fork_status handling: mock the retry-request lookup, the reopen opener, and
+// the runner launch so the provider's branches are observable. The coding-fork
+// bind now rides the `ready` event (echoed by the server), not an in-memory map.
+const takeForkRetryRequest = vi.fn();
+const reopenForkDialogForRetry = vi.fn();
 vi.mock("@/lib/forkOperations", () => ({
-  takePendingForkBind: (...a: unknown[]) => takePendingForkBind(...a),
-  reopenForkDialogForSource: (...a: unknown[]) => reopenForkDialogForSource(...a),
-  registerPendingForkBind: vi.fn(),
+  takeForkRetryRequest: (...a: unknown[]) => takeForkRetryRequest(...a),
+  reopenForkDialogForRetry: (...a: unknown[]) => reopenForkDialogForRetry(...a),
+  registerForkRetryRequest: vi.fn(),
   setForkDialogReopener: vi.fn(),
 }));
 const launchRunner = vi.fn((..._a: unknown[]) => Promise.resolve({ runnerId: "r1" }));
@@ -125,8 +126,8 @@ function lastWatched(): string[] {
 beforeEach(() => {
   setWatched.mockClear();
   subscribe.mockClear();
-  takePendingForkBind.mockReset();
-  reopenForkDialogForSource.mockReset();
+  takeForkRetryRequest.mockReset();
+  reopenForkDialogForRetry.mockReset();
   launchRunner.mockClear();
   toastSuccess.mockReset();
   toastError.mockReset();
@@ -670,13 +671,8 @@ describe("SessionUpdatesProvider fork_status frames", () => {
     return fn;
   }
 
-  it("on ready with a pending coding-fork bind, launches the runner and shows success", () => {
+  it("on ready with a coding-fork bind in the event, launches the runner and shows success", () => {
     const client = new QueryClient();
-    takePendingForkBind.mockReturnValue({
-      hostId: "host_1",
-      workspace: "/repo",
-      git: { branchName: "feature/x" },
-    });
     const dispatch = frameListener(client);
 
     act(() =>
@@ -687,13 +683,22 @@ describe("SessionUpdatesProvider fork_status frames", () => {
         status: "ready",
         fork_id: "conv_fork",
         error: null,
+        // The server echoes the bind intent (snake_case) so any client can bind.
+        bind: {
+          host_id: "host_1",
+          workspace: "/repo",
+          git: { branch_name: "feature/x", base_branch: "main" },
+        },
       }),
     );
 
-    // The deferred bind is consumed and fired with the just-arrived fork id.
-    expect(takePendingForkBind).toHaveBeenCalledWith("op-1");
+    // The bind rides the event and is fired with the just-arrived fork id;
+    // git is mapped snake→camel (null-ish fields → undefined).
     expect(launchRunner).toHaveBeenCalledWith("host_1", "conv_fork", "/repo", {
       branchName: "feature/x",
+      baseBranch: "main",
+      existingWorktree: undefined,
+      existingBranch: undefined,
     });
     expect(toastSuccess).toHaveBeenCalledWith(
       "Session cloned",
@@ -701,9 +706,8 @@ describe("SessionUpdatesProvider fork_status frames", () => {
     );
   });
 
-  it("on ready with NO pending bind (sandbox/chat), shows success without launching", () => {
+  it("on ready with NO bind (sandbox/chat), shows success without launching", () => {
     const client = new QueryClient();
-    takePendingForkBind.mockReturnValue(undefined);
     const dispatch = frameListener(client);
 
     act(() =>
@@ -714,6 +718,7 @@ describe("SessionUpdatesProvider fork_status frames", () => {
         status: "ready",
         fork_id: "conv_fork",
         error: null,
+        bind: null,
       }),
     );
 
@@ -724,9 +729,10 @@ describe("SessionUpdatesProvider fork_status frames", () => {
     );
   });
 
-  it("on failed, clears the pending bind and shows an error toast with a retry action", () => {
+  it("on failed, shows an error toast whose retry reopens with the stashed request", () => {
     const client = new QueryClient();
-    takePendingForkBind.mockReturnValue(undefined);
+    // This tab still has the original request stashed (truncated fork).
+    takeForkRetryRequest.mockReturnValue({ sourceId: "conv_src", upToResponseId: "resp_cut" });
     const dispatch = frameListener(client);
 
     act(() =>
@@ -737,11 +743,10 @@ describe("SessionUpdatesProvider fork_status frames", () => {
         status: "failed",
         fork_id: null,
         error: "Couldn't clone the session. Try again.",
+        bind: null,
       }),
     );
 
-    // The orphaned bind is dropped and the error toast reuses the operation id.
-    expect(takePendingForkBind).toHaveBeenCalledWith("op-3");
     expect(launchRunner).not.toHaveBeenCalled();
     const [msg, opts] = toastError.mock.calls.at(-1) as [
       string,
@@ -749,9 +754,35 @@ describe("SessionUpdatesProvider fork_status frames", () => {
     ];
     expect(msg).toBe("Couldn't clone the session. Try again.");
     expect(opts.id).toBe("op-3");
-    // "Try again" reopens the dialog for the SOURCE session.
+    // "Try again" reopens with the ORIGINAL params (so a truncated fork stays truncated).
     opts.action.onClick();
-    expect(reopenForkDialogForSource).toHaveBeenCalledWith("conv_src");
+    expect(takeForkRetryRequest).toHaveBeenCalledWith("op-3");
+    expect(reopenForkDialogForRetry).toHaveBeenCalledWith({
+      sourceId: "conv_src",
+      upToResponseId: "resp_cut",
+    });
+  });
+
+  it("on failed with no stashed request (post-refresh tab), retries a full fork of the source", () => {
+    const client = new QueryClient();
+    takeForkRetryRequest.mockReturnValue(undefined);
+    const dispatch = frameListener(client);
+
+    act(() =>
+      dispatch({
+        type: "fork_status",
+        operation_id: "op-3b",
+        source_id: "conv_src",
+        status: "failed",
+        fork_id: null,
+        error: "Couldn't clone the session. Try again.",
+        bind: null,
+      }),
+    );
+
+    const [, opts] = toastError.mock.calls.at(-1) as [string, { action: { onClick: () => void } }];
+    opts.action.onClick();
+    expect(reopenForkDialogForRetry).toHaveBeenCalledWith({ sourceId: "conv_src" });
   });
 
   it("on cloning (reconnect replay / other tab), shows the loading toast", () => {
@@ -766,6 +797,7 @@ describe("SessionUpdatesProvider fork_status frames", () => {
         status: "cloning",
         fork_id: null,
         error: null,
+        bind: null,
       }),
     );
 

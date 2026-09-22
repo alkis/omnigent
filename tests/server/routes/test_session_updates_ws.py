@@ -607,22 +607,43 @@ def test_pending_fork_op_is_replayed_on_connect(app: FastAPI, stores, fast_resca
         )
 
 
-def test_fork_op_cache_retention_bounds_failures() -> None:
-    """A new ``cloning`` for a source evicts that source's prior ``failed`` op,
-    and ``ready`` evicts its own — so a stream of failures can't accumulate."""
+def test_fork_op_cache_retention_supersedes_prior_terminal_for_same_owner() -> None:
+    """Terminal ops are RETAINED (so a disconnect-through-completion reconnect
+    can dismiss its toast) but a new ``cloning`` for the same source+owner
+    supersedes the prior terminal entry — so retention stays finite."""
     from omnigent.server.routes._sessions.common import _fork_op_cache
 
     src = "conv_retention_src"
-    # A failed op is retained (so its toast survives a reconnect)…
-    sessions_routes._publish_fork_status(None, src, "op-fail-1", "failed", error="boom")
+    # A failed op is retained so its toast survives a reconnect…
+    sessions_routes._publish_fork_status(ALICE, src, "op-fail-1", "failed", error="boom")
     assert _fork_op_cache.get("op-fail-1") is not None
-    # …until a retry (new cloning for the same source) supersedes it.
-    sessions_routes._publish_fork_status(None, src, "op-retry", "cloning")
+    # …until a retry (new cloning for the same source+owner) supersedes it.
+    sessions_routes._publish_fork_status(ALICE, src, "op-retry", "cloning")
     assert _fork_op_cache.get("op-fail-1") is None, "prior failure must be dropped on retry"
     assert _fork_op_cache.get("op-retry") is not None
-    # ready evicts its own entry (the announced session carries it thereafter).
-    sessions_routes._publish_fork_status(None, src, "op-retry", "ready", fork_id="conv_done")
-    assert _fork_op_cache.get("op-retry") is None
+    # ready is RETAINED (not evicted): a client that missed the live event needs
+    # the reconnect replay to dismiss its "Cloning…" toast.
+    sessions_routes._publish_fork_status(ALICE, src, "op-retry", "ready", fork_id="conv_done")
+    assert _fork_op_cache.get("op-retry") is not None
+    # A later cloning of the same source supersedes that retained ready too.
+    sessions_routes._publish_fork_status(ALICE, src, "op-again", "cloning")
+    assert _fork_op_cache.get("op-retry") is None, "retained ready superseded by next fork"
+
+
+def test_fork_op_cache_cleanup_is_owner_scoped() -> None:
+    """One user forking a SHARED source must not evict another user's op state."""
+    from omnigent.server.routes._sessions.common import _fork_op_cache
+
+    src = "conv_shared_src"
+    # Alice's fork of the shared source failed; her failure is retained.
+    sessions_routes._publish_fork_status(ALICE, src, "op-alice-fail", "failed", error="boom")
+    assert _fork_op_cache.get("op-alice-fail") is not None
+    # Bob forks the SAME shared source — this must NOT drop Alice's record.
+    sessions_routes._publish_fork_status(BOB, src, "op-bob-clone", "cloning")
+    assert _fork_op_cache.get("op-alice-fail") is not None, (
+        "a shared-source fork by another user must not evict Alice's failure state"
+    )
+    assert _fork_op_cache.get("op-bob-clone") is not None
 
 
 def test_session_added_for_inaccessible_session_is_not_pushed(

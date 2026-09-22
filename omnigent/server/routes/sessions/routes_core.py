@@ -1878,6 +1878,7 @@ def register_core_routes(
                                         "status",
                                         "fork_id",
                                         "error",
+                                        "bind",
                                     )
                                 }
                             )
@@ -1909,6 +1910,7 @@ def register_core_routes(
                                 "status": rec.get("status"),
                                 "fork_id": rec.get("fork_id"),
                                 "error": rec.get("error"),
+                                "bind": rec.get("bind"),
                             }
                         )
 
@@ -3491,7 +3493,18 @@ def register_core_routes(
                     error="Couldn't clone the session. Try again.",
                 )
                 return
-            _publish_fork_status(user_id, source_id, operation_id, "ready", fork_id=new_conv.id)
+            # Echo the persisted coding-fork bind intent on ready so ANY client
+            # (the original tab, a reconnected one, or another tab) can bind the
+            # fork's runner — the intent no longer lives only in a tab's memory,
+            # so it survives a refresh mid-clone.
+            _publish_fork_status(
+                user_id,
+                source_id,
+                operation_id,
+                "ready",
+                fork_id=new_conv.id,
+                bind=body.async_bind.model_dump() if body.async_bind is not None else None,
+            )
 
         _publish_fork_status(user_id, source_id, op_id, "cloning")
         fork_task = asyncio.create_task(_run_fork(op_id), name=f"fork-{op_id}")

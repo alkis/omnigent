@@ -410,10 +410,10 @@ async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
     captured: dict[str, Any] = {}
     orig = routes_core._publish_fork_status
 
-    def _spy(user_id, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+    def _spy(user_id, src, op_id, status, *, fork_id=None, error=None, bind=None):  # type: ignore[no-untyped-def]
         if status == "failed":
             captured["error"] = error
-        return orig(user_id, src, op_id, status, fork_id=fork_id, error=error)
+        return orig(user_id, src, op_id, status, fork_id=fork_id, error=error, bind=bind)
 
     monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
 

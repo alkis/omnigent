@@ -38,6 +38,19 @@ export type SessionUpdatesFrame =
       status: "cloning" | "ready" | "failed";
       fork_id: string | null;
       error: string | null;
+      // Coding-fork runner-bind intent, echoed by the server on `ready` so any
+      // client can bind the fork's runner (survives refresh / other tabs).
+      // Null for sandbox/chat forks and for cloning/failed events.
+      bind: {
+        host_id: string;
+        workspace: string;
+        git: {
+          branch_name: string;
+          base_branch?: string | null;
+          existing_worktree?: boolean | null;
+          existing_branch?: boolean | null;
+        } | null;
+      } | null;
     }
   | { type: "heartbeat" };
 

@@ -28,8 +28,8 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { forkSession } from "@/lib/sessionsApi";
-import { registerPendingForkBind, takePendingForkBind } from "@/lib/forkOperations";
+import { forkSession, type LaunchRunnerGitOptions } from "@/lib/sessionsApi";
+import { registerForkRetryRequest, takeForkRetryRequest } from "@/lib/forkOperations";
 import { toast } from "sonner";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -1190,8 +1190,11 @@ export function ForkSessionForm({
       // SessionUpdatesProvider receives the event. We do NOT navigate.
       const operationId = crypto.randomUUID();
 
-      // Coding fork: the runner bind needs the fork id, which only arrives with
-      // the `ready` event — stash the bind so the provider fires it then.
+      // Coding fork: build the runner-bind intent. It rides the request to the
+      // server, which echoes it on the `ready` event so the bind survives a
+      // refresh (it isn't held in this tab's memory).
+      let asyncBind:
+        { hostId: string; workspace: string; git?: LaunchRunnerGitOptions } | undefined;
       if (isCodingSource && !sandboxSelected && selectedHostId) {
         const trimmedBranch = branchName.trim();
         addRecent(workspaceTrimmed);
@@ -1204,7 +1207,7 @@ export function ForkSessionForm({
         const baseOnSource =
           onSourceHost &&
           (workspaceTrimmed === sourceRepo || workspaceTrimmed === sourceWorkspaceNorm);
-        registerPendingForkBind(operationId, {
+        asyncBind = {
           hostId: selectedHostId,
           // Recreating a deleted source worktree launches from the REPO
           // path (the server derives the worktree directory from the
@@ -1222,12 +1225,19 @@ export function ForkSessionForm({
                     baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
                   }
               : undefined,
-        });
+        };
       }
-      // Register the toast and close BEFORE awaiting, so `ready` (which the
-      // provider keys to operationId) always finds this toast to replace.
+      // Stash the original request so a failed op's "Try again" reopens the
+      // dialog with the SAME params — notably up_to_response_id, so a "fork from
+      // this response" retry can't silently become a full-history fork.
+      registerForkRetryRequest(operationId, {
+        sourceId: sourceSessionId,
+        upToResponseId: upToResponseId ?? undefined,
+      });
+      // Show the "Cloning…" toast BEFORE awaiting, so `ready` (which the
+      // provider keys to operationId, and which can only arrive AFTER the 202)
+      // always finds this toast to replace — no race.
       toast.loading("Cloning session…", { id: operationId, duration: Infinity });
-      onClose();
       try {
         // The run-config section (native targets only) reports its ready-to-send
         // value; an empty object (non-native target) sends no run overrides.
@@ -1237,6 +1247,7 @@ export function ForkSessionForm({
           upToResponseId: upToResponseId ?? undefined,
           config: runConfig,
           asyncOperationId: operationId,
+          asyncBind,
           // Sandbox clone: the server provisions the host, so the fork call
           // carries the compute request itself and no launchRunner follows.
           // The workspace is always explicit — the dialog's repository field
@@ -1253,15 +1264,17 @@ export function ForkSessionForm({
               }
             : undefined,
         });
+        // Accepted (202) — the copy runs in the background; close and let the
+        // fork_status stream drive the toast + sidebar. We do NOT navigate.
+        onClose();
       } catch (e) {
-        // The POST itself was rejected (validation/access) — nothing was
-        // created, so roll back the optimistic registration and surface the
-        // error as the operation's toast (the dialog has already closed).
-        takePendingForkBind(operationId);
-        toast.error(e instanceof Error ? e.message : "Couldn't clone the session. Try again.", {
-          id: operationId,
-          duration: Infinity,
-        });
+        // The POST was rejected synchronously (validation/access) — nothing was
+        // created. Keep the dialog OPEN with the error inline so the user's
+        // inputs stay editable for a straight resubmit; clear the optimistic
+        // toast + retry stash since there's no operation to track.
+        toast.dismiss(operationId);
+        takeForkRetryRequest(operationId);
+        setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");
       }
     } catch (e) {
       // A pre-flight failure before the fork was dispatched — the dialog is

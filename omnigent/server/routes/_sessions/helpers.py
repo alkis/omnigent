@@ -5032,6 +5032,7 @@ def _publish_fork_status(
     *,
     fork_id: str | None = None,
     error: str | None = None,
+    bind: dict[str, Any] | None = None,
 ) -> None:
     """
     Publish a fork-operation status to the caller's session-updates stream.
@@ -5042,16 +5043,17 @@ def _publish_fork_status(
     toast; ``"failed"`` surfaces an actionable error; ``"ready"`` is published
     back-to-back with the ``session_added`` that reveals the finished row.
 
-    A pending/failed op is retained in :data:`_fork_op_cache` (keyed by
-    ``op_id``, tagged with its ``owner``) so a client that refreshes or
-    reconnects mid-clone re-seeds its state from the stream's reconnect
-    replay. ``"ready"`` evicts — from then on the announced session carries it.
+    Every op (cloning AND the terminal ready/failed) is retained in
+    :data:`_fork_op_cache` (keyed by ``op_id``, tagged with its ``owner``) so a
+    client that refreshes or reconnects — including one that disconnects exactly
+    as the fork completes and misses the live event — re-seeds its state from
+    the stream's reconnect replay and can dismiss its "Cloning…" toast.
 
-    Retention is bounded so a stream of failures can't grow the cache without
-    limit: a new ``"cloning"`` for a source drops that source's prior terminal
-    ``"failed"`` entry (a retry supersedes the old failure — no orphaned toast),
-    and the cache is capped at :data:`_FORK_OP_CACHE_MAX` entries, evicting the
-    oldest when full.
+    Retention is bounded so it can't grow without limit: a new ``"cloning"`` for
+    a source drops that OWNER's prior terminal entries for the same source (a
+    retry supersedes the old outcome — no orphaned toast; owner-scoped so a
+    shared-source fork can't evict another user's state), and the cache is
+    capped at :data:`_FORK_OP_CACHE_MAX` entries, evicting the oldest when full.
 
     :param user_id: The forking caller, or ``None`` in single-user mode.
     :param source_id: The session being forked, e.g. ``"conv_abc123"``.
@@ -5059,29 +5061,42 @@ def _publish_fork_status(
     :param status: ``"cloning"``, ``"ready"``, or ``"failed"``.
     :param fork_id: The destination session id, set on ``"ready"``.
     :param error: Failure detail when *status* is ``"failed"``.
+    :param bind: Coding-fork runner-bind intent (``host_id``/``workspace``/
+        ``git``) echoed on ``"ready"`` so any client can perform the bind
+        without holding it in memory. ``None`` for sandbox/chat forks.
     """
-    if status == "ready":
-        _fork_op_cache.pop(op_id, None)
-    else:
-        if status == "cloning":
-            # A retry (or any new fork of this source) supersedes a prior
-            # failure, so drop that source's stale failed entries — otherwise
-            # the old failure toast would replay forever on reconnect.
-            for prior_id, rec in _fork_op_cache.items():
-                if rec.get("source_id") == source_id and rec.get("status") == "failed":
-                    _fork_op_cache.pop(prior_id, None)
-            # Bound the cache: evict the oldest entries once at the cap.
-            excess = len(_fork_op_cache) - _FORK_OP_CACHE_MAX + 1
-            if excess > 0:
-                for stale_id, _ in _fork_op_cache.items()[:excess]:
-                    _fork_op_cache.pop(stale_id, None)
-        _fork_op_cache[op_id] = {
-            "owner": user_id,
-            "source_id": source_id,
-            "status": status,
-            "fork_id": fork_id,
-            "error": error,
-        }
+    if status == "cloning":
+        # A retry (or any new fork of the SAME source by the SAME owner)
+        # supersedes a prior terminal entry, so drop that owner's stale
+        # failed/ready records for this source — otherwise an old toast would
+        # replay forever on reconnect. Owner-scoped so one user forking a
+        # SHARED source can't evict another user's retained operation state.
+        for prior_id, rec in _fork_op_cache.items():
+            if (
+                rec.get("source_id") == source_id
+                and rec.get("owner") == user_id
+                and rec.get("status") in ("failed", "ready")
+            ):
+                _fork_op_cache.pop(prior_id, None)
+        # Bound the cache: evict the oldest entries once at the cap.
+        excess = len(_fork_op_cache) - _FORK_OP_CACHE_MAX + 1
+        if excess > 0:
+            for stale_id, _ in _fork_op_cache.items()[:excess]:
+                _fork_op_cache.pop(stale_id, None)
+    # Terminal states (ready/failed) are RETAINED, not evicted: a client that
+    # disconnects exactly as the fork completes misses the live event, and only
+    # a retained entry lets the reconnect replay dismiss its "Cloning…" toast
+    # (and, for a same-session WS reconnect, still fire the deferred bind). They
+    # are superseded by the next cloning of the same source (above) and bounded
+    # by the cap, so retention stays finite.
+    _fork_op_cache[op_id] = {
+        "owner": user_id,
+        "source_id": source_id,
+        "status": status,
+        "fork_id": fork_id,
+        "error": error,
+        "bind": bind,
+    }
     user_session_stream.publish(
         _discovery_key(user_id),
         {
@@ -5091,6 +5106,7 @@ def _publish_fork_status(
             "status": status,
             "fork_id": fork_id,
             "error": error,
+            "bind": bind,
         },
     )
 

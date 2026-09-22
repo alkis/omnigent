@@ -823,17 +823,29 @@ export async function forkSession(
     /**
      * Opt into asynchronous materialization: the POST returns 202 immediately
      * with this operation id and progress arrives as `fork_status` events on
-     * the session-updates stream. The CALLER generates this id and registers
-     * its pending state (toast, deferred runner bind) BEFORE calling, so a fast
-     * `ready` event can't race the registration. Omitted → synchronous 201 +
-     * the finished session (the contract non-web clients rely on).
+     * the session-updates stream. The CALLER generates this id and shows its
+     * pending toast BEFORE calling, so a fast `ready` event can't race it.
+     * Omitted → synchronous 201 + the finished session (the contract non-web
+     * clients rely on).
      */
     asyncOperationId?: string;
+    /**
+     * Coding-fork runner-bind intent for the async path. Sent to the server so
+     * it can echo the intent back on the `ready` event — the client then binds
+     * the fork's runner from that event, which survives a refresh (the intent
+     * isn't held in the tab's memory). `git` matches `launchRunner`'s options.
+     */
+    asyncBind?: {
+      hostId: string;
+      workspace: string;
+      git?: LaunchRunnerGitOptions;
+    };
   } = {},
 ): Promise<
   { accepted: true; operationId: string; sourceId: string } | { accepted: false; session: Session }
 > {
-  const { title, agentId, upToResponseId, config, sandbox, sideChat, asyncOperationId } = options;
+  const { title, agentId, upToResponseId, config, sandbox, sideChat, asyncOperationId, asyncBind } =
+    options;
   const body: {
     title?: string;
     agent_id?: string;
@@ -847,12 +859,44 @@ export async function forkSession(
     workspace?: string | null;
     side_chat?: boolean;
     async_operation_id?: string;
+    async_bind?: {
+      host_id: string;
+      workspace: string;
+      git?: {
+        branch_name: string;
+        base_branch?: string;
+        existing_worktree?: boolean;
+        existing_branch?: boolean;
+      };
+    };
   } = {};
   if (sideChat) {
     body.side_chat = true;
   }
   if (asyncOperationId !== undefined) {
     body.async_operation_id = asyncOperationId;
+  }
+  if (asyncBind !== undefined) {
+    body.async_bind = {
+      host_id: asyncBind.hostId,
+      workspace: asyncBind.workspace,
+      ...(asyncBind.git !== undefined
+        ? {
+            git: {
+              branch_name: asyncBind.git.branchName,
+              ...(asyncBind.git.baseBranch !== undefined
+                ? { base_branch: asyncBind.git.baseBranch }
+                : {}),
+              ...(asyncBind.git.existingWorktree !== undefined
+                ? { existing_worktree: asyncBind.git.existingWorktree }
+                : {}),
+              ...(asyncBind.git.existingBranch !== undefined
+                ? { existing_branch: asyncBind.git.existingBranch }
+                : {}),
+            },
+          }
+        : {}),
+    };
   }
   if (title !== undefined) {
     body.title = title;

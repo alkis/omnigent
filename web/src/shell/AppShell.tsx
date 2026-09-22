@@ -2008,27 +2008,30 @@ export function AppShell() {
   );
 
   // Let a failed-fork toast (raised anywhere by SessionUpdatesProvider) reopen
-  // this dialog for the source. The dialog forks the ACTIVE session, so first
-  // navigate to the source, then open once that route resolves — held in a ref
-  // and applied by the effect below.
+  // this dialog for the source WITH its original params (notably
+  // up_to_response_id, so a "fork from here" retry stays truncated). The dialog
+  // forks the ACTIVE session, so first navigate to the source, then open once
+  // that route resolves — the pending request is held in a ref and applied by
+  // the effect below.
   const navigate = useNavigate();
-  const pendingForkReopenRef = useRef<string | null>(null);
+  const pendingForkReopenRef = useRef<{ sourceId: string; upToResponseId?: string } | null>(null);
   useEffect(() => {
-    setForkDialogReopener((sourceId) => {
-      if (conversationId === sourceId) {
-        setForkUpToResponseId(null);
+    setForkDialogReopener((request) => {
+      if (conversationId === request.sourceId) {
+        setForkUpToResponseId(request.upToResponseId ?? null);
         setForkOpen(true);
         return;
       }
-      pendingForkReopenRef.current = sourceId;
-      navigate(`/c/${sourceId}`);
+      pendingForkReopenRef.current = request;
+      navigate(`/c/${request.sourceId}`);
     });
     return () => setForkDialogReopener(null);
   }, [conversationId, navigate]);
   useEffect(() => {
-    if (conversationId && pendingForkReopenRef.current === conversationId) {
+    const pending = pendingForkReopenRef.current;
+    if (pending && conversationId === pending.sourceId) {
       pendingForkReopenRef.current = null;
-      setForkUpToResponseId(null);
+      setForkUpToResponseId(pending.upToResponseId ?? null);
       setForkOpen(true);
     }
   }, [conversationId]);

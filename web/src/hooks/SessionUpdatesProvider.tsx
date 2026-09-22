@@ -42,7 +42,7 @@ import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { launchRunner } from "@/lib/sessionsApi";
-import { reopenForkDialogForSource, takePendingForkBind } from "@/lib/forkOperations";
+import { reopenForkDialogForRetry, takeForkRetryRequest } from "@/lib/forkOperations";
 import { toast } from "sonner";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
@@ -385,11 +385,23 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // and a mid-clone refresh re-seeds it).
           if (frame.status === "ready") {
             toast.success("Session cloned", { id: frame.operation_id, duration: 4000 });
-            // Coding fork: bind its runner now that the fork id exists. Sandbox
-            // and chat forks have no pending bind (undefined → skipped).
-            const bind = takePendingForkBind(frame.operation_id);
+            // Coding fork: bind its runner now that the fork id exists. The bind
+            // intent rides the event (echoed by the server), so this works after
+            // a refresh or in another tab — no reliance on this tab's memory.
+            // Sandbox/chat forks carry no bind (null → skipped). The bind is an
+            // atomic set_runner_id server-side, so a double-fire from two tabs is
+            // harmless (one wins, the other 409s).
+            const bind = frame.bind;
             if (bind && frame.fork_id) {
-              void launchRunner(bind.hostId, frame.fork_id, bind.workspace, bind.git).catch((e) => {
+              const git = bind.git
+                ? {
+                    branchName: bind.git.branch_name,
+                    baseBranch: bind.git.base_branch ?? undefined,
+                    existingWorktree: bind.git.existing_worktree ?? undefined,
+                    existingBranch: bind.git.existing_branch ?? undefined,
+                  }
+                : undefined;
+              void launchRunner(bind.host_id, frame.fork_id, bind.workspace, git).catch((e) => {
                 // Recovery is the unbound-fork picker on the session page.
                 console.warn(`Clone ${frame.fork_id}: runner bind failed`, e);
               });
@@ -399,13 +411,18 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             // if that changed-frame lost a race with this one.
             void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           } else if (frame.status === "failed") {
-            takePendingForkBind(frame.operation_id);
             toast.error(frame.error ?? "Couldn't clone the session.", {
               id: frame.operation_id,
               duration: Infinity,
               action: {
                 label: "Try again",
-                onClick: () => reopenForkDialogForSource(frame.source_id),
+                // Reopen with the ORIGINAL params (up_to_response_id) when this
+                // tab still has them stashed; otherwise fall back to a full fork
+                // of the source (a post-refresh tab lost the stash).
+                onClick: () =>
+                  reopenForkDialogForRetry(
+                    takeForkRetryRequest(frame.operation_id) ?? { sourceId: frame.source_id },
+                  ),
               },
             });
           } else {
