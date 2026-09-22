@@ -4762,11 +4762,9 @@ describe("chatStore — stop", () => {
   });
 
   it("keeps the just-sent prompt bubble when stop interrupts before input.consumed", () => {
-    // Failure mode this catches: stopping a running turn (Stop button or the
-    // composer's Escape shortcut, both route through stop()) used to wipe
-    // pendingUserMessages, deleting a POSTed-but-not-yet-consumed prompt from
-    // the transcript with no undo. The optimistic bubble must stay until the
-    // server reconciles it.
+    // A POSTed-but-not-yet-consumed prompt is still optimistic; stop() (the
+    // Stop button and the composer's Escape shortcut both route through it)
+    // must leave it in the transcript until the server reconciles it.
     useChatStore.setState({
       conversationId: "conv_abc",
       pendingUserMessages: [
