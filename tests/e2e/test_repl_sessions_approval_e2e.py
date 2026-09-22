@@ -34,6 +34,8 @@ _ASK_DEMO_YAML = _REPO_ROOT / "tests" / "resources" / "agents" / "ask-demo" / "a
 _FIXTURES_DIR = _REPO_ROOT / "tests" / "_fixtures" / "agents"
 _TOOL_GATE_DIR = _FIXTURES_DIR / "e2e-tool-gate"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Braille spinner frames the REPL repaints while a turn is in flight.
+_SPINNER_ONLY_RE = re.compile(r"[\u2800-\u28ff\s]+")
 
 # Matches the CLI's own cold-start budget: daemon spawn + host-online + runner-online.
 _LAUNCH_TIMEOUT = 120
@@ -44,14 +46,32 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+def _meaningful_tail(raw: str, limit: int = 1500) -> str:
+    """Return the tail of PTY output with spinner repaints collapsed.
+
+    A stalled REPL repaints its braille spinner many times a second, so a raw
+    tail is all spinner frames and the content that explains the stall is gone.
+    """
+    kept: list[str] = []
+    spinners = 0
+    for line in _strip_ansi(raw).splitlines():
+        if not line.strip() or _SPINNER_ONLY_RE.fullmatch(line.strip()):
+            spinners += 1
+            continue
+        kept.append(line)
+    body = "\n".join(kept)[-limit:]
+    return f"{body}\n[{spinners} spinner/blank repaint lines omitted]"
+
+
 def _expect(child: Any, pattern: Any, *, timeout: float) -> None:
     """Wrap child.expect, surfacing buffered PTY output when a TIMEOUT fires."""
     try:
         child.expect(pattern, timeout=timeout)
     except pexpect.TIMEOUT:
-        tail = _strip_ansi(child.before or "")[-1500:]
         raise pexpect.TIMEOUT(
-            f"Timeout waiting for {pattern!r}.\nPTY tail (ANSI-stripped):\n{tail}"
+            f"Timeout waiting for {pattern!r}.\n"
+            f"PTY tail (ANSI-stripped, spinners collapsed):\n"
+            f"{_meaningful_tail(child.before or '')}"
         ) from None
 
 
