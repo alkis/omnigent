@@ -1444,7 +1444,7 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         resp = _server_get(
             f"{base_url}/v1/sessions",
             headers=_remote_headers(server_url=base_url, host_id=None),
-            params={"limit": 100},
+            params={"limit": 100, "visibility": "all"},
             timeout=10.0,
         )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
@@ -2620,6 +2620,13 @@ async def _query_sessions_once(
 
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
+    # An auto-woken turn can finish between live-stream subscriptions.
+    # Recheck its durable output once the session has stopped running.
+    if chat.status not in ("running", "launching"):
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            logger.info("Recovered headless output from completed session %s", bound.id)
+            return reconciled
     # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
@@ -3021,6 +3028,7 @@ async def _resolve_latest_conversation_id_async(
         limit=1,
         order="desc",
         sort_by="updated_at",
+        visibility="mine",
     )
     if not sessions:
         return None
@@ -3076,13 +3084,13 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
                 raise click.ClickException(f"{source}: directory has no config.yaml to override.")
             target = config
 
-        raw = yaml.safe_load(target.read_text())
+        raw = yaml.safe_load(target.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
         _apply_overrides_to_raw(raw, overrides)
-        target.write_text(yaml.safe_dump(raw, default_flow_style=False))
+        target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent
         _MATERIALIZED_OVERRIDE_DIRS[materialized.resolve()] = tmpdir
         return materialized
@@ -3129,7 +3137,7 @@ def _load_yaml_for_override_peek(source: Path) -> _YamlMapping | None:
         config = source / "config.yaml"
         if not config.is_file():
             return None
-        parsed = yaml.safe_load(config.read_text())
+        parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
         return parsed if isinstance(parsed, dict) else None
     return _load_yaml_if_single_file(source)
 
@@ -3149,7 +3157,7 @@ def _load_yaml_if_single_file(source: Path) -> _YamlMapping | None:
     """
     if not source.is_file():
         return None
-    parsed = yaml.safe_load(source.read_text())
+    parsed = yaml.safe_load(source.read_text(encoding="utf-8"))
     return parsed if isinstance(parsed, dict) else None
 
 
