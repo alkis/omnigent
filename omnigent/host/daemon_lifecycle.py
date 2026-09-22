@@ -146,9 +146,9 @@ def write_daemon_record(
 def mark_daemon_registered(record_path: Path, *, pid: int | None = None) -> bool:
     """Stamp the owning daemon's record with a completed registration.
 
-    The daemon calls this once its tunnel hello has landed on an accepted,
-    authenticated connection — the registration transport itself — giving the
-    CLI's background-spawn readiness gate ground truth even when the secondary
+    The daemon calls this once the server has confirmed registration on the
+    tunnel itself (its first post-hello frame), giving the CLI's
+    background-spawn readiness gate ground truth even when the secondary
     ``GET /v1/hosts/{id}`` status read diverges. Rewrites the record in place
     (same inode) so the daemon's lifecycle flock survives.
 

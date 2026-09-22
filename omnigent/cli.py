@@ -2741,8 +2741,8 @@ def _daemon_reports_registered(record: _HostDaemonRecord) -> bool:
     """
     Whether the daemon's own registry record shows a completed registration.
 
-    The daemon stamps ``registered_at`` once its tunnel hello lands on an
-    accepted, authenticated connection — the registration transport itself.
+    The daemon stamps ``registered_at`` once the server confirms registration
+    on the tunnel itself (the first frame the server sends after the hello).
     That is ground truth even when the secondary ``GET /v1/hosts/{id}`` status
     read diverges (stale/cached read, proxy-split transports), so a healthy,
     registered daemon is never mistaken for one that failed to register.
@@ -8787,8 +8787,8 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
             )
-        # Primary: the daemon's own registration stamp, written on the tunnel
-        # transport itself. The secondary server status read below can diverge
+        # Primary: the daemon's own registration stamp, server-acknowledged on
+        # the tunnel itself. The secondary server status read below can diverge
         # from it, so it must never be the sole reason to declare failure and
         # tear down a daemon that did register.
         if _daemon_reports_registered(record):

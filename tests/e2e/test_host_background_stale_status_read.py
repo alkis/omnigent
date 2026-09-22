@@ -61,6 +61,8 @@ from aiohttp import web
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import POLL_INTERVAL_S, find_free_port
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # The CLI's background-registration grace is a fixed 30s constant with no env
 # override (``_BACKGROUND_HOST_REGISTRATION_GRACE_S`` in ``omnigent/cli.py``),
 # so the command runs for ~30s before it gives up and tears the daemon down.
@@ -348,6 +350,11 @@ def test_host_background_tears_down_registered_daemon_on_stale_status_read(
         env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
         env["OPENAI_API_KEY"] = "mock-key"
         env = apply_runner_env(env)
+        # The daemon spawns with ``python -P`` (cwd off sys.path) and
+        # apply_runner_env only neutralizes the environment, so point PYTHONPATH
+        # at this worktree or the daemon imports the ambient checkout instead of
+        # the code under test.
+        env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
 
         # Run the real user command. It blocks for the full 30s grace before
         # giving up, so drive it as a subprocess and watch the ground-truth
