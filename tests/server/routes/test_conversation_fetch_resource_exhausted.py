@@ -1,37 +1,9 @@
-"""Regression: a WHS RESOURCE_EXHAUSTED on a conversation fetch must not
-escape as an unhandled 500.
+"""Store RESOURCE_EXHAUSTED must reach session clients as a retryable 503.
 
-Every conversation fetch runs its own WHS ``GetTreeNode`` gRPC
-call (the deliberate ACL + existence gate). Under a burst that gate can
-saturate the workspace-wide 60-concurrent-request budget, and WHS answers
-with ``StatusCode.RESOURCE_EXHAUSTED``
-("REQUEST_LIMIT_EXCEEDED: Workspace ... exceeded the concurrent limit of 60
-requests."). That transient error is neither retried nor mapped to a
-retry-able status: it propagates out of ``get_conversation`` unhandled,
-reaches ``server/app.py`` ``_handle_unhandled_exception``, and the user's
-session load / turn fails with a bare 500 ``internal_error``.
-
-Per the ticket's own correction, the fix is NOT to cache/batch the WHS call
-(it is a permission gate and must run per read). The defect is the
-*handling*: a transient ``RESOURCE_EXHAUSTED`` must be retried with backoff
-and then surfaced as a retry-able **503** with a retry hint, never as an
-unhandled 500.
-
-This test drives the real ``GET /v1/sessions/{id}`` route -> the snapshot
-builder -> ``ConversationStore.get_conversation`` chain and the real server
-exception handlers, and asserts the post-fix contract (RED until the
-handling lands, GREEN after).
-
-Environment note / stand-in: the reported failing store is the
-Databricks-internal ``databricks_mysql_conversation_store`` calling WHS over
-Barnacle gRPC, which is not present in this OSS repo. Here the OSS
-``SqlAlchemyConversationStore`` stands in for that store, and an injected
-``grpc.RpcError`` carrying ``StatusCode.RESOURCE_EXHAUSTED`` (shaped like the
-``_InactiveRpcError`` in the ticket) stands in for the real WHS
-budget-exhaustion. The observable this guards -- a transient store/RPC error
-mapped to a retry-able 503 instead of escaping as an unhandled 500 -- is
-server-layer and reproduces faithfully on the stand-in.
-"""
+Drive the real in-process route, snapshot builder and exception handler
+with an injected grpc.RpcError at the store boundary. This simulates WHS
+quota exhaustion; the internal encrypted store and live WHS are not
+available here. Keep the per-read permission check intact."""
 
 from __future__ import annotations
 
@@ -62,8 +34,7 @@ _WHS_LIMIT_MESSAGE = (
 
 
 class _ResourceExhaustedRpcError(grpc.RpcError):
-    """Stand-in for the ``_InactiveRpcError`` the WHS gate raises when the
-    workspace 60-concurrent-request budget is exhausted."""
+    """Simulate WHS rejecting a request above its concurrency budget."""
 
     def code(self) -> grpc.StatusCode:
         return grpc.StatusCode.RESOURCE_EXHAUSTED

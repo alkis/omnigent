@@ -1,13 +1,6 @@
-"""Targeted tests for the transient-exhaustion -> 503 error mapping.
+"""Verify RESOURCE_EXHAUSTED maps to 503 with Retry-After and a stable code.
 
-The server's catch-all exception handler classifies a gRPC-shaped
-``RESOURCE_EXHAUSTED`` escaping a store read (e.g. a per-read ACL gate's
-quota under a burst) as a retry-able condition: HTTP 503 with a
-``Retry-After`` hint and the ``resource_exhausted`` error code, instead of
-an unhandled 500 ``internal_error``. These tests pin the response contract
-and the classifier's shape-matching, including that other gRPC statuses do
-NOT get the retry-able mapping.
-"""
+Other gRPC statuses must retain their existing handling."""
 
 from __future__ import annotations
 
