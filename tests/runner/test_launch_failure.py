@@ -169,6 +169,30 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
 
 
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Realistic AI-gateway budget exhaustion message (budget name/id synthetic).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}'
+        ),
+        # Minimal form — just the key phrase.
+        "Budget X has reached its limit of $0.",
+        # Disabled per-user rate limit (rate limit is set to 0).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED",'
+            '"message":"rate limit is set to 0 for user test@example.com"}'
+        ),
+    ],
+)
+def test_classifies_budget_exhausted(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "codex_budget_exhausted"
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -179,6 +203,7 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
+        ("codex_budget_exhausted", "budget"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
