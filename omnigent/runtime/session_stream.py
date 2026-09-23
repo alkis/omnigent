@@ -205,6 +205,58 @@ def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
             _log_turn_outcome(conversation_id, event_type, event)
 
 
+# Semantic sub-cause codes for turn failures the harness flattens into a single
+# coarse error code (bare ``RuntimeError`` from the executor adapter's
+# ``inner executor error: <detail>`` wrap). The detail text is the only signal,
+# so classify it into a stable, content-free machine code the failure-rate
+# dashboards can group on without re-parsing free text. Patterns are ordered
+# specific-first; the first match wins. Returns ``None`` when nothing matches so
+# the attribute is omitted rather than mislabelled.
+_ERROR_SUBCAUSE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("disk_exhausted", ("no space left on device", "errno 28")),
+    (
+        "authentication_required",
+        ("is not signed in", "not logged in", "please run /login", "sign-in screen"),
+    ),
+    (
+        "harness_startup_timeout",
+        ("never started a thread", "native thread never started", "startup timed out"),
+    ),
+    ("harness_bridge_state_missing", ("bridge state is missing",)),
+    (
+        "terminal_not_ready",
+        (
+            "tmux target is not advertised",
+            "terminal did not become ready",
+            "wait for the terminal to launch",
+        ),
+    ),
+    (
+        "model_unavailable",
+        ("issue with the selected model", "may not exist or you may not have access"),
+    ),
+    ("unsupported_tool_configuration", ("is not supported for this model",)),
+)
+
+
+def classify_error_subcause(message: str | None) -> str | None:
+    """Map a turn-failure message to a stable sub-cause code, or ``None``.
+
+    Content-free: the return value is a fixed vocabulary label, never a slice of
+    the (potentially sensitive) message. ``harness_startup_file_missing`` needs
+    two markers so a bare ``[Errno 2]`` from elsewhere doesn't steal it.
+    """
+    if not message:
+        return None
+    text = message.lower()
+    if "no such file or directory" in text and "harness log:" in text:
+        return "harness_startup_file_missing"
+    for code, needles in _ERROR_SUBCAUSE_PATTERNS:
+        if any(needle in text for needle in needles):
+            return code
+    return None
+
+
 def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, Any]) -> None:
     """Emit a first-class ``turn_finished`` audit row on a terminal SSE event.
 
@@ -227,6 +279,12 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
             error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+            # Split coarse harness codes (bare RuntimeError et al.) into a stable
+            # sub-cause so failure-rate queries don't collapse startup timeouts,
+            # disk exhaustion, terminal-readiness, etc. into one opaque bucket.
+            subcause = classify_error_subcause(error.get("message"))
+            if subcause is not None:
+                attributes["error_subcause"] = subcause
         if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
             attributes["error_source"] = event["source"]
         impact = _TURN_OUTCOME_IMPACT.get(outcome)

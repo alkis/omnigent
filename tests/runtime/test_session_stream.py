@@ -1033,3 +1033,76 @@ def test_failed_event_logs_omit_unrecognized_sources(
     for record in [*sse_records, *audit_records]:
         assert record.attributes["error_code"] == "failed"
         assert "error_source" not in record.attributes
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "inner executor error: Codex native thread never started: Codex app-server "
+            "never started a thread (startup timed out after 120s: TimeoutError).",
+            "harness_startup_timeout",
+        ),
+        (
+            "inner executor error: Codex native executor error: "
+            "[Errno 28] No space left on device",
+            "disk_exhausted",
+        ),
+        (
+            "inner executor error: [Errno 2] No such file or directory "
+            "(harness log: ~/.omnigent/logs/runner/runner-1-2-3.log)",
+            "harness_startup_file_missing",
+        ),
+        (
+            "inner executor error: Claude terminal tmux target is not advertised yet.",
+            "terminal_not_ready",
+        ),
+        (
+            "inner executor error: Codex native bridge state is missing",
+            "harness_bridge_state_missing",
+        ),
+        (
+            "inner executor error: There's an issue with the selected model (claude-opus-4-8). "
+            "It may not exist or you may not have access to it.",
+            "model_unavailable",
+        ),
+        (
+            "inner executor error: API Error: 400 tool type 'advisor' "
+            "is not supported for this model",
+            "unsupported_tool_configuration",
+        ),
+        # A bare [Errno 2] without the harness-log marker must NOT be stolen.
+        ("inner executor error: [Errno 2] No such file or directory", None),
+        # Unrecognized / sensitive free text stays unclassified.
+        ("private provider failure detail", None),
+        (None, None),
+    ],
+)
+def test_classify_error_subcause(message: str | None, expected: str | None) -> None:
+    assert session_stream.classify_error_subcause(message) == expected
+
+
+def test_turn_finished_carries_error_subcause_for_wrapped_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coarse RuntimeError gains a stable, content-free sub-cause on the audit row."""
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    with _capturing_audit_logger() as records:
+        session_stream._log_sse_event(
+            "conv_rt",
+            {
+                "type": "response.failed",
+                "error": {
+                    "code": "RuntimeError",
+                    "message": "inner executor error: Codex native thread never started: "
+                    "Codex app-server never started a thread (startup timed out: TimeoutError).",
+                },
+            },
+        )
+    assert len(records) == 1
+    attrs = records[0].attributes
+    assert attrs["error_code"] == "RuntimeError"
+    assert attrs["error_subcause"] == "harness_startup_timeout"
+    # Still content-free: no slice of the message rides along.
+    assert "never started" not in records[0].getMessage()
