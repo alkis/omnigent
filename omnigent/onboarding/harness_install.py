@@ -53,11 +53,11 @@ from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.harness_startup_config import resolve_harness_path
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
-from omnigent.opencode_native_client import (
+from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -154,6 +154,15 @@ COPILOT_KEY = "copilot"
 HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+
+# Devin (Cognition) ships via a curl installer rather than npm and authenticates
+# through its own ``devin auth login``, which writes a credential file it reads
+# back at spawn — Omnigent stores no Devin credential. ``devin auth status``
+# exits 0 only while logged in, giving the same revocation-aware status probe
+# Codex gets from ``codex login status``.
+DEVIN_KEY = "devin"
+
+_DEVIN_INSTALL_HINT = "curl -fsSL https://cli.devin.ai/install.sh | bash"
 
 # Anthropic recommends its native installer over ``npm install -g``: it writes
 # to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
@@ -313,6 +322,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
         min_version=_HERMES_MIN_VERSION,
     ),
+    DEVIN_KEY: HarnessInstallSpec(
+        "Devin",
+        "devin",
+        package=None,
+        login_args=("auth", "login"),
+        status_args=("auth", "status"),
+        install_hint=_DEVIN_INSTALL_HINT,
+        install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
+        auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
+    ),
 }
 
 
@@ -378,6 +397,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Native Devin TUI (``devin-native``, via ``omni devin``) wraps the ``devin``
+    # CLI; ``native-devin`` gates on the same binary. The bare ``devin`` spelling
+    # canonicalizes to ``devin-native``, so it lands here too, and the ACP row
+    # gates on the same binary through the catalog.
+    "devin-native": DEVIN_KEY,
+    "native-devin": DEVIN_KEY,
 }
 
 
@@ -738,7 +763,7 @@ def _parse_harness_cli_version(text: str) -> str | None:
     """Extract a semver-ish string from ``<binary> --version`` output.
 
     Mirrors the OpenCode-specific parser in
-    :func:`omnigent.opencode_native_app_server.parse_opencode_version` but is
+    :func:`omnigent.harnesses.opencode_native.app_server.parse_opencode_version` but is
     kept generic so any harness can declare a version range in its install spec.
     Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
     ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.
@@ -849,9 +874,7 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
-# Install keys whose binary-path override id differs from the key itself:
-# claude/codex are keyed by provider family here, and agy (``gemini``) has no
-# override env var — its launch resolves via PATH/fallback dirs only.
+# Map install-family keys to launch-path override IDs. Agy has no override.
 _PATH_OVERRIDE_IDS: dict[str, str | None] = {
     ANTHROPIC_FAMILY: "claude",
     OPENAI_FAMILY: "codex",
@@ -860,21 +883,7 @@ _PATH_OVERRIDE_IDS: dict[str, str | None] = {
 
 
 def resolve_harness_cli_binary(key: str) -> str | None:
-    """Resolve the effective CLI binary for *key*, the way launch does.
-
-    Launch honors a per-harness executable override — the
-    ``OMNIGENT_<NAME>_PATH`` env var (:func:`resolve_harness_path`), which the
-    CLI front door also threads ``harness.<id>.command`` config into — so an
-    install that lives only at a custom path is launchable. Readiness and
-    install verdicts must consult the same override, with ``PATH`` (plus the
-    :func:`resolve_cli_binary` fallback dirs) as the fallback rather than the
-    precondition, or they report a working install as missing.
-
-    :param key: A harness family (``"anthropic"`` / ``"openai"``) or install
-        key, e.g. :data:`KIMI_KEY`.
-    :returns: Absolute path to the executable, or ``None`` when neither the
-        override nor the standard ladder resolves one (or *key* has no spec).
-    """
+    """Resolve a configured override, then the standard binary search path."""
     spec = harness_install_spec(key)
     if spec is None:
         return None
@@ -884,9 +893,7 @@ def resolve_harness_cli_binary(key: str) -> str | None:
         resolved = resolve_cli_binary(override)
         if resolved is not None:
             return resolved
-        # A set-but-unresolvable override falls back to the standard ladder
-        # (the same contract as resolve_cli_binary's env_var handling), so a
-        # typo'd override never hides a PATH install readiness credited before.
+        # An invalid override does not hide a standard installation.
     return resolve_cli_binary(spec.binary)
 
 
@@ -1001,6 +1008,7 @@ def _harness_cli_version_string(
     try:
         completed = subprocess.run(
             [binary, "--version"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1110,13 +1118,7 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
-    # Resolve the freshly-installed binary via the SAME resolution readiness
-    # uses (:func:`resolve_harness_cli_binary` — the configured override, then
-    # ``PATH`` plus the nvm/npm-global/homebrew fallback dirs), so the install
-    # verdict and the readiness badge can never disagree. A bare
-    # ``shutil.which`` here would report "not found" for a binary the host
-    # daemon's frozen ``PATH`` omits but readiness still resolves via the
-    # ladder — the spurious "failed" toast next to a green "ready" tick.
+    # Use the same resolution as readiness so setup and the host agree.
     resolved = resolve_harness_cli_binary(key)
     if resolved is not None:
         # Put the resolving dir on ``PATH`` for this process so the setup
@@ -1201,6 +1203,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             [binary, *spec.status_args],
             check=False,
             timeout=timeout,
+            # Concurrent probes must not change or restore a shared terminal's input mode.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
         )

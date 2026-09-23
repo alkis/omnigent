@@ -33,9 +33,7 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
 
-    # Binary resolution honors the per-harness executable override env vars;
-    # clear any ambient ones so a developer's real ``OMNIGENT_*_PATH`` (or a
-    # legacy ``HARNESS_*_PATH``) can't flip a ``which``-based assertion.
+    # Keep ambient executable overrides out of resolution assertions.
     for var in list(os.environ):
         if var.endswith("_PATH") and var.startswith(("OMNIGENT_", "HARNESS_")):
             monkeypatch.delenv(var, raising=False)
@@ -1642,15 +1640,8 @@ def _write_executable(path: Path) -> str:
 def test_custom_path_only_install_counts_as_installed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An install reachable only via ``OMNIGENT_KIMI_PATH`` reads installed.
-
-    Launch resolves the configured executable, so a PATH-only readiness
-    predicate hid a launchable harness: the host advertised kimi as
-    ``binary-missing`` and ``omni setup`` said "Not installed" on a machine
-    where ``omnigent kimi`` works.
-    """
+    """Credit an install reachable only through ``OMNIGENT_KIMI_PATH``."""
     shim = _write_executable(tmp_path / "custom-tools" / "kimi")
-    # Nothing named ``kimi`` on PATH; only the override path resolves.
     monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
     monkeypatch.setenv("OMNIGENT_KIMI_PATH", shim)
 
@@ -1661,11 +1652,7 @@ def test_custom_path_only_install_counts_as_installed(
 def test_legacy_path_override_counts_as_installed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The deprecated ``HARNESS_KIMI_PATH`` alias is honored until removal.
-
-    Launch (``resolve_harness_path``) still reads the legacy var with a
-    deprecation warning, so readiness must credit the same install.
-    """
+    """Honor the legacy ``HARNESS_KIMI_PATH`` launch alias."""
     shim = _write_executable(tmp_path / "legacy-tools" / "kimi")
     monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
     monkeypatch.setenv("HARNESS_KIMI_PATH", shim)
@@ -1676,11 +1663,7 @@ def test_legacy_path_override_counts_as_installed(
 def test_unresolvable_override_falls_back_to_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A typo'd override never hides a PATH install readiness credited before.
-
-    Same contract as ``resolve_cli_binary``'s env-var handling: the verdict
-    only moves toward available, so no currently-green machine regresses.
-    """
+    """Fall back to PATH when an override cannot be resolved."""
     monkeypatch.setenv("OMNIGENT_KIMI_PATH", str(tmp_path / "nope" / "kimi"))
     monkeypatch.setattr(
         hi.shutil, "which", lambda name: "/usr/bin/kimi" if name == "kimi" else None
@@ -1700,11 +1683,7 @@ def test_unresolvable_override_falls_back_to_path(
 def test_family_keys_resolve_their_cli_override_vars(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, env_var: str, binary: str
 ) -> None:
-    """Family install keys map to their CLI's override var, not the family name.
-
-    The claude/codex specs are keyed ``anthropic``/``openai``; the override
-    var keys off the binary each spec spawns (the var launch honors).
-    """
+    """Map family install keys to their CLI override variables."""
     shim = _write_executable(tmp_path / "override" / binary)
     monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
     monkeypatch.setenv(env_var, shim)
@@ -1714,11 +1693,7 @@ def test_family_keys_resolve_their_cli_override_vars(
 
 
 def test_gemini_has_no_path_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """No override var is consulted for agy — its launch is PATH/ladder only.
-
-    Honoring a speculative ``OMNIGENT_GEMINI_PATH`` would make readiness
-    credit an executable launch never uses.
-    """
+    """Keep Agy resolution on the launch path, which has no override."""
     shim = _write_executable(tmp_path / "override" / "agy")
     monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
     monkeypatch.setenv("OMNIGENT_GEMINI_PATH", shim)
@@ -1731,12 +1706,7 @@ def test_gemini_has_no_path_override(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 def test_custom_path_install_outside_version_range_reads_outdated(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A too-old custom-path install is "outdated", not "missing".
-
-    ``_binary_availability_reason`` / ``_cli_absence_label`` distinguish the
-    two by whether the binary resolves at all; the override-resolved binary
-    must feed that check so the user is told to upgrade, not to install.
-    """
+    """Report an old custom-path install as outdated rather than missing."""
     shim = _write_executable(tmp_path / "custom-tools" / "kimi")
     monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
     monkeypatch.setenv("OMNIGENT_KIMI_PATH", shim)
@@ -1748,7 +1718,5 @@ def test_custom_path_install_outside_version_range_reads_outdated(
 
     monkeypatch.setattr(hi.subprocess, "run", _old_version_run)
 
-    # The version gate fails, but the binary still resolves — the pair that
-    # yields "version-too-low" / "Needs upgrade" instead of "binary-missing".
     assert hi.harness_cli_installed(hi.KIMI_KEY) is False
     assert hi.resolve_harness_cli_binary(hi.KIMI_KEY) == shim
