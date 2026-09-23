@@ -1,14 +1,4 @@
-"""Agent-spec resolution on the host runner-launch path.
-
-The launch endpoint resolves the session's bound agent spec twice —
-``os_env.cwd`` for the workspace boundary and the harness for the launch
-frame. Both go through ``AgentCache.load``, which raises ``KeyError`` when
-the bundle is gone from the artifact store (e.g. a server whose artifact
-storage was reset while the DB kept the agent and session rows). That load
-failure must surface as a structured ``agent_bundle_missing`` client error,
-never escape as an unhandled exception (the opaque 500 users hit when
-resuming such a session).
-"""
+"""Both launch-time spec lookups report agent_bundle_missing for a lost bundle."""
 
 from __future__ import annotations
 

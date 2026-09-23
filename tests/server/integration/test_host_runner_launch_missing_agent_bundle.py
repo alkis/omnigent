@@ -1,23 +1,4 @@
-"""Session resume fails at runner launch with an opaque 500.
-
-Journey (from the bug report): boot Arca -> run ``openui`` -> resume an
-existing session. The CLI resume path
-(:func:`omnigent.host.daemon_launch.launch_or_reuse_daemon_runner`) POSTs
-``/v1/hosts/{host_id}/runners`` and the user sees::
-
-    Error: Failed to launch a runner on host '...' (500): An internal error occurred.
-
-Mechanism reproduced here: the launch endpoint resolves the session's bound
-agent spec via ``_resolve_agent_spec_cwd`` -> ``AgentCache.load`` with NO
-error guard — unlike the session-create path, which wraps the very same call
-in ``except (KeyError, AttributeError, ValueError, ImportError, OSError)``.
-When the agent's bundle is no longer present in the artifact store (e.g. a
-server whose artifact/cache state was lost across a reboot while the DB kept
-the agent and session rows), ``AgentCache.load`` raises ``KeyError``, which
-escapes the endpoint and surfaces as the generic catch-all 500 the reporter
-saw. A launch for a session whose agent bundle is unavailable must fail with
-a structured client error, never an opaque 500.
-"""
+"""A missing stored agent bundle produces an actionable runner-launch error."""
 
 from __future__ import annotations
 
@@ -49,17 +30,7 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
     db_uri: str,
     tmp_path: Path,
 ) -> None:
-    """
-    POST /v1/hosts/{id}/runners for a session whose agent bundle is
-    missing from the artifact store must return a structured client
-    error (4xx), not the generic 500 the resume CLI surfaces to users.
-
-    Today ``_resolve_agent_spec_cwd`` calls ``AgentCache.load`` unguarded;
-    the ``KeyError`` from the artifact store escapes the endpoint and the
-    catch-all exception handler turns it into
-    ``500 {"error": {"message": "An internal error occurred."}}`` — the
-    exact failure reported for the boot-Arca -> openui -> resume flow.
-    """
+    """Launch fails without binding a runner when the agent bundle is missing."""
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -67,9 +38,7 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
 
-    # Single-user wiring (no auth_provider), mirroring the workspace-boundary
-    # test: resolve_host_launch authorizes against the local owner so the
-    # request reaches the agent-spec resolution directly.
+    # Single-user ownership lets the request reach bundle resolution.
     app = FastAPI()
     app.include_router(
         create_hosts_router(
@@ -82,9 +51,7 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
         prefix="/v1",
     )
 
-    # Same handlers production installs (omnigent.server.app): the
-    # structured OmnigentError mapper AND the catch-all, so an exception
-    # escaping the endpoint surfaces exactly as the user saw it.
+    # Map structured errors and uncaught exceptions as the production app does.
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
         request: Request,
@@ -112,9 +79,7 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
             },
         )
 
-    # Host online: persisted row + live registry entry (the endpoint only
-    # reads the registry before the agent-spec resolution, so a stub WS is
-    # enough to get past resolve_host_launch).
+    # Only host presence is needed before bundle resolution; no launch frame is sent.
     host_store.upsert_on_connect(_HOST_ID, "laptop", "local")
     registry.register(
         _HOST_ID,
@@ -127,9 +92,7 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
         owner="local",
     )
 
-    # An agent row whose bundle key has NO backing artifact — the state a
-    # rebooted server is in when the DB survived but the artifact/cache
-    # storage did not. The session (the one the user resumes) is bound to it.
+    # Persist the agent and session without the backing bundle.
     agent_id = "ab5e97bd41c34fa2b0c9d5c3f1e2a6d4"
     agent = agent_store.create(
         agent_id=agent_id,
@@ -138,8 +101,6 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
     )
     conv = conv_store.create_conversation(agent_id=agent.id)
 
-    # The exact request the CLI resume path (launch_or_reuse_daemon_runner)
-    # sends for this session.
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",
@@ -149,18 +110,13 @@ async def test_launch_runner_missing_agent_bundle_is_not_a_500(
             json={"session_id": conv.id, "workspace": str(tmp_path)},
         )
 
-    assert resp.status_code < 500, (
-        f"Launching a runner for a session whose agent bundle is missing "
-        f"must be a structured client error, got {resp.status_code}: "
-        f"{resp.text}. The unguarded AgentCache.load in "
-        f"_resolve_agent_spec_cwd/_resolve_agent_harness lets the artifact "
-        f"store's KeyError escape as the generic 500 users see as "
-        f"\"Failed to launch a runner on host '...' (500): An internal "
-        f'error occurred." on session resume.'
-    )
+    assert resp.status_code == 410, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == ErrorCode.AGENT_BUNDLE_MISSING
+    assert agent.name in error["message"]
+    assert "Re-upload the agent" in error["message"]
 
-    # A failed launch must leave the session unbound so a later retry
-    # (e.g. after re-uploading the agent) can bind cleanly.
+    # Leave the session unbound so it can retry after the bundle is restored.
     refetched = conv_store.get_conversation(conv.id)
     assert refetched is not None
     assert refetched.runner_id is None, "a failed launch must not leave a runner bound"
