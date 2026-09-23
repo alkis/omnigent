@@ -12600,3 +12600,121 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+# --- TUI pane-death fail-fast ---
+
+
+def test_codex_discover_thread_fails_fast_when_tui_pane_dies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Thread discovery fails fast when the TUI pane dies before starting a thread.
+
+    A launcher that exits immediately (e.g., because a wrapper injected a
+    duplicate --remote flag) causes the TUI pane to die before any
+    thread/started event is emitted.  Without the pane-death watcher the
+    discovery task burns the full 30-second timeout; with it the error is
+    raised within one poll interval.
+    """
+    import asyncio as _asyncio
+
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    # wait_for_thread_started hangs indefinitely (no thread ever starts).
+    hang_event = _asyncio.Event()
+
+    async def _hang(_client: object, *, timeout: object = None) -> str:
+        await hang_event.wait()
+        raise TimeoutError("should not reach here")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _hang)
+
+    class _FakePaneDead:
+        """Fake terminal whose pane is immediately dead."""
+
+        running = False
+        _last_exit_status: int | None = 2
+
+        async def is_alive(self) -> bool:
+            return False
+
+        def last_pane_text(self) -> str | None:
+            return "error: the argument '--remote <ADDR>' cannot be used multiple times"
+
+        @property
+        def last_exit_status(self) -> int | None:
+            return self._last_exit_status
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test_pane_die",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_FakeClient(),
+            routing_summary="Databricks ucode profile 'DEFAULT'",
+            tui_terminal=_FakePaneDead(),  # type: ignore[arg-type]
+        )
+    )
+
+    err = read_bridge_startup_error(bridge_dir)
+    assert err is not None, "bridge startup error must be recorded"
+    # The error must describe the real cause, not a generic timeout.
+    assert "TUI exited" in err, f"expected pane-death cause in error; got: {err!r}"
+    assert "exit status 2" in err, f"expected exit code in error; got: {err!r}"
+    assert "startup timed out" not in err, f"must not describe as timeout; got: {err!r}"
+    assert "Launch routing: Databricks ucode profile 'DEFAULT'" in err
+
+
+def test_codex_discover_thread_fails_with_timeout_when_no_tui_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a tui_terminal, the existing timeout path is preserved.
+
+    When the terminal instance is not passed (e.g., in tests or for
+    backwards-compatible callers), thread discovery times out with the
+    ordinary timeout message.
+    """
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    async def _timeout(_client: object, *, timeout: object = None) -> str:
+        raise TimeoutError("no thread event")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test_no_terminal",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_FakeClient(),
+            routing_summary="provider 'test-provider' -- SENTINEL",
+            tui_terminal=None,
+        )
+    )
+
+    err = read_bridge_startup_error(bridge_dir)
+    assert err is not None
+    assert "startup timed out" in err
+    assert "Launch routing: provider 'test-provider' -- SENTINEL" in err

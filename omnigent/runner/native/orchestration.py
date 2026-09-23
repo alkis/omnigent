@@ -5251,6 +5251,14 @@ async def _auto_create_codex_terminal(
                 exc_info=True,
             )
 
+    # Resolve the freshly launched TUI terminal instance for pane-death
+    # detection during thread discovery.
+    _codex_tui_terminal: TerminalInstance | None = None
+    if launch_config.external_session_id is None:
+        _tr = resource_registry.terminal_registry
+        if _tr is not None:
+            _codex_tui_terminal = _tr.get(session_id, "codex", "main")
+
     # Adopt the thread the fresh TUI creates and run the forwarder in the
     # background, so session creation never blocks on TUI startup.
     _forwarder_task = asyncio.create_task(
@@ -5266,6 +5274,7 @@ async def _auto_create_codex_terminal(
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
+                tui_terminal=_codex_tui_terminal,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -5315,6 +5324,37 @@ async def _auto_create_codex_terminal(
     return terminal_view
 
 
+# Poll the TUI pane liveness this often while waiting for thread/started.
+_TUI_PANE_DEATH_POLL_INTERVAL_S = 2.0
+
+
+class _TuiPaneDeathError(RuntimeError):
+    """Raised when the TUI pane exits before a Codex thread is started."""
+
+
+async def _watch_codex_tui_pane(terminal: TerminalInstance) -> None:
+    """Poll the TUI pane until it dies, then raise :class:`_TuiPaneDeathError`.
+
+    Runs concurrently with ``wait_for_thread_started`` so a TUI that exits
+    before creating an app-server thread is detected promptly — within one
+    poll interval — instead of waiting the full startup timeout.
+    """
+    while True:
+        await asyncio.sleep(_TUI_PANE_DEATH_POLL_INTERVAL_S)
+        try:
+            alive = await terminal.is_alive()
+        except Exception:  # noqa: BLE001
+            # A probe failure is not a confirmed death; keep polling.
+            continue
+        if not alive:
+            status = terminal.last_exit_status
+            tail = terminal.last_pane_text()
+            detail = f"exit status {status}" if status is not None else "process exited"
+            if tail:
+                detail += f"; last output: {tail[-200:]!r}"
+            raise _TuiPaneDeathError(f"Codex TUI exited before starting a thread ({detail})")
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -5327,6 +5367,7 @@ async def _codex_discover_thread_and_forward(
     app_server: CodexNativeAppServer | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
+    tui_terminal: TerminalInstance | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -5368,6 +5409,9 @@ async def _codex_discover_thread_and_forward(
     :param thread_start_timeout_seconds: Configured-command thread-start
         allowance. ``None`` preserves the forwarder's ordinary 30-second
         default.
+    :param tui_terminal: The launched TUI :class:`TerminalInstance`, used to
+        detect an early exit and report the real cause instead of burning the
+        full startup timeout. ``None`` disables the probe (e.g. for tests).
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -5422,6 +5466,32 @@ async def _codex_discover_thread_and_forward(
                 # No deadline: the turn-facing failure is already recorded,
                 # so this wait only serves a possible interactive sign-in.
                 thread_id = await wait_for_thread_started(event_client, timeout=None)
+            elif tui_terminal is not None:
+                # Race thread discovery against a pane-liveness probe so an
+                # early TUI exit is detected promptly (within one poll interval)
+                # instead of burning the full 30-second startup timeout.
+                timeout_s = (
+                    thread_start_timeout_seconds
+                    if thread_start_timeout_seconds is not None
+                    else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                )
+                discover_task = asyncio.create_task(
+                    wait_for_thread_started(event_client, timeout=timeout_s)
+                )
+                death_task = asyncio.create_task(_watch_codex_tui_pane(tui_terminal))
+                done, pending = await asyncio.wait(
+                    {discover_task, death_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                if discover_task in done:
+                    thread_id = discover_task.result()  # re-raises on failure
+                else:
+                    death_task.result()  # re-raises _TuiPaneDeathError
+                    thread_id = ""  # unreachable; keeps type-checker happy
             elif thread_start_timeout_seconds is not None:
                 thread_id = await wait_for_thread_started(
                     event_client,
@@ -5430,20 +5500,25 @@ async def _codex_discover_thread_and_forward(
             else:
                 thread_id = await wait_for_thread_started(event_client)
         except (TimeoutError, RuntimeError) as exc:
-            # Expected failure modes of wait_for_thread_started: the TUI exited
-            # at startup, or the event stream ended before a thread was
-            # created. Stop forwarding (cleanup runs in ``finally``); any other
-            # error is a bug and propagates.
+            # Expected failure modes: the TUI exited at startup, the event
+            # stream ended, or the startup timeout fired. Stop forwarding
+            # (cleanup runs in ``finally``); any other error is a bug.
             try:
                 diagnostics = collect_codex_startup_diagnostics(app_server)
             except Exception as diagnostics_error:  # noqa: BLE001
                 # Diagnostics must not replace the startup error or prevent cleanup.
                 diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+            if isinstance(exc, TimeoutError):
+                reason = "timeout"
+            elif isinstance(exc, _TuiPaneDeathError):
+                reason = "tui_pane_died"
+            else:
+                reason = "event_stream_ended"
             failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
             failure_event["attributes"] = {
                 "harness": "codex-native",
                 "phase": "thread_discovery",
-                "reason": "timeout" if isinstance(exc, TimeoutError) else "event_stream_ended",
+                "reason": reason,
                 "timeout_s": (
                     None
                     if login_required
@@ -5475,6 +5550,8 @@ async def _codex_discover_thread_and_forward(
                     else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
                 )
                 cause = f"startup timed out after {timeout_seconds:g}s"
+            elif isinstance(exc, _TuiPaneDeathError):
+                cause = str(exc)
             else:
                 cause = "event stream ended before a thread was created"
             write_bridge_startup_error(
