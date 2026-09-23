@@ -10,6 +10,7 @@ import pytest
 from omnigent.runner.launch_failure import (
     _FAILURE_CODE_DESCRIPTIONS,
     FailureDiagnosis,
+    classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
 )
@@ -114,6 +115,64 @@ def test_command_path_is_matched_by_basename() -> None:
     assert isinstance(diagnosis, FailureDiagnosis)
 
 
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded "
+            "workspace input tokens per minute rate limit for databricks-test-model. "
+            "Work with your Databricks account team to request a higher FMAPI rate limit tier."
+        ),
+        "API Error: Request rejected (429)",
+        'API Error: 429 {"error": {"type": "rate_limit_error"}}',
+        "REQUEST_LIMIT_EXCEEDED: request throttled",
+        "Rate limit exceeded",
+        "rate-limit reached for this model",
+        "rate limited",
+        "Rate limited",
+        "rate-limited",
+        "rate_limited",
+        "HTTP 429",
+        "HTTP/1.1 429",
+        "status_code: 429",
+        "Too Many Requests",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
+    ],
+)
+def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "rate_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "An unexpected error occurred",
+        "API Error: Request rejected (401) · UNAUTHENTICATED",
+        "API Error: Request rejected (403) · PERMISSION_DENIED",
+        (
+            "API Error: Request rejected (403) · PERMISSION_DENIED: "
+            "See rate_limit_error troubleshooting"
+        ),
+        "API Error: 401 Unauthorized. Previous request: rate limit exceeded.",
+        "HTTP/1.1 403: See rate_limit_exceeded troubleshooting",
+        "There's an issue with the selected model. It may not exist.",
+        "You've hit your usage limit.",
+        "Error loading model-429",
+        "Request rejected (4290)",
+    ],
+)
+def test_preserves_other_native_turn_errors(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing", "invalid_input"])
+def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -125,6 +184,7 @@ def test_command_path_is_matched_by_basename() -> None:
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
         ("workspace_missing", "workspace"),
+        ("rate_limit_exceeded", "You can retry this turn"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
@@ -139,9 +199,7 @@ def test_describe_failure_code_unknown(code: str | None) -> None:
 
 
 def test_failure_code_descriptions_match_frontend_mirror() -> None:
-    # The failure card renders client-side from a hand-mirrored copy of this
-    # map; a code present in only one copy silently degrades to the generic
-    # "Something went wrong" headline on the other side.
+    # A missing mirror entry makes the UI fall back to its generic headline.
     tsx_path = Path(__file__).resolve().parents[2] / "web/src/components/blocks/StatusBlocks.tsx"
     match = re.search(
         r"const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = \{(.*?)\n\};",
