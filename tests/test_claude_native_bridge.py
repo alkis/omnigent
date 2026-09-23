@@ -5314,10 +5314,13 @@ class _FakeModeCycleTmux:
         *,
         start: str = "default",
         stale_reads: int = 0,
+        draft: str = "",
     ) -> None:
         self.cycle = cycle
         self.index = cycle.index(start)
         self.presses = 0
+        # Unsent text sitting in the composer, e.g. a person's half-typed line.
+        self.draft = draft
         # Captures right after a BTab that still render the PREVIOUS mode,
         # modelling the TUI's asynchronous repaint.
         self.stale_reads = stale_reads
@@ -5346,7 +5349,7 @@ class _FakeModeCycleTmux:
             # the status + mode footer rows Claude renders beneath it.
             pane = (
                 "╭──────────────╮\n"
-                "❯ \n"
+                f"❯ {self.draft}\n"
                 "╰──────────────╯\n"
                 "  Opus 5 │ 0/1M (0%)\n"
                 f"  {self._FOOTERS[self.cycle[index]]}\n"
@@ -5448,6 +5451,38 @@ def test_set_permission_mode_is_a_noop_when_already_in_target(
 
     assert got == "auto"
     assert fake.presses == 0, f"Expected no shift+tab presses, got {fake.presses}."
+
+
+def test_set_permission_mode_does_not_wait_for_an_unsent_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Shift+tab leaves a draft alone, so the switch must not wait for one.
+
+    The paste path holds while the box holds someone else's text because
+    pasting would clear or merge with it; the mode cycle touches no text,
+    so inheriting that hold would only delay the switch by the draft budget.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(
+        ["default", "acceptEdits", "plan", "auto"], start="default", draft="half typed thought"
+    )
+    monkeypatch.setattr("subprocess.run", fake.run)
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode="auto", timeout_s=5.0)
+
+    assert got == "auto"
+    assert clock.now < claude_native_bridge._FOREIGN_DRAFT_WAIT_TIMEOUT_S, (
+        f"The mode switch waited out the unsent draft ({clock.now:.1f} virtual s)"
+    )
 
 
 def test_set_permission_mode_raises_when_target_not_in_cycle(

@@ -3948,6 +3948,7 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
         bridge_dir=bridge_dir,
+        hold_for_draft=True,
         leftover_draft=leftover_draft,
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
@@ -5810,6 +5811,7 @@ def _wait_for_claude_prompt_ready(
     *,
     timeout_s: float,
     bridge_dir: Path | None = None,
+    hold_for_draft: bool = False,
     leftover_draft: str | None = None,
 ) -> None:
     """
@@ -5835,6 +5837,10 @@ def _wait_for_claude_prompt_ready(
         unanswered liveness probe extends the wait to
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
         query ends the wait at the next liveness check.
+    :param hold_for_draft: Also hold (bounded) while the rendered box holds
+        text this caller did not type: a paste would clear or merge with
+        it. Keystrokes that leave a draft alone — the permission-mode
+        shift+tab — pass ``False`` and proceed as soon as the box renders.
     :param leftover_draft: Text the reclaim step already waited out (see
         :func:`_restore_occupied_input`), e.g. ``"half typed"``. A box
         holding exactly that is not held for again; any other draft is.
@@ -5890,7 +5896,7 @@ def _wait_for_claude_prompt_ready(
         else:
             empty_polls += 1
         if _claude_prompt_rendered(pane):
-            if not _composer_holds_draft(pane):
+            if not hold_for_draft or not _composer_holds_draft(pane):
                 return
             # Text another writer put in the box (a slash command the runner
             # is submitting from its own process): pasting now would clear or

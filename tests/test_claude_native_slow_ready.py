@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -83,18 +84,13 @@ def test_first_message_survives_slow_terminal_startup(
         tmux_target: str,
         *,
         timeout_s: float,
-        bridge_dir: Path | None = None,
-        leftover_draft: str | None = None,
+        **kwargs: Any,
     ) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(
-            socket_path,
-            tmux_target,
-            timeout_s=timeout_s,
-            bridge_dir=bridge_dir,
-            leftover_draft=leftover_draft,
-        )
+        # Forward the gate's keyword options untouched so a new one cannot
+        # turn this observer into a TypeError.
+        original_wait(socket_path, tmux_target, timeout_s=timeout_s, **kwargs)
 
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", observe_wait)
     with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:
