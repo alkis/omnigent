@@ -419,19 +419,7 @@ async def test_executor_error_sdk_cause_classifies_response_failed(
     use_error_with_sdk_cause: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """An ExecutorError's carried SDK exception classifies the failed response.
-
-    A provider-throttle failure (an upstream 429, e.g. "Selected model is at
-    capacity") reaches the adapter as an ExecutorError whose ``exception``
-    field carries the ``openai.RateLimitError`` the executor caught. The
-    adapter chains it onto its wrapper RuntimeError, so the scaffold's error
-    detail carries the semantic ``rate_limit_exceeded`` code.
-
-    Regression guard: pre-fix the executor flattened the SDK exception into
-    the message string, the classifier saw only a bare RuntimeError, and the
-    failed response carried the unclassified ``code="RuntimeError"`` — an
-    upstream capacity outage attributed to Omnigent.
-    """
+    """The harness process preserves the SDK cause in its response.failed event."""
     conv_id = "conv_err_sdk_cause"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
@@ -444,10 +432,62 @@ async def test_executor_error_sdk_cause_classifies_response_failed(
     assert events[-1].event == "response.failed"
     error_detail = events[-1].data["response"]["error"]
     assert error_detail is not None
-    # The semantic provider-throttle code, not the wrapper's class name.
     assert error_detail["code"] == "rate_limit_exceeded"
-    # The upstream reason stays visible to the user alongside the code.
     assert "Selected model is at capacity" in error_detail["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_session", [False, True])
+async def test_executor_error_preserves_only_explicitly_idle_sessions(
+    preserve_session: bool,
+) -> None:
+    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor, TextChunk
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    error = ExecutorError(message="model unavailable", retryable=True)
+    if preserve_session:
+        error.preserve_session = True
+        executor.enqueue_events([error])
+    else:
+        executor.enqueue_events([TextChunk(text="partial response"), error])
+    executor.interrupt_session = AsyncMock(return_value=True)
+    executor.close_session = AsyncMock()
+    executor.close = AsyncMock()
+    factory = Mock(return_value=executor)
+    adapter = ExecutorAdapter(executor_factory=factory)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await adapter.run_turn(request, ctx)
+
+    if preserve_session:
+        assert adapter._executor is executor
+        assert adapter._abandoned_executor_cleanup is None
+        executor.interrupt_session.assert_not_awaited()
+        executor.close.assert_not_awaited()
+        executor.enqueue_response("retried")
+        retry_ctx = TurnContext(
+            response_id="resp_retry", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(request, retry_ctx)
+        factory.assert_called_once()
+    else:
+        assert adapter._executor is None
+        assert adapter._abandoned_executor_cleanup is not None
+        await adapter._abandoned_executor_cleanup
+        executor.interrupt_session.assert_awaited_once()
+        executor.close_session.assert_awaited_once()
+        executor.close.assert_awaited_once()
 
 
 async def test_executor_error_usage_reaches_response_failed(

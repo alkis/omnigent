@@ -346,20 +346,18 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
-    :param exception: The SDK exception the executor caught, when the
-        failure originated from one. Carried in-process so the executor
-        adapter can chain it (``raise ... from``) and error
-        classification maps the semantic type (e.g. an
-        ``openai.RateLimitError`` for an upstream 429 →
-        ``rate_limit_exceeded``) instead of flattening the failure to
-        an unclassified wrapper string. ``None`` when the failure has
-        no originating exception.
+    :param exception: Original SDK error for semantic classification through
+        the adapter's explicit cause chain; None for non-exception failures.
+    :param preserve_session: The executor is idle and safe to reuse after this
+        failure. Set only when no prompt or tool work remains in progress.
+        Defaults to ``False`` so failed turns receive normal teardown.
     """
 
     message: str
     retryable: bool = False
     usage: ExecutorUsage | None = None
     exception: BaseException | None = None
+    preserve_session: bool = False
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:

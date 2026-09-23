@@ -76,6 +76,13 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
+# Interrupting an executor abandoned by an abnormal exit usually fails because the
+# harness is already gone -- that absence is what abandoned it. Its socket refuses or
+# resets the connection, or the slice expires with nothing left to answer. The reap
+# below still tears the subprocess down and reports its own failures, so these are
+# teardown facts rather than faults. Any other error keeps ERROR.
+_HARNESS_ALREADY_GONE_ERRORS = (TimeoutError, ConnectionError)
+
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
 _ORPHAN_RESYNC_THRESHOLD = 3
@@ -311,6 +318,7 @@ class ExecutorAdapter(HarnessApp):
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
+                        clean_exit = event.preserve_session
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
                                 agent_span,
@@ -327,9 +335,7 @@ class ExecutorAdapter(HarnessApp):
                             ctx.provider_usage = event.usage
                         # Guard: empty message surfaces as "inner executor error: " with no detail.
                         detail = event.message or "no detail reported (see runner/harness logs)"
-                        # Chain the executor-caught SDK exception so error
-                        # classification sees the semantic type instead of
-                        # only this opaque wrapper.
+                        # Preserve the SDK cause for semantic error classification.
                         raise RuntimeError(f"inner executor error: {detail}") from event.exception
         except ElicitationDeclinedError:
             # Fallback for non-SDK executors; SDK-based paths use ctx.cancelled.set() instead.
@@ -403,12 +409,23 @@ class ExecutorAdapter(HarnessApp):
         Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
         a wedged interrupt can never starve the subprocess reap.
+
+        An interrupt that only proves the harness is already gone
+        (:data:`_HARNESS_ALREADY_GONE_ERRORS`) logs a warning naming the cause; every other
+        failure stays at ERROR.
         """
         if executor is None:
             return True
         try:
             await asyncio.wait_for(
                 executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
+            )
+        except _HARNESS_ALREADY_GONE_ERRORS as exc:
+            _logger.warning(
+                "abnormal-exit interrupt of inner session %s found the harness already gone (%s)",
+                session_key,
+                type(exc).__name__,
+                exc_info=True,
             )
         except Exception:  # best-effort: a failed/timed-out interrupt is logged, not raised
             _logger.error(
@@ -1021,16 +1038,9 @@ def _classify_anthropic_exception(exception: BaseException) -> str | None:
 
 
 def classify_inner_exception(exception: BaseException) -> str | None:
-    """Fan out across per-SDK classifiers; first match wins. Returns ``None`` when unrecognized.
+    """Classify the exception and its explicit causes, returning the first SDK match.
 
-    Walks the explicit ``__cause__`` chain, so a wrapper raised with
-    ``raise ... from sdk_exc`` classifies by the SDK exception it carries
-    (e.g. the executor adapter's ``RuntimeError("inner executor error: …")``
-    chained from an ``openai.RateLimitError``).
-
-    New classifiers plug in here once. Order matters if SDK hierarchies ever overlap —
-    more-specific classifiers should come first.
-    """
+    Unrecognized or cyclic chains return None. Keep specific classifiers first."""
     from omnigent.llms.errors import is_context_length_exceeded
 
     seen: set[int] = set()

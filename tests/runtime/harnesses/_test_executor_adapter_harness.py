@@ -181,18 +181,7 @@ def _build_error_with_usage() -> Executor:
 
 
 def _build_error_with_sdk_cause() -> Executor:
-    """
-    MockExecutor scripted with an :class:`ExecutorError` carrying the SDK
-    exception it caught (an ``openai.RateLimitError`` for an upstream 429).
-
-    Mirrors the openai-agents executor's model-capacity failure: the SDK
-    raises on the provider's 429 and the executor flattens it into the
-    message string. The carried exception lets the adapter chain it, so
-    the scaffold's error detail classifies as ``rate_limit_exceeded``
-    instead of falling back to the wrapper's class name.
-
-    :returns: A configured :class:`MockExecutor` instance.
-    """
+    """Script a provider rate limit with its original SDK exception."""
     import httpx
     import openai
 
