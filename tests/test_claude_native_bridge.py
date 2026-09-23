@@ -10312,6 +10312,8 @@ def test_a_leftover_draft_is_still_cleared_for_a_slash_command_after_the_wait(
         ("─" * 30 + '\n❯\xa0Try "create a util loggi\n' + "─" * 30 + "\n", False),
         # The queued-input hint shown while a turn runs is chrome too.
         (_composer_pane("Press up to edit queued messages"), False),
+        # Text that only begins like the suggestion is a real draft.
+        (_composer_pane('Try "npm test" then report back'), True),
         # Shell mode is another input mode, not a chat draft.
         ("─" * 30 + "\n! ls\n" + "─" * 30 + "\n", False),
         ("Starting Claude Code...\n", False),
@@ -10358,7 +10360,9 @@ def test_a_torn_capture_mid_settle_does_not_release_the_slash_command(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert _captures_before_first_send(events) >= settle + 1, (
+    # settle free frames + the blank + the pending-prompt check. If the blank
+    # counted as free the command would type one capture earlier.
+    assert _captures_before_first_send(events) >= settle + 2, (
         f"A torn frame must not release the settle early; events: {events}"
     )
 
@@ -10442,7 +10446,7 @@ def test_a_late_blank_capture_does_not_end_the_draft_wait(
     A torn frame late in a draft wait does not end that wait.
 
     A search occupies the first 2.55 s, another writer's draft appears at
-    2.70 s, and a blank capture lands at 5.10 s while the draft is still in
+    2.70 s, and a blank capture lands at ~5.25 s while the draft is still in
     the box. A blank bound anchored at entry would already be expired and
     hand the box back for the C-u; the bound must follow the last frame that
     showed the composer instead.
@@ -10450,7 +10454,9 @@ def test_a_late_blank_capture_does_not_end_the_draft_wait(
     bridge_dir = _picker_bridge_dir(tmp_path)
     poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
     search_frames = int(2.55 / poll)
-    draft_before_blank = int(2.4 / poll)
+    draft_before_blank = int(
+        2.7 / poll
+    )  # the blank lands at ~5.25 s, past an entry-anchored bound
     draft_after_blank = int(0.9 / poll)
     settle = [_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1)
     events = _events_tmux(

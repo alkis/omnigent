@@ -388,11 +388,15 @@ _SLASH_COMMAND_SETTLE_POLLS = 5
 # Dim hints Claude Code renders in an EMPTY input box: the startup suggestion
 # (``Try "fix lint errors"``) and the queued-input hint while a turn runs.
 # Chrome, not a draft — the first keystroke replaces it — so a box showing
-# only one of these is free. Prefix-matched: a narrow pane wraps or truncates
-# the suggestion, and a plain capture carries no styling to tell the dim hint
-# from typed text, so a person's own draft that starts exactly like a hint
-# reads as empty (its pre-existing fate was an unconditional clear).
-_COMPOSER_PLACEHOLDER_PREFIXES = ('Try "', "Press up to edit queued messages")
+# only one of these is free. A plain capture carries no styling to tell the
+# dim hint from typed text, so the suggestion is recognised by its shape
+# (see :func:`_is_composer_hint`): a quoted phrase and nothing after it, or
+# the unclosed start of one on a narrow pane that wrapped or truncated it.
+# Text that only begins like the hint (``Try "npm test" then report back``)
+# is a draft; a draft that IS exactly hint-shaped still reads as empty (its
+# pre-existing fate was an unconditional clear).
+_COMPOSER_SUGGESTION_PREFIX = 'Try "'
+_COMPOSER_QUEUED_HINT = "Press up to edit queued messages"
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -5511,10 +5515,9 @@ def _composer_draft_text(pane: str) -> str | None:
     the glyph is a draft: a message another writer pasted and has not yet
     submitted, a slash command mid-flight, a person's unsent text, or the
     ``[Pasted text …]`` placeholder of a large paste. An empty box renders
-    the bare glyph, or the glyph plus one of the dim hints in
-    :data:`_COMPOSER_PLACEHOLDER_PREFIXES` that the first keystroke
-    replaces; Claude Code separates a draft from the glyph with a
-    non-breaking space, which ``str.strip`` removes.
+    the bare glyph, or the glyph plus a dim hint (:func:`_is_composer_hint`)
+    that the first keystroke replaces; Claude Code separates a draft from
+    the glyph with a non-breaking space, which ``str.strip`` removes.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The draft, e.g. ``"/effort high"``; ``""`` for an empty box;
@@ -5527,9 +5530,31 @@ def _composer_draft_text(pane: str) -> str | None:
     if not stripped.startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     tail = stripped[len(_CLAUDE_PROMPT_GLYPH) :].strip()
-    if tail.startswith(_COMPOSER_PLACEHOLDER_PREFIXES):
+    if _is_composer_hint(tail):
         return ""
     return tail
+
+
+def _is_composer_hint(tail: str) -> bool:
+    """
+    Return whether the text after the composer glyph is Claude's own hint.
+
+    The queued-input hint is matched by prefix (a narrow pane truncates it).
+    The startup suggestion is ``Try "<phrase>"`` with nothing after the
+    closing quote; a narrow pane wraps or truncates it, so an unclosed
+    ``Try "…`` also counts. Text that continues past the closing quote is
+    a draft that merely begins like the hint.
+
+    :param tail: Composer row text after the glyph, stripped, e.g.
+        ``'Try "fix lint errors"'``.
+    :returns: ``True`` when *tail* is chrome rather than a draft.
+    """
+    if tail.startswith(_COMPOSER_QUEUED_HINT):
+        return True
+    if not tail.startswith(_COMPOSER_SUGGESTION_PREFIX):
+        return False
+    quoted = tail[len(_COMPOSER_SUGGESTION_PREFIX) :]
+    return '"' not in quoted or (quoted.endswith('"') and quoted.count('"') == 1)
 
 
 def _composer_holds_draft(pane: str) -> bool:
