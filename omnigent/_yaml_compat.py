@@ -1,22 +1,7 @@
-"""libyaml-backed YAML loading, with a pure-Python fallback.
+"""Prefer libyaml for safe YAML loading, with a pure-Python fallback.
 
-PyYAML ships two implementations of the same safe loader: the pure-Python
-``SafeLoader`` and ``CSafeLoader``, which wraps libyaml. Both accept the
-same grammar, share the same constructor and resolver classes, and build
-identical Python objects — the C one is just far faster. Parsing the
-19.2 KB ``examples/polly/config.yaml`` takes 3.14 ms pure-Python and
-0.18 ms through libyaml.
-
-Spec and config parsing is the bulk of the cost of loading an agent bundle,
-so those loaders build on the C parser where it is available. PyYAML wheels
-bundle libyaml, but a source install built without the libyaml headers
-exposes no ``CSafeLoader`` at all — hence the fallback.
-
-libyaml reports the line and column of a syntax error but not the echoed
-source line and caret that the pure-Python parser prints. :func:`load`
-restores those by reparsing failed documents, so the speedup costs nothing
-in authoring diagnostics.
-"""
+Reparse structural errors with SafeLoader to restore source-line and caret
+diagnostics without adding work to successful parses."""
 
 from __future__ import annotations
 
@@ -55,21 +40,10 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 
 def narrow_bools_to_yaml_1_2(loader: type[yaml.SafeLoader]) -> None:
-    """Stop *loader* resolving ``on``/``off``/``yes``/``no`` as booleans.
+    """Keep on/off/yes/no as strings and true/false as booleans.
 
-    Default PyYAML follows YAML 1.1, where those spellings are bools — a
-    trap for our specs, whose policy system uses ``on:`` as the selector
-    field. Without this, ``on: [request]`` yields a dict keyed by ``True``.
-    ``true``/``false`` keep resolving as bools.
-
-    Safe on either base: libyaml scans tokens itself but calls back into
-    the Python resolver to tag them, so the narrowed table applies to the
-    C parser too.
-
-    :param loader: A ``SafeLoader``/``CSafeLoader`` subclass to narrow
-        in place. Must be a dedicated subclass, never a PyYAML loader
-        itself — see the copy below.
-    """
+    Apply only to a dedicated SafeLoader or CSafeLoader subclass. Both parsers
+    use the Python resolver; copying its table leaves other YAML callers intact."""
     # Copy before mutating. ``yaml_implicit_resolvers`` lives on PyYAML's
     # shared ``BaseResolver``, so the same dict object backs SafeLoader and
     # CSafeLoader alike; an in-place edit would strip bool parsing from
@@ -91,29 +65,14 @@ def narrow_bools_to_yaml_1_2(loader: type[yaml.SafeLoader]) -> None:
 # caller's isinstance checks, so the return type is the same ``Any`` that
 # ``yaml.safe_load`` itself returns.
 def load(text: str, loader: type[yaml.SafeLoader]) -> Any:  # type: ignore[explicit-any]
-    """Parse *text* with *loader*, keeping pure-Python error detail.
+    """Parse text with loader, retaining detailed structural-error diagnostics.
 
-    libyaml's messages carry the line and column but drop the echoed
-    source line and caret, which are what make a typo in a hand-written
-    config obvious. A document that failed to parse is already off the
-    hot path, so reparsing it with the pure-Python scanner costs nothing
-    in the success case and restores the better message.
+    Retry only scanner, parser and composer errors with stock SafeLoader. Tag
+    constructors have not run at those stages; constructor errors must retain
+    the original loader diagnosis. Text input allows the retry to reread it.
 
-    Only :data:`_PARSE_STAGE_ERRORS` are retried, and the retry uses stock
-    ``SafeLoader`` rather than a pure-Python twin of *loader*. Those errors
-    are raised before any tag is resolved, so *loader*'s resolver and
-    constructor tables cannot have affected whether — or where — the
-    document failed. Constructor errors are left alone: a loader carrying
-    its own constructors would see its real error replaced by an unrelated
-    "could not determine a constructor" from the stock loader.
-
-    :param text: The YAML source. Must be text rather than a stream, so
-        the retry can reread it.
-    :param loader: Loader class to parse with, typically built on
-        :data:`SafeLoaderBase`.
-    :returns: The parsed document, or ``None`` for an empty string.
-    :raises yaml.YAMLError: If *text* is not valid YAML.
-    """
+    :returns: Parsed document, or None for empty input.
+    :raises yaml.YAMLError: If parsing fails."""
     try:
         return yaml.load(text, Loader=loader)
     except _PARSE_STAGE_ERRORS as fast_error:
@@ -138,14 +97,8 @@ def load(text: str, loader: type[yaml.SafeLoader]) -> Any:  # type: ignore[expli
 
 
 def safe_load(text: str) -> Any:  # type: ignore[explicit-any]
-    """Drop-in ``yaml.safe_load`` that prefers the libyaml parser.
+    """Prefer libyaml while preserving yaml.safe_load YAML 1.1 semantics.
 
-    Resolver and constructor behaviour match ``yaml.safe_load`` exactly,
-    including YAML 1.1 booleans (``on``/``off``/``yes``/``no``). Callers
-    that need YAML 1.2 boolean semantics subclass :data:`SafeLoaderBase`
-    and apply :func:`narrow_bools_to_yaml_1_2`.
-
-    :param text: The YAML source.
-    :returns: The parsed document, or ``None`` for an empty string.
-    """
+    For YAML 1.2 booleans, subclass SafeLoaderBase and narrow its resolver.
+    Returns None for empty input."""
     return load(text, SafeLoaderBase)

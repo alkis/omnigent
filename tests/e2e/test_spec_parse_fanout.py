@@ -1,19 +1,7 @@
-"""Runner agent-bundle spec parsing under sub-agent fan-out.
+"""Exercise runner session creation with a mock server supplying a shared bundle.
 
-Drives the runner app's real session-creation boundary
-(``POST /v1/sessions``) wired to the real
-``_resolve_agent_spec_from_server`` resolver, backed by a mock server
-serving one multi-agent bundle. Creating a parent session plus N
-sub-agent sessions that all share one ``(agent_id, version)`` bundle
-must not re-parse the identical YAML once per session, and the spec
-YAML loader must be the libyaml-accelerated one when it is available.
-
-Hermetic: no live server, no LLM key, no harness CLI needed.
-
-Run::
-
-    pytest tests/e2e/test_spec_parse_fanout.py -o addopts= -q
-"""
+Parent and child sessions must reuse its parsed spec. These tests use the
+real resolver in process, with no live server or model."""
 
 from __future__ import annotations
 
@@ -131,18 +119,7 @@ class _FakeProcessManager:
 async def test_fanout_does_not_reparse_bundle_per_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One shared bundle must not be YAML-parsed once per created session.
-
-    Journey: launch an orchestrator agent (parent session), then fan out
-    N sub-agent sessions of the same agent. All N+1 creates resolve the
-    same ``(agent_id, version)`` bundle; the extracted files are already
-    disk-cached, so at most the initial resolution should parse the
-    top-level config.yaml. Re-parsing per session is the CPU burst users
-    observe on the runner during sub-agent fan-out.
-
-    :param monkeypatch: Used to count parses at the parser boundary.
-    :returns: None.
-    """
+    """Session creation must reuse the parse for a shared (agent_id, version) bundle."""
     bundle = _build_multi_agent_bundle()
 
     def _bundle_handler(request: httpx.Request) -> httpx.Response:
@@ -234,15 +211,7 @@ async def test_fanout_does_not_reparse_bundle_per_session(
 
 
 def test_config_yaml_loader_uses_libyaml() -> None:
-    """Spec parsing must use the libyaml-accelerated safe loader.
-
-    The pure-Python ``yaml.SafeLoader`` is ~10-20x slower than
-    ``yaml.CSafeLoader`` on the same config.yaml; multiplied across a
-    multi-agent bundle's files and per-session re-resolution it becomes
-    a visible fraction of runner CPU during sub-agent fan-out.
-
-    :returns: None.
-    """
+    """Use the accelerated safe loader when libyaml is installed."""
     if not getattr(yaml, "__with_libyaml__", False):
         pytest.skip("PyYAML built without libyaml; CSafeLoader unavailable")
 

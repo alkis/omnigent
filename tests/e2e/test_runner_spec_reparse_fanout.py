@@ -1,45 +1,8 @@
-"""E2E reproduction: the runner re-parses the agent bundle YAML per session
-with the pure-Python ``SafeLoader``.
+"""Real runner fan-out must parse each shared agent bundle only once.
 
-Two independent defects, each guarded by its own test here.
-
-Facet A -- slow loader (``test_config_loader_uses_libyaml_csafeloader``):
-``omnigent/spec/parser.py`` parses ``config.yaml`` with
-``yaml.load(..., Loader=_ConfigYamlLoader)`` where
-``_ConfigYamlLoader(yaml.SafeLoader)`` is the pure-Python loader (~10-20x
-slower than the libyaml ``CSafeLoader``). libyaml *is* available in the
-runtime (``yaml.__with_libyaml__`` is True and ``yaml.CSafeLoader`` exists),
-so the parse pays the pure-Python tax needlessly. This is a purely internal
-(``api``) defect -- no user-visible surface -- so it is asserted directly on
-the shipped runtime the runner imports. Fails on the buggy build; passes once
-``_ConfigYamlLoader`` is rebased onto ``CSafeLoader``.
-
-Facet B -- re-parse per session, no memoization
-(``test_runner_does_not_reparse_shared_bundle_per_session``): the runner's
-``_resolve_agent_spec_from_server`` calls ``load(dest, ...)`` -> ``parse(dest)``
-unconditionally on every session-create, and the runner's session-spec cache
-is keyed by ``session_id``. So a parent session and each of its sub-agent
-sessions -- which share the SAME ``(agent_id, version)`` bundle -- each miss
-the cache and re-parse the identical bundle YAML (and, recursively, every
-sub-agent ``config.yaml`` under ``agents/``). During sub-agent fan-out this
-bursts to a meaningful fraction of runner CPU.
-
-This drives the real user journey: register a directory-format bundle (a
-parent whose ``tools.agents`` fan out to three sub-agents), bind it to a real
-runner, and dispatch a turn in which the parent dispatches all three
-sub-agents via ``sys_session_send``. A test-only ``sitecustomize`` shim
-injected onto the runner subprocess's ``PYTHONPATH`` records every
-``omnigent.spec.parser.parse`` call the runner makes (product code is NOT
-modified). Because exactly one bundle is registered, every parsed directory
-belongs to it; on the buggy build the parent bundle directory is parsed once
-per session (parent create + each sub-agent session), so its parse count is
-> 1. A build that memoizes the parsed ``AgentSpec`` by ``(agent_id, version)``
-parses it exactly once, so this test then passes.
-
-Run::
-
-    .venv/bin/python -m pytest tests/e2e/test_runner_spec_reparse_fanout.py -v
-"""
+A sitecustomize shim counts parser calls in a real server/runner journey
+with a mock model and three sub-agents. A separate check verifies that
+libyaml is selected when available."""
 
 from __future__ import annotations
 
@@ -189,16 +152,7 @@ def _sub_config(name: str, model: str) -> dict[str, Any]:
 
 
 def _build_bundle(parent_cfg: dict[str, Any], subs: dict[str, dict[str, Any]]) -> bytes:
-    """Pack a directory-format bundle (config.yaml + agents/<name>/config.yaml).
-
-    The root ``config.yaml`` arcname routes the bundle through the native
-    ``omnigent/spec/parser.py`` ``parse()`` path (the code the bug lives in),
-    which recursively parses each ``agents/<name>/config.yaml``.
-
-    :param parent_cfg: Parent config mapping.
-    :param subs: Mapping of sub-agent name -> its config mapping.
-    :returns: gzip tarball bytes ready for multipart upload.
-    """
+    """Pack root and child config.yaml files into a directory-format agent bundle."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
 
@@ -219,17 +173,10 @@ def _live_server_and_instrumented_runner(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> Iterator[tuple[str, httpx.Client, str]]:
-    """Spawn a real server + a real runner whose spec parses are counted.
+    """Run a real server and runner against a mock model, counting spec parses.
 
-    Mirrors the ``live_server`` fixture in ``tests/e2e/conftest.py`` but is
-    self-contained so the runner subprocess can carry a ``sitecustomize`` shim
-    (on its ``PYTHONPATH``) that records every ``parse()`` call. The server
-    points its LLM connections at the mock gateway.
-
-    :param tmp_path: Per-test temp dir for the DB, logs, and counter files.
-    :param mock_llm_server_url: Session-scoped mock LLM base URL.
-    :yields: ``(base_url, http_client, runner_id)``.
-    """
+    Yields (base_url, http_client, runner_id); the runner imports an isolated
+    sitecustomize shim through PYTHONPATH."""
     import secrets
 
     # Counter shim on a dir we prepend to the runner's PYTHONPATH.
@@ -440,18 +387,13 @@ def _wait_for_child_sessions(
     expected: int,
     timeout: float = 240.0,
 ) -> list[str]:
-    """Poll the sub-agent session list until *expected* children of the parent appear.
-
-    :param client: HTTP client pointed at the live server.
-    :param parent_session_id: The dispatching parent session id.
-    :param expected: Number of sub-agent sessions to wait for.
-    :param timeout: Max seconds to wait.
-    :returns: The discovered child session ids.
-    """
+    """Poll until the expected number of child sessions appears or timeout expires."""
     deadline = time.monotonic() + timeout
     seen: set[str] = set()
     while time.monotonic() < deadline:
-        resp = client.get("/v1/sessions", params={"kind": "sub_agent", "limit": 1000})
+        resp = client.get(
+            "/v1/sessions", params={"kind": "sub_agent", "limit": 1000, "visibility": "all"}
+        )
         resp.raise_for_status()
         for item in resp.json().get("data", []):
             cid = str(item.get("id"))
@@ -518,14 +460,7 @@ def _parse_counts_by_root(parse_log: Path) -> dict[str, int]:
 
 
 def _parent_bundle_root(counts: dict[str, int]) -> str | None:
-    """Identify the top-level bundle directory among parsed roots.
-
-    The parent bundle dir is the root under which the sub-agent roots live,
-    i.e. some other root starts with ``<root>/agents``.
-
-    :param counts: Per-root parse counts.
-    :returns: The parent bundle root path, or ``None`` if undetermined.
-    """
+    """Find the parsed root containing the child agents/ directories."""
     roots = list(counts)
     for root in roots:
         needle = os.path.join(root, "agents")
@@ -535,14 +470,7 @@ def _parent_bundle_root(counts: dict[str, int]) -> str | None:
 
 
 def test_config_loader_uses_libyaml_csafeloader() -> None:
-    """Facet A: the config loader must use the libyaml ``CSafeLoader`` when available.
-
-    ``_ConfigYamlLoader`` currently subclasses the pure-Python
-    ``yaml.SafeLoader`` even though ``yaml.CSafeLoader`` (libyaml, ~20x faster)
-    is importable in the runtime. That is the ~20x parse tax the bug describes.
-    Fails on the buggy build; passes once the loader is rebased onto
-    ``CSafeLoader`` (with its custom implicit-resolver / bool overrides ported).
-    """
+    """Use CSafeLoader when libyaml is available."""
     from omnigent.spec.parser import _ConfigYamlLoader
 
     assert yaml.__with_libyaml__, (
@@ -564,16 +492,7 @@ def test_runner_does_not_reparse_shared_bundle_per_session(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """Facet B: the runner must not re-parse a shared bundle once per session.
-
-    Drives the reported journey -- a parent fans out to three sub-agents that
-    share the parent's ``(agent_id, version)`` bundle -- and counts how many
-    times the runner parsed that bundle directory. On the buggy build the
-    session-spec cache is keyed by ``session_id`` and the resolver re-parses
-    unconditionally, so the parent bundle is parsed once per session (> 1). A
-    build that memoizes the parsed ``AgentSpec`` by ``(agent_id, version)``
-    parses it exactly once, making this test pass.
-    """
+    """Parent and three child sessions sharing a bundle must parse its root once."""
     uid = uuid.uuid4().hex[:8]
     parent_token = f"reparse-run-{uid}"
     parent_model = f"mock-reparse-parent-{uid}"

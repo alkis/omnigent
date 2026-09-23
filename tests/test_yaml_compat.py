@@ -48,14 +48,7 @@ def test_narrowed_loaders_build_on_the_active_base() -> None:
 
 
 def test_narrowed_loaders_keep_yaml_1_1_bool_aliases_as_strings() -> None:
-    """``on``/``off``/``yes``/``no`` stay strings; ``true``/``false`` stay bools.
-
-    This is the one behaviour the C parser could plausibly break — libyaml
-    scans tokens itself, and only calls back into the Python resolver to tag
-    them. If that callback ever stopped honouring the subclass's resolver
-    table, ``on:`` would silently become the key ``True`` and every policy
-    selector in the repo would break.
-    """
+    """Both parsers honor narrowed resolvers: on/off/yes/no stay strings."""
     for loader in _NARROWED_LOADERS:
         parsed = yaml.load(_YAML_1_2_BOOLS, Loader=loader)
         assert parsed == {
@@ -160,14 +153,7 @@ def test_load_does_not_reparse_documents_that_succeed() -> None:
 
 
 def test_load_does_not_substitute_constructor_errors() -> None:
-    """A loader's own constructor error must reach the caller intact.
-
-    The reparse only ever runs stock ``SafeLoader``, which knows nothing of
-    a caller's custom tags. Retrying a constructor failure would swap a
-    precise error for the stock loader's unrelated "could not determine a
-    constructor for the tag" — so construction-stage failures are not
-    retried at all.
-    """
+    """Preserve custom constructor failures instead of retrying with stock SafeLoader."""
 
     class _CustomLoader(_ConfigYamlLoader):  # type: ignore[valid-type,misc]
         pass
