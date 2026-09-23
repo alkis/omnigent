@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -12,24 +14,26 @@ import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
+    _READINESS_PROBE_MAX_WORKERS,
     configured_harness_map,
     harness_is_configured,
 )
 
 
 @pytest.fixture(autouse=True)
-def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Isolate cursor + copilot credential sources so their readiness is deterministic.
+def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate CLI credential sources so their readiness is deterministic.
 
     Cursor readiness keys off a configured ``CURSOR_API_KEY`` and copilot off a
     GitHub token (the ``cursor:`` / ``copilot:`` config blocks or the
     environment), so point the config home at an empty tmp dir and clear any
     ambient ``CURSOR_API_KEY`` / ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
     ``GITHUB_TOKEN`` — otherwise a developer's real key would flip their verdict
-    under these tests.
+    under these tests. Antigravity similarly accepts ``GEMINI_API_KEY``.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
     # Copilot also accepts a ``gh auth login`` session as a token, so a developer's
@@ -139,6 +143,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "native-cursor",
         "kiro-native",
         "native-kiro",
+        "antigravity-native",
+        "native-antigravity",
         "goose-native",
         "native-goose",
         "hermes",
@@ -163,6 +169,8 @@ def test_cli_harness_configured_only_when_binary_installed(
     breaks every native launch (if it stayed False).
     """
     _all_clis_installed(monkeypatch)
+    if harness in {"antigravity-native", "native-antigravity"}:
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     assert harness_is_configured(harness) is True
     _no_clis_installed(monkeypatch)
     assert harness_is_configured(harness) is False
@@ -227,8 +235,10 @@ def test_claude_ready_via_configured_provider_without_cli_login(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
 
-    def _must_not_probe(_key: str, **_kw: object) -> bool:
-        raise AssertionError("CLI login probed despite a configured provider")
+    def _must_not_probe(key: str, **_kw: object) -> bool:
+        if key == "anthropic":
+            raise AssertionError("Claude login probed despite a configured provider")
+        return False
 
     monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
     assert configured_harness_map()["claude-native"] is True
@@ -320,6 +330,16 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
         "kiro-native",
         "native-kiro",
+        # Native Devin (``omni devin``) — gates on the devin binary. The bare
+        # ``devin`` spelling canonicalizes onto ``devin-native``, so it is
+        # covered too; Devin's ACP row is keyed ``devin-acp`` and gates on the
+        # same binary through the catalog.
+        "devin",
+        "devin-native",
+        # The retired builtin ACP id still resolves (aliased onto the native
+        # wrap), so a consumer holding it must get a real answer, not "unknown".
+        "devin-acp",
+        "native-devin",
         # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
         # on the goose CLI.
         "goose",
@@ -473,7 +493,7 @@ def test_configured_harness_map_all_true_with_clis(
 
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
-        "omnigent.codex_native._codex_auth_unavailable_reason",
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
         lambda: None,
     )
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
@@ -506,13 +526,56 @@ def test_configured_harness_map_probes_codex_readiness_once(
         return "needs-auth"
 
     monkeypatch.setattr(
-        "omnigent.codex_native._codex_auth_unavailable_reason",
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
         _codex_reason,
     )
 
     result = configured_harness_map()
 
     assert calls == 1
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
+
+
+def test_configured_harness_map_runs_independent_probes_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent readiness probes overlap without duplicating aliases."""
+    lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    calls: Counter[str] = Counter()
+
+    def _availability(canonical: str) -> bool | str:
+        nonlocal active, max_active
+        with lock:
+            calls[canonical] += 1
+            active += 1
+            max_active = max(max_active, active)
+            if active >= _READINESS_PROBE_MAX_WORKERS:
+                release.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("readiness probes did not overlap")
+        with lock:
+            active -= 1
+        if "codex" in canonical:
+            return "needs-auth"
+        return canonical != "claude-native"
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._harness_availability",
+        _availability,
+    )
+
+    result = configured_harness_map()
+
+    assert result
+    assert max_active == _READINESS_PROBE_MAX_WORKERS
+    assert all(count == 1 for count in calls.values())
+    assert result["claude-native"] is False
+    assert result["native-claude"] is True
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
@@ -637,7 +700,7 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
 def test_antigravity_native_requires_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``antigravity-native`` needs both the ``agy`` binary and a stored credential."""
+    """``antigravity-native`` needs both the ``agy`` binary and a credential."""
     import omnigent.onboarding.gemini_auth as _ga
 
     _all_clis_installed(monkeypatch)

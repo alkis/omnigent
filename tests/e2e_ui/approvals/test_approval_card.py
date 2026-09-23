@@ -30,7 +30,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _MOCK_ELICITATION_TIMEOUT_MS = 15_000
 
@@ -102,6 +102,39 @@ def test_approval_card_reject(
     expect(responded).to_be_visible(timeout=30_000)
     expect(responded.get_by_text("Rejected", exact=False).first).to_be_visible()
     _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+
+
+@pytest.mark.timeout(120)
+def test_pending_approval_keeps_interrupt_available(
+    page: Page,
+    approval_session: tuple[str, str],
+) -> None:
+    """A turn parked on an approval remains interruptible from the composer."""
+    base_url, session_id = approval_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("Run the command now.")
+    page.get_by_role("button", name="Send", exact=True).click()
+
+    card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+    expect(card).to_be_visible(timeout=_AGENT_TURN_TIMEOUT_MS)
+    composer.fill("Keep this draft after interrupting.")
+    interrupt = page.get_by_role("button", name="Interrupt", exact=True)
+    expect(interrupt).to_be_visible()
+    expect(interrupt).to_be_enabled()
+
+    with page.expect_request(
+        lambda request: (
+            request.method == "POST" and request.url.endswith(f"/v1/sessions/{session_id}/events")
+        )
+    ) as request_info:
+        interrupt.click()
+
+    assert request_info.value.post_data_json == {"type": "interrupt", "data": {}}
+    expect(interrupt).not_to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    expect(composer).to_have_value("Keep this draft after interrupting.")
 
 
 @pytest.mark.timeout(90)

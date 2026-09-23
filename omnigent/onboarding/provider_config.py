@@ -50,16 +50,16 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.env_credentials import (
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.spec.parser import check_unresolved_env_vars
+from omnigent.util.env_credentials import (
     _ENV_REF_RE,
     env_names_with_omnigent_prefix,
     expand_envvars_with_omnigent_prefix,
     getenv_with_omnigent_prefix,
     omnigent_prefixed_env_name,
 )
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.spec.parser import check_unresolved_env_vars
 
 _logger = logging.getLogger(__name__)
 
@@ -96,10 +96,11 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # too (a Databricks AI Gateway is pi-consumable — Pi speaks its Anthropic
 # surface), with the actual gateway capability validated at resolution time.
 # A ``subscription`` (CLI login, unusable outside its own CLI) and ``bedrock``
-# (native-``omnigent claude`` only) can never drive pi. Resolution: an
-# explicit pi default wins; otherwise pi falls back to the anthropic then
-# openai family default, skipping the non-pi kinds (see
-# :func:`default_provider_for_harness`).
+# (native-``omnigent claude`` only) can never drive pi — EXCEPT for a pi
+# subscription (``kind="subscription", cli="pi"``), which explicitly opts into
+# Pi's own native auth and may default the pi surface. Resolution: an explicit
+# pi default wins; otherwise pi falls back to the anthropic then openai family
+# default, skipping the non-pi kinds (see :func:`default_provider_for_harness`).
 PI_SURFACE = "pi"
 
 # Accepted ``wire_api`` values. ``responses`` is the OpenAI Responses API;
@@ -184,7 +185,7 @@ _HARNESS_FAMILY: dict[str, str] = {
     "agy": OPENAI_FAMILY,
     # NB: ``kimi`` is intentionally absent. Upstream Kimi Code CLI has no
     # per-spawn provider override flag, so Omnigent cannot thread a generic
-    # provider through. Provider routing for kimi lives in ``~/.kimi/config.toml``
+    # provider through. Provider routing for kimi lives in ``~/.kimi-code/config.toml``
     # and is managed out-of-band via ``kimi provider add``.
     # Qwen Code is OpenAI-compatible; the native TUI keys both spellings (mirroring
     # codex-native) so a same-agent qwen→qwen fork/switch reads as same-family.
@@ -323,6 +324,13 @@ class FamilyConfig:
         allowing self-hosted providers serving catalog-known model IDs to use
         their own rates. ``None`` (the default) means no custom pricing — falls
         back to catalog. See :class:`ModelPricingConfig`.
+    :param context_window: Optional context window size in tokens for the
+        default model (e.g. ``1048576`` for a 1M-context gateway model).
+        When set, pi-native sessions advertise this limit in ``models.json``
+        so Pi does not fall back to its own 128k default.
+    :param max_output_tokens: Optional maximum output token count for the
+        default model (e.g. ``65536``). When set, pi-native sessions
+        advertise this limit in ``models.json`` instead of Pi's 16k default.
     """
 
     base_url: str
@@ -332,6 +340,8 @@ class FamilyConfig:
     wire_api: str | None = None
     models: dict[str, str] = field(default_factory=dict)
     pricing: ModelPricingConfig | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
 
     @property
     def default_model(self) -> str | None:
@@ -341,6 +351,28 @@ class FamilyConfig:
             ``None`` when the family declares no default.
         """
         return self.models.get("default")
+
+    def resolve_model_tier(self, model_id: str) -> str:
+        """Resolve a ``models:`` value that names another tier to its id.
+
+        Deployments alias tier names to ids (``deepseek-pro:
+        deepseek-v4-pro``) and reference those aliases from other keys
+        (``default: deepseek-pro``). Whatever reaches an endpoint — the
+        launch model, the picker's shortlist, the spawn env — must be the
+        concrete id, never the alias.
+
+        :param model_id: A ``models`` key or value, e.g. ``"deepseek-pro"``.
+        :returns: The concrete id the alias chain ends at, e.g.
+            ``"deepseek-v4-pro"``; *model_id* unchanged when it names no
+            other tier.
+        """
+        current = model_id
+        for _ in range(8):  # bounded: a cyclic alias map must terminate
+            alias = self.models.get(current)
+            if not isinstance(alias, str) or not alias or alias == current:
+                return current
+            current = alias
+        return model_id
 
 
 @dataclass(frozen=True)
@@ -377,6 +409,8 @@ class ProviderEntry:
         ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
+    :param connection: For managed ``kind="databricks"`` providers, ``"databricks"``
+        selects the session owner's connection. Mutually exclusive with ``profile``.
     :param model_provider: For ``kind="cli-config"`` only: the custom
         provider id in the CLI's config file that the launch pins, i.e. the
         ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``. ``None``
@@ -402,6 +436,7 @@ class ProviderEntry:
     families: dict[str, FamilyConfig] = field(default_factory=dict)
     cli: str | None = None
     profile: str | None = None
+    connection: str | None = None
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
@@ -757,6 +792,27 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    context_window_raw = raw.get("context_window")
+    context_window: int | None = None
+    if context_window_raw is not None:
+        if not isinstance(context_window_raw, int) or context_window_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.context_window must be a positive integer, got {context_window_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        context_window = context_window_raw
+
+    max_output_tokens_raw = raw.get("max_output_tokens")
+    max_output_tokens: int | None = None
+    if max_output_tokens_raw is not None:
+        if not isinstance(max_output_tokens_raw, int) or max_output_tokens_raw <= 0:
+            raise OmnigentError(
+                f"{prefix}.max_output_tokens must be a positive integer, "
+                f"got {max_output_tokens_raw!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        max_output_tokens = max_output_tokens_raw
+
     return FamilyConfig(
         base_url=base_url_raw,
         api_key=api_key,
@@ -765,6 +821,8 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
         wire_api=wire_api,
         models=models,
         pricing=pricing,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -824,7 +882,7 @@ def _parse_default_families(
     # ``provider_families`` and rejects a hand-edited ``default: ["gemini",
     # "pi"]`` at parse time (parity with how a subscription's pi scope is
     # rejected), rather than failing loudly only at pi launch.
-    pi_ok = pi_capable and bool(served & frozenset(_PI_FALLBACK_FAMILIES))
+    pi_ok = pi_capable and (bool(served & frozenset(_PI_FALLBACK_FAMILIES)) or not served)
     allowed = served | {PI_SURFACE} if pi_ok else served
     invalid = requested - allowed
     if invalid:
@@ -905,19 +963,24 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 code=ErrorCode.INVALID_INPUT,
             )
         # A subscription serves the family its CLI implies (claude→anthropic,
-        # codex→openai); an unknown CLI serves nothing.
+        # codex→openai); a pi subscription serves no model family directly —
+        # it is pi-capable so it can claim the pi scope explicitly, signalling
+        # "use Pi's own native auth"; an unknown CLI serves nothing.
         served = (
             {ANTHROPIC_FAMILY}
             if cli_raw == "claude"
             else ({OPENAI_FAMILY} if cli_raw == "codex" else set())
         )
+        # claude/codex subscriptions are locked to their own CLIs and cannot
+        # drive pi. A pi subscription explicitly opts into Pi's own native auth
+        # and may default the pi surface (pi_capable=True, served={}).
         return ProviderEntry(
             name=name,
             kind=kind,
             cli=cli_raw,
-            # A subscription is locked to its own CLI, so it can never drive
-            # pi — naming "pi" in its default scope is a config error.
-            default_families=_parse_default_families(name, default_raw, served, pi_capable=False),
+            default_families=_parse_default_families(
+                name, default_raw, served, pi_capable=(cli_raw == "pi")
+            ),
         )
 
     if kind == CLI_CONFIG_KIND:
@@ -963,9 +1026,17 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
 
     if kind == DATABRICKS_KIND:
         profile_raw = raw.get("profile")
-        if not isinstance(profile_raw, str) or not profile_raw:
+        connection_raw = raw.get("connection")
+        if connection_raw is not None and (
+            connection_raw != "databricks" or profile_raw is not None
+        ):
             raise OmnigentError(
-                f"provider {name!r}: a 'profile' is required when kind is 'databricks'.",
+                f"provider {name!r}: use exactly one of profile or connection: databricks.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if connection_raw is None and (not isinstance(profile_raw, str) or not profile_raw):
+            raise OmnigentError(
+                f"provider {name!r}: a profile or connection: databricks is required.",
                 code=ErrorCode.INVALID_INPUT,
             )
         # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
@@ -975,7 +1046,8 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
         return ProviderEntry(
             name=name,
             kind=kind,
-            profile=profile_raw,
+            profile=profile_raw if isinstance(profile_raw, str) else None,
+            connection=connection_raw,
             default_families=_parse_default_families(
                 name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
@@ -1037,7 +1109,9 @@ def load_config() -> dict[str, object]:
         ``{"providers": {"openrouter": {"kind": "gateway", ...}}}``, or
         ``{}`` when the config file is missing, empty, or unreadable.
     """
-    return _load_config()
+    from omnigent.inference_config import load_runtime_inference_config
+
+    return load_runtime_inference_config()
 
 
 def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
@@ -1082,7 +1156,9 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
     return result
 
 
-def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
+def provider_credential_env_vars(
+    config: dict[str, object], *, include_dollar_key_refs: bool = False
+) -> frozenset[str]:
     """Return the env var names referenced by provider ``api_key_ref`` entries.
 
     Scans all inline-family providers (``key`` / ``gateway`` / ``local``) in
@@ -1098,12 +1174,15 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
     credential env vars into the runner subprocess without requiring the user
     to list them in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` by hand.
 
-    Only ``env:``-style references are included.  ``keychain:`` refs resolve
+    Saved sandbox profiles also include dollar references in ``api_key_ref``
+    when ``include_dollar_key_refs`` is enabled. ``keychain:`` refs resolve
     through the secret store and are never env vars.  ``auth_command`` is a
     shell command, not a static env var.  ``base_url`` env-refs are omitted
     because the URL is not a credential.
 
     :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
+    :param include_dollar_key_refs: Forward dollar-style ``api_key_ref`` entries
+        from a saved sandbox profile; defaults to legacy forwarding behavior.
     :returns: Env var names (and their ``OMNIGENT_`` aliases) that provider
         credential fields reference, e.g.
         ``frozenset({"MY_TOKEN", "OMNIGENT_MY_TOKEN"})``.
@@ -1118,8 +1197,17 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
                     names.add(n)
             # api_key: $VAR or ${VAR} — inline $VAR reference (unresolved at
             # parse time; expanded lazily by _expand_family).
-            if family.api_key is not None:
-                for match in _ENV_REF_RE.finditer(family.api_key):
+            dollar_refs = [family.api_key]
+            if (
+                include_dollar_key_refs
+                and family.api_key_ref is not None
+                and family.api_key_ref.startswith("$")
+            ):
+                dollar_refs.append(family.api_key_ref)
+            for reference in dollar_refs:
+                if reference is None:
+                    continue
+                for match in _ENV_REF_RE.finditer(reference):
                     var = match.group(1) or match.group(2)
                     for n in env_names_with_omnigent_prefix(var):
                         names.add(n)
@@ -1146,12 +1234,12 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     Most ``cli-config`` providers (a custom codex ``[model_providers.X]``) are
     unusable outside their own CLI, so they never serve pi. The exception is a
     Databricks AI Gateway: it exposes an Anthropic Messages surface Pi speaks
-    natively, and :func:`omnigent.pi_native_credentials._cli_config_pi_provider`
+    natively, and :func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`
     translates it into a Pi gateway config (and the gateway-harness pi path
     routes it too — see ``configure_agent_harness_with_provider``). So a
     cli-config provider serves pi *iff* it is a pi-consumable Databricks gateway.
 
-    The capability check lives in :mod:`omnigent.pi_native_credentials` (the
+    The capability check lives in :mod:`omnigent.harnesses.pi_native.credentials` (the
     single source of truth, alongside the gateway-URL allowlist and the codex
     transport reader). It is imported **lazily** here: ``pi_native_credentials``
     imports this module at top level, so a top-level import back would cycle;
@@ -1163,7 +1251,7 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     """
     if entry.kind != CLI_CONFIG_KIND:
         return False
-    from omnigent.pi_native_credentials import cli_config_pi_provider_capable
+    from omnigent.harnesses.pi_native.credentials import cli_config_pi_provider_capable
 
     return cli_config_pi_provider_capable(entry)
 
@@ -1181,8 +1269,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
       plus the :data:`PI_SURFACE` scope (pi consumes either family).
     - ``subscription`` / ``cli-config``: derived from the CLI — ``claude``
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
-      surface. Never pi: a CLI login (or a provider pinned in the CLI's
-      own config file) is unusable outside its own CLI.
+      surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
+      "use Pi's own native auth"). Other CLIs serve nothing.
     - ``databricks``: both families plus pi — ucode routes the Claude,
       Codex, and pi surfaces.
 
@@ -1222,6 +1310,10 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
             return frozenset({ANTHROPIC_FAMILY})
+        if entry.cli == "pi":
+            # A pi subscription signals "use Pi's own native auth" — it serves
+            # only the pi scope (no model family directly).
+            return frozenset({PI_SURFACE})
         if entry.cli == "codex":
             # A codex *cli-config* provider may ALSO serve pi: a Databricks AI
             # Gateway exposes an Anthropic Messages surface Pi speaks natively

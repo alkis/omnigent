@@ -1,10 +1,4 @@
-"""Unit tests: _ensure_backend Databricks auth-then-daemon ordering.
-
-Guards the sequential contract in the remote-server branch of
-``_ensure_backend``: auth runs on the calling thread before the daemon starts,
-so the daemon's first tunnel attempt has valid credentials and interactive
-login output is never interleaved with spinner output.
-"""
+"""Verify Databricks authentication completes before daemon startup."""
 
 from __future__ import annotations
 
@@ -24,11 +18,6 @@ _REMOTE = "https://example.databricksapps.com"
 
 def _no_url_expand(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda s: s.rstrip("/"))
-
-
-# ---------------------------------------------------------------------------
-# auth-before-daemon ordering
-# ---------------------------------------------------------------------------
 
 
 def test_daemon_not_called_until_auth_returns(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,11 +48,6 @@ def test_daemon_not_called_until_auth_returns(monkeypatch: pytest.MonkeyPatch) -
     )
 
 
-# ---------------------------------------------------------------------------
-# auth on main thread
-# ---------------------------------------------------------------------------
-
-
 def test_auth_executes_on_calling_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     """_ensure_databricks_server_auth must run on the main thread (TTY-safe)."""
     _no_url_expand(monkeypatch)
@@ -82,11 +66,6 @@ def test_auth_executes_on_calling_thread(monkeypatch: pytest.MonkeyPatch) -> Non
     assert seen[0] is threading.main_thread(), (
         f"auth ran on {seen[0].name!r} — must run on main thread for TTY safety"
     )
-
-
-# ---------------------------------------------------------------------------
-# auth failure prevents daemon start
-# ---------------------------------------------------------------------------
 
 
 def test_daemon_not_started_when_auth_raises(monkeypatch: pytest.MonkeyPatch) -> None:
