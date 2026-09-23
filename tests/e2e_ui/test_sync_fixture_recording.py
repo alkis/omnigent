@@ -1,11 +1,4 @@
-"""The ``OMNIGENT_E2E_RECORD_DIR`` recorder must film sync-API journeys.
-
-Tests that take pytest-playwright's sync ``page``/``context`` fixtures, or open
-a browser through ``playwright.sync_api`` directly, must be recorded when
-``OMNIGENT_E2E_RECORD_DIR`` is set — exactly like tests driving the async API.
-Historically only the async ``Browser`` methods were patched, so sync-fixture
-journeys were silently never filmed.
-"""
+"""The optional recorder must capture sync Playwright calls and pytest fixtures."""
 
 from __future__ import annotations
 
@@ -19,13 +12,7 @@ from playwright.sync_api import Browser, Page
 
 @pytest.fixture(scope="module", autouse=True)
 def record_dir(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
-    """Point the recorder at a temp dir before any function-scoped fixture runs.
-
-    Module scope guarantees the env var is set before ``browser_context_args``,
-    ``_record_video``, and pytest-playwright's ``context`` fixture instantiate,
-    and overrides any ambient ``OMNIGENT_E2E_RECORD_DIR`` so the assertions
-    below stay hermetic.
-    """
+    """Set an isolated recording directory before function-scoped browser fixtures run."""
     target = tmp_path_factory.mktemp("record")
     mp = pytest.MonkeyPatch()
     mp.setenv("OMNIGENT_E2E_RECORD_DIR", str(target))
