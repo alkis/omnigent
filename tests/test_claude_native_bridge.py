@@ -10224,9 +10224,18 @@ def test_a_leftover_draft_still_receives_the_message_after_the_wait(
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     events = _events_tmux(monkeypatch, [_composer_pane("my half-typed thought")])
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
 
     inject_user_message(bridge_dir, content="fix the flaky test")
 
+    # One foreign-draft wait, not one per stage: the reclaim hands the draft
+    # it gave up on to the readiness gate, which must not hold for it again.
+    assert clock.now <= (
+        claude_native_bridge._FOREIGN_DRAFT_WAIT_TIMEOUT_S
+        + claude_native_bridge._PASTE_COMMIT_TIMEOUT_S
+        + 2.0
+    ), f"The leftover draft was waited out more than once ({clock.now:.1f} virtual s)"
     verbs = [event.split(":")[1] for event in events if event.startswith("send:")]
     assert "paste-buffer" in verbs, f"The message must still be pasted; events: {events}"
     tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:send-keys:")]
@@ -10263,6 +10272,10 @@ def test_a_leftover_draft_is_still_cleared_for_a_slash_command_after_the_wait(
         (_composer_pane("[Pasted text #1 +12 lines]"), True),
         # The dim suggestion an empty box shows on some starts is chrome, not a draft.
         ("─" * 30 + '\n❯\xa0Try "create a util logging.py that..."\n' + "─" * 30 + "\n", False),
+        # A narrow pane truncates or wraps the suggestion: still chrome.
+        ("─" * 30 + '\n❯\xa0Try "create a util loggi\n' + "─" * 30 + "\n", False),
+        # The queued-input hint shown while a turn runs is chrome too.
+        (_composer_pane("Press up to edit queued messages"), False),
         # Shell mode is another input mode, not a chat draft.
         ("─" * 30 + "\n! ls\n" + "─" * 30 + "\n", False),
         ("Starting Claude Code...\n", False),
@@ -10272,6 +10285,81 @@ def test_a_leftover_draft_is_still_cleared_for_a_slash_command_after_the_wait(
 def test_composer_holds_draft(pane: str, expected: bool) -> None:
     """The draft check reads only the framed chat composer's own text."""
     assert claude_native_bridge._composer_holds_draft(pane) is expected
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_composer_pane("fix the flaky test"), "fix the flaky test"),
+        (_IDLE_PANE, ""),
+        ("─" * 30 + '\n❯\xa0Try "edit <filepath> to..."\n' + "─" * 30 + "\n", ""),
+        (_composer_pane("Press up to edit queued messages"), ""),
+        ("Starting Claude Code...\n", None),
+    ],
+)
+def test_composer_draft_text(pane: str, expected: str | None) -> None:
+    """The draft reader returns the box's text, empty for a free box, None when unmounted."""
+    assert claude_native_bridge._composer_draft_text(pane) == expected
+
+
+def test_a_torn_capture_mid_settle_does_not_release_the_slash_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A blank capture after a free frame counts for nothing; the settle goes on.
+
+    A torn read mid-settle is neither a free box nor a draft. Returning on it
+    would let the command type before the settle window has run, defeating
+    the yield to a paste in flight.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    settle = claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS
+    events = _events_tmux(
+        monkeypatch,
+        [_IDLE_PANE, "", *[_IDLE_PANE] * (settle - 1), _composer_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert _captures_before_first_send(events) >= settle + 1, (
+        f"A torn frame must not release the settle early; events: {events}"
+    )
+
+
+def test_a_surface_opened_after_a_waited_draft_still_gets_its_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The surface-dismiss budget starts when the surface appears.
+
+    Waiting out another writer's draft must not consume it: a ctrl+r search
+    opened after most of that wait would otherwise be past its deadline on
+    first sight and the command typed into the search filter.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    draft_frames = int(3.75 / poll)  # past the old entry-anchored 3 s budget
+    settle = [_IDLE_PANE] * claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS
+    events = _events_tmux(
+        monkeypatch,
+        [
+            *[_composer_pane("fix the flaky test")] * draft_frames,
+            *[_REVERSE_SEARCH_PANE] * 3,
+            *settle,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert "send:send-keys:Escape" in events, (
+        f"The search opened after the draft wait must still be Escaped; events: {events}"
+    )
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:")]
+    assert tails[-3:] == ["C-u", "/effort high", "Enter"], f"Unexpected keystrokes: {tails}"
 
 
 def test_a_slash_command_draft_that_never_renders_submits_blind(
