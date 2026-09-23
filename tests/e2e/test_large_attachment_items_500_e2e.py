@@ -1,45 +1,10 @@
-"""E2E regression test: a large inline attachment makes a session's
-``GET /v1/sessions/<id>/items`` fail with HTTP 500, so the conversation can no
-longer be opened.
+"""A large inline attachment must not make the session-items endpoint return 500.
 
-Reported production journey (Databricks Apps / ``prod-aws-us-west-2``): a user
-attaches a large PDF (>1 MiB). The attachment bytes are persisted **inline**
-(base64) inside the conversation item, so a single item can be several MB. On
-session load the server decrypts a page of items by sending them to the mas-java
-CMK sidecar over gRPC; the request frame exceeds mas-java's **1 MiB** Armeria
-inbound limit and is rejected with ``RESOURCE_EXHAUSTED``::
-
-    Unhandled exception - RPC terminated with RESOURCE_EXHAUSTED.
-    Frame size 2036419 exceeds maximum: 1048576
-
-The ``_InactiveRpcError`` propagates unhandled through FastAPI ->
-``GET /sessions/{id}/items`` returns HTTP 500. The failure is deterministic:
-every load of that conversation 500s, so the session becomes unopenable while
-the write path (upload + turn) succeeded cleanly.
-
-Environment fidelity — this is a **stand-in** reproduction. The failing seam
-(``databricks_mysql_conversation_store._decode_item_data_batch`` -> CMK decrypt
-gRPC -> mas-java Armeria 1 MiB frame limit) lives in Databricks deployment code
-that is not part of ``omnigent-ai/omnigent`` or this build: here the conversation
-store's ``_decode_item_data_batch`` is identity (plaintext, no gRPC, no size
-limit), so driving the genuine user journey never 500s. To exercise the same
-user-observable failure against the real read route + exception handler, the
-spawned server bootstraps ``_decode_item_data_batch`` to reject a page whose
-combined payload exceeds the mas-java 1 MiB inbound limit — standing in for the
-CMK sidecar's frame-size rejection. This mirrors the accepted pattern in
-``tests/e2e/test_claude_native_cold_resume_items_500_e2e.py``.
-
-Desired behavior (asserted): a session that holds a large attachment must still
-load — ``GET /sessions/{id}/items`` must NOT return HTTP 500, so a single
-oversized item can no longer make the whole conversation permanently
-unreadable. On the buggy build the read path 500s, so this test FAILS with the
-returned status + body in the failure message.
-
-Run::
-
-    .venv/bin/python -m pytest \
-        tests/e2e/test_large_attachment_items_500_e2e.py -v
-"""
+Run a real local HTTP server with a decode hook that rejects payloads over
+1 MiB, simulating a CMK sidecar transport limit. The actual encrypted
+Databricks store and gRPC sidecar are outside this repository and are not
+exercised. Seed the persisted inline-PDF item directly, then verify the
+read route avoids HTTP 500 despite the undecodable attachment."""
 
 from __future__ import annotations
 
@@ -219,14 +184,7 @@ def _create_session(base_url: str) -> str:
 
 
 def _make_pdf(size_bytes: int) -> bytes:
-    """Build a valid, ``size_bytes``-large single-page PDF.
-
-    The bulk is a padded PDF comment so the whole thing stays a well-formed
-    ``application/pdf`` the upload route accepts.
-
-    :param size_bytes: Target total size, e.g. ``1_600_000``.
-    :returns: The PDF bytes.
-    """
+    """Build a valid PDF padded with a comment to size_bytes."""
     head = (
         b"%PDF-1.4\n"
         b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
@@ -239,15 +197,7 @@ def _make_pdf(size_bytes: int) -> bytes:
 
 
 def _append_items(database_uri: str, session_id: str, items: list) -> None:
-    """Append conversation items straight into the spawned server's store.
-
-    Direct store writes are the same seeding pattern the e2e suites use — there
-    is no REST bulk-append.
-
-    :param database_uri: The spawned server's SQLite URI.
-    :param session_id: Conversation to append to.
-    :param items: ``NewConversationItem`` objects to persist.
-    """
+    """Seed conversation items directly in the spawned server's SQLite store."""
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
@@ -283,16 +233,7 @@ def _small_text_items(count: int) -> list:
 
 
 def _inline_attachment_item(pdf_bytes: bytes, filename: str) -> list:
-    """Build a user message whose content inlines *pdf_bytes* as base64.
-
-    Mirrors the persisted state the ticket documents: the attachment bytes are
-    stored inline (base64) inside the conversation item, so a single item is
-    several MB and is re-read on every session load.
-
-    :param pdf_bytes: The attachment payload.
-    :param filename: The attachment file name.
-    :returns: A one-element list holding the ``NewConversationItem``.
-    """
+    """Build the persisted user-message shape with a base64 inline PDF."""
     from omnigent.entities import MessageData, NewConversationItem
 
     encoded = base64.b64encode(pdf_bytes).decode()
@@ -317,20 +258,7 @@ def _inline_attachment_item(pdf_bytes: bytes, filename: str) -> list:
 
 
 def test_large_attachment_keeps_session_loadable(tmp_path: Path) -> None:
-    """A session holding a large inline attachment must still load its items.
-
-    Journey (the reporter's): a user attaches a large PDF (>1 MiB) to a
-    conversation and later reloads the page. The attachment persists inline
-    (base64) in the item, and the session-load decrypt of that page exceeds the
-    mas-java 1 MiB frame limit.
-
-    Expected: ``GET /sessions/{id}/items`` still serves the conversation (no
-    HTTP 500), so one oversized item can not make the whole session unopenable.
-    Buggy behavior: the decode overflow propagates unhandled and the read route
-    returns HTTP 500, so the conversation can no longer be opened.
-
-    :param tmp_path: Per-test temp dir (server DB + artifacts).
-    """
+    """An oversized inline attachment must leave the session readable over HTTP."""
     port = _find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "chat.db"
