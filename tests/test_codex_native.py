@@ -12635,20 +12635,22 @@ def test_codex_discover_thread_fails_fast_when_tui_pane_dies(
     monkeypatch.setattr(_fwd, "wait_for_thread_started", _hang)
 
     class _FakePaneDead:
-        """Fake terminal whose pane is immediately dead."""
+        """Fake terminal whose pane is immediately dead.
+
+        last_exit_status is a plain method matching the real TerminalInstance
+        signature — NOT a property — so the watcher calls it correctly.
+        """
 
         running = False
-        _last_exit_status: int | None = 2
 
         async def is_alive(self) -> bool:
             return False
 
+        def last_exit_status(self) -> int | None:  # plain method, matches real class
+            return 2
+
         def last_pane_text(self) -> str | None:
             return "error: the argument '--remote <ADDR>' cannot be used multiple times"
-
-        @property
-        def last_exit_status(self) -> int | None:
-            return self._last_exit_status
 
     class _FakeClient:
         async def close(self) -> None:
@@ -12672,8 +12674,85 @@ def test_codex_discover_thread_fails_fast_when_tui_pane_dies(
     # The error must describe the real cause, not a generic timeout.
     assert "TUI exited" in err, f"expected pane-death cause in error; got: {err!r}"
     assert "exit status 2" in err, f"expected exit code in error; got: {err!r}"
+    # Guard against accidentally logging a bound-method object instead of its return value.
+    assert "bound method" not in err, f"last_exit_status was not called; got: {err!r}"
     assert "startup timed out" not in err, f"must not describe as timeout; got: {err!r}"
     assert "Launch routing: Databricks ucode profile 'DEFAULT'" in err
+
+
+def test_codex_discover_thread_fails_fast_real_terminal_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pane-death watcher works against a real TerminalInstance.
+
+    Uses the same construction pattern as tests/inner/test_terminal.py so the
+    attribute contract (last_exit_status is a method, last_pane_text reads a
+    cached snapshot) is exercised against the production class.
+    """
+    import asyncio as _asyncio
+
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    hang_event = _asyncio.Event()
+
+    async def _hang(_client: object, *, timeout: object = None) -> str:
+        await hang_event.wait()
+        raise TimeoutError("should not reach here")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _hang)
+
+    # Construct a real TerminalInstance and set its internal state to simulate
+    # a dead pane with a known exit status and pane snapshot.
+    terminal = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=False,
+    )
+    terminal._last_exit_status = 2
+    terminal._remember_pane_snapshot(
+        "error: the argument '--remote' cannot be used multiple times"
+    )
+
+    # is_alive() would invoke tmux; monkeypatch it to return False immediately.
+    async def _dead() -> bool:
+        return False
+
+    monkeypatch.setattr(terminal, "is_alive", _dead)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test_real_terminal",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_FakeClient(),
+            routing_summary="Databricks ucode profile 'DEFAULT'",
+            tui_terminal=terminal,
+        )
+    )
+
+    err = read_bridge_startup_error(bridge_dir)
+    assert err is not None, "bridge startup error must be recorded"
+    assert "TUI exited" in err, f"expected pane-death cause; got: {err!r}"
+    # Exit status came from the real last_exit_status() method.
+    assert "exit status 2" in err, f"expected exit code from real method; got: {err!r}"
+    assert "bound method" not in err, f"last_exit_status was not called; got: {err!r}"
+    # Pane tail came from the real last_pane_text() / _remember_pane_snapshot.
+    assert "cannot be used multiple times" in err, f"expected pane tail; got: {err!r}"
+    assert "startup timed out" not in err
 
 
 def test_codex_discover_thread_fails_with_timeout_when_no_tui_terminal(

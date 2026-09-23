@@ -5347,11 +5347,14 @@ async def _watch_codex_tui_pane(terminal: TerminalInstance) -> None:
             # A probe failure is not a confirmed death; keep polling.
             continue
         if not alive:
-            status = terminal.last_exit_status
-            tail = terminal.last_pane_text()
+            status = terminal.last_exit_status()
+            raw_tail = terminal.last_pane_text()
             detail = f"exit status {status}" if status is not None else "process exited"
-            if tail:
-                detail += f"; last output: {tail[-200:]!r}"
+            if raw_tail:
+                # Collapse newlines and runs of spaces to keep the
+                # user-facing cause on one readable line.
+                flat = " ".join(raw_tail.split())
+                detail += f"; last output: {flat[-200:]!r}"
             raise _TuiPaneDeathError(f"Codex TUI exited before starting a thread ({detail})")
 
 
@@ -5487,11 +5490,9 @@ async def _codex_discover_thread_and_forward(
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
-                if discover_task in done:
-                    thread_id = discover_task.result()  # re-raises on failure
-                else:
-                    death_task.result()  # re-raises _TuiPaneDeathError
-                    thread_id = ""  # unreachable; keeps type-checker happy
+                if death_task in done:
+                    death_task.result()  # raises _TuiPaneDeathError
+                thread_id = discover_task.result()  # re-raises on timeout/stream-end
             elif thread_start_timeout_seconds is not None:
                 thread_id = await wait_for_thread_started(
                     event_client,
