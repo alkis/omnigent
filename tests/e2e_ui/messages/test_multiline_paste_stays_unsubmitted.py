@@ -1,25 +1,13 @@
-"""E2E: pasting multiline text must not submit it to the agent by itself.
+"""Clipboard pastes must remain drafts until an explicit send gesture.
 
-Two surfaces accept a paste of text containing newlines:
-
-- The embedded terminal pane of a terminal-first (native TUI) session. The
-  TUI (Claude Code) enables bracketed paste, so a multi-line paste must land
-  in its input box as one block; only an explicit Enter submits it. When the
-  browser xterm never learns bracketed paste is active, it sends the pasted
-  newlines as raw carriage returns and the TUI submits the first line the
-  moment the paste arrives — text the user never sent races off to the agent.
-- The chat composer. A paste must insert into the draft; only the configured
-  send gesture submits.
-
-Both journeys paste through the browser's real clipboard + paste gesture, not
-synthetic value assignment, so the xterm/composer paste pipelines are the ones
-exercised.
-"""
+These browser journeys exercise the real clipboard in the chat composer
+and the embedded Claude terminal, including bracketed-paste handling."""
 
 from __future__ import annotations
 
 import re
 import shutil
+import sys
 import time
 import uuid
 from urllib.parse import urlparse
@@ -59,16 +47,10 @@ def _pane_lines(pane: str) -> list[str]:
 
 
 def _input_box_region(pane: str) -> tuple[list[str], list[str]] | None:
-    """Split *pane* into (rows above the input box, rows inside it).
+    """Split a Claude pane around the final two input-box border rows.
 
-    The idle Claude Code composer is bordered above and below by full-width
-    box-drawing rules; everything above its top border is transcript/echo
-    territory, where only *submitted* prompts render.
-
-    :param pane: The pane's visible text.
-    :returns: ``(above, inside)`` line lists, or ``None`` while the pane has
-        no complete input box to split on (mid-repaint).
-    """
+    :param pane: Visible pane text.
+    :returns: Transcript and input rows, or None during an incomplete repaint."""
     lines = _pane_lines(pane)
     borders = [i for i, line in enumerate(lines) if _BORDER_RUN.search(line)]
     if len(borders) < 2:
@@ -78,11 +60,7 @@ def _input_box_region(pane: str) -> tuple[list[str], list[str]] | None:
 
 
 def _paste_visible(rows: list[str], markers: tuple[str, ...]) -> bool:
-    """Whether the pasted block shows in *rows* — literally or collapsed.
-
-    Claude Code may render a large paste as a ``[Pasted text …]`` placeholder
-    instead of the literal lines; both count as the paste having arrived.
-    """
+    """Recognize literal pasted lines or Claude's collapsed pasted-text placeholder."""
     joined = "\n".join(rows)
     return all(marker in joined for marker in markers) or "Pasted text" in joined
 
@@ -135,7 +113,7 @@ def test_tui_multiline_paste_stays_unsubmitted(
     second = f"pasteblock-second-{nonce}"
     page.context.grant_permissions(["clipboard-read", "clipboard-write"])
     page.evaluate("([a, b]) => navigator.clipboard.writeText(a + '\\n' + b)", [first, second])
-    xterm_input.press("Control+Shift+V")
+    xterm_input.press("Meta+V" if sys.platform == "darwin" else "Control+Shift+V")
 
     # Wait for the paste to surface in the pane at all, then give a premature
     # submission time to repaint before judging.
@@ -198,7 +176,7 @@ def test_composer_multiline_paste_stays_in_composer(
     page.evaluate(
         "navigator.clipboard.writeText('composer paste line one\\ncomposer paste line two')"
     )
-    composer.press("Control+V")
+    composer.press("ControlOrMeta+V")
 
     expect(composer).to_have_value("composer paste line one\ncomposer paste line two")
     page.wait_for_timeout(1_000)

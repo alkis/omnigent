@@ -47,6 +47,7 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -56,6 +57,7 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
@@ -101,6 +103,21 @@ _CONTROL_READ_CHUNK: Final[int] = 256 * 1024
 # single read; raise it so a large burst can be pulled in one wakeup.
 _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 
+# Terminal type declared for the control-mode attach client. The real renderer
+# is the browser's xterm.js, an xterm-256color-class emulator, so this is
+# accurate rather than a guess. tmux exposes it as ``#{client_termname}``, and a
+# pane TUI (e.g. Codex) trusts that over its own $TERM; without pinning it the
+# client inherits the runner's TERM, which can be a non-interactive ``dumb``.
+_WEB_TERMINAL_TERM: Final[str] = "xterm-256color"
+
+# Closing the socket is best-effort: the browser may already be gone. Starlette
+# raises ``RuntimeError`` once a close frame has been sent and
+# ``WebSocketDisconnect`` when the transport is already dead (it wraps
+# uvicorn's ``ClientDisconnected``, an ``OSError``, so neither is a
+# ``RuntimeError``). A client that left first is not a bridge failure, and
+# letting either escape the route surfaces as "Exception in ASGI application".
+_WS_CLOSE_EXPECTED_ERRORS: Final = (RuntimeError, WebSocketDisconnect)
+
 # When the control reader ends with a send backlog still queued (a
 # burst-then-exit program), how long to let the forwarder finish draining that
 # sentinel-terminated backlog before teardown cancels it. Bounds teardown so a
@@ -115,19 +132,14 @@ _CLIPBOARD_BUFFER_CHANGED_PREFIX: Final = b"%paste-buffer-changed "
 _CLIPBOARD_BUFFER_NAME_RE: Final = re.compile(rb"[A-Za-z0-9_.:-]{1,128}\Z")
 # Browser clipboard writes should stay text-sized. Bound the raw buffer before
 # base64/JSON expansion so a huge tmux buffer cannot become a websocket DoS.
-_CLIPBOARD_MAX_BYTES: Final[int] = 1024 * 1024
+_CLIPBOARD_MAX_BYTES: Final[int] = MAX_CLIPBOARD_BYTES
 _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # A copy-mode commit follows the initiating key or mouse release immediately.
 # Correlating the notification with this client's recent input prevents one
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
 
-# Multi-line browser pastes are delivered through tmux's own paste pipeline
-# (``load-buffer`` + ``paste-buffer -p``): only the tmux server reliably knows
-# whether the pane program requested bracketed paste (``#{bracket_paste_flag}``
-# needs tmux >= 3.7), so it — not the browser xterm — decides whether to wrap
-# the block in ESC[200~/201~. Transport buffers carry this name prefix so the
-# resulting ``%paste-buffer-changed`` is never mistaken for a user copy.
+# Distinguish paste transport buffers from user copies in clipboard notifications.
 _PASTE_MAX_BYTES: Final[int] = 1024 * 1024
 _PASTE_BUFFER_PREFIX: Final = "omnigent-paste-"
 _PASTE_DELIVER_TIMEOUT_S: Final[float] = 5.0
@@ -260,23 +272,17 @@ async def _paste_via_tmux_buffer(
     buffer_name: str,
     data: bytes,
 ) -> bool:
-    """Deliver pasted bytes to the pane through tmux's own paste pipeline.
+    """Let tmux apply the pane's bracketed-paste mode and delete the transport buffer.
 
-    ``paste-buffer -p`` wraps the block in bracketed-paste markers exactly when
-    the pane program requested the mode, and otherwise pastes plainly with
-    newlines replaced by carriage returns — the same normalization a native
-    terminal paste applies. This keeps a multi-line paste from being executed
-    line by line when the browser xterm could not know the pane's mode (modes
-    enabled before attach are only queryable via ``#{bracket_paste_flag}`` on
-    tmux >= 3.7). ``-d`` deletes the transport buffer after the paste.
+    This also works before tmux 3.7, where browsers cannot query that mode.
+    Without bracketed paste, tmux normalizes newlines to carriage returns.
 
     :param tmux: Absolute tmux executable path.
-    :param socket_path: Private tmux server socket.
-    :param tmux_target: The ``-t`` target, e.g. ``"main"``.
-    :param buffer_name: Transport buffer name (``omnigent-paste-*``).
-    :param data: Raw pasted bytes from the browser.
-    :returns: ``True`` when tmux accepted the paste, ``False`` on any failure.
-    """
+    :param socket_path: Private server socket.
+    :param tmux_target: Destination pane.
+    :param buffer_name: Temporary omnigent-paste-* buffer.
+    :param data: Raw clipboard bytes.
+    :returns: Whether tmux accepted the paste."""
     try:
         proc = await asyncio.create_subprocess_exec(
             tmux,
@@ -639,7 +645,7 @@ async def bridge_tmux_control_to_websocket(
     tmux = shutil.which("tmux")
     if tmux is None:
         _logger.error("tmux not found on PATH; cannot control-attach target=%s", tmux_target)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(*_WS_CLOSE_EXPECTED_ERRORS):
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="tmux not found")
         return
 
@@ -662,6 +668,10 @@ async def bridge_tmux_control_to_websocket(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Pin the client's TERM so a leaked ``dumb`` from the runner env
+            # can't reach a pane TUI via ``#{client_termname}`` (see
+            # _WEB_TERMINAL_TERM).
+            env={**os.environ, "TERM": _WEB_TERMINAL_TERM},
             # Raise the stdout StreamReader buffer above the 64 KiB default so a
             # single ``read`` can pull a whole output burst (see
             # _CONTROL_STDOUT_BUFFER_LIMIT).
@@ -669,7 +679,7 @@ async def bridge_tmux_control_to_websocket(
         )
     except (OSError, ValueError):
         _logger.exception("control-attach spawn failed target=%s", tmux_target)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(*_WS_CLOSE_EXPECTED_ERRORS):
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="control attach failed")
         return
 
@@ -979,7 +989,7 @@ async def bridge_tmux_control_to_websocket(
                 proc.kill()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
-        with contextlib.suppress(RuntimeError):
+        with contextlib.suppress(*_WS_CLOSE_EXPECTED_ERRORS):
             if control_ended_first:
                 # The control client ended: distinguish a genuine session-gone
                 # (%exit with a dead/absent pane) from a mere detach. Reuse the
