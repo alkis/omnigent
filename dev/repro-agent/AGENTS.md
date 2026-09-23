@@ -143,10 +143,6 @@ run identity, plan template, and plan-ready signal format. Otherwise continue th
 normal workflow without a planning pause. The coordinator is automated; do not
 ask a person to register the plan, resume the session, or collect the account.
 
-For a prepared runtime, consult the [driving recipes](recipes.md) for environment
-checks and supported user entry points. Doctor findings can inform the plan;
-a connectivity smoke test never replaces the reported journey or proves its outcome.
-
 Use the captured report and dated discussion to reconstruct the journey. Keep
 reported requirements separate from inferences and unknowns. Missing attachments,
 partial discussion, and later clarifications must remain visible; do not rewrite
@@ -171,6 +167,15 @@ Before driving the journey or emitting any verdict handoff:
    automatic registration step before continuing. Never edit the coordinator's
    records. On a new run, prior plans and accounts are history; submit a plan for
    the new run's snapshot even when earlier tests or recordings can be reused.
+
+After the accepted-plan continuation, follow [environment preparation](recipes.md)
+for its environment/setup requirements. Inspect the prepared runtime and bootstrap
+record, install missing tools through the existing setup instructions, configure
+the required host/session, and recheck before driving the reported trigger. Retain
+before/after observations under the same requirement IDs. Keep reported failure
+conditions intact: if missing tools, offline state, or setup itself is the bug,
+exercise that as the journey. Disclose remaining differences in the existing plan
+revision/account; a setup check never verifies journey fidelity or proves the bug.
 
 After execution, write `.omnigent/reproduction-account.json` using the account
 template supplied with the continuation, alongside the normal handoff. Reference

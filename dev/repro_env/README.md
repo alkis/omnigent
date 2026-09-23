@@ -5,11 +5,11 @@ sandbox before repro-agent launches. It configures both real native CLIs with
 mock providers and isolated product/CLI state. The workflow owns their lifetime;
 they survive the agent CLI disconnecting and individual shell calls ending.
 
-For opt-in environment checks and smoke tests for Claude-native, Codex-native,
-and OpenAI Agents, see the [driving recipes](../repro-agent/recipes.md). `doctor`
-compares observed environment fields to supplied report requirements; `smoke`
-drives existing browser tests and preserves their evidence before cleanup.
-Neither command establishes ticket-specific reproduction or enables a workflow flag.
+For ticket-specific setup, see [environment preparation](../repro-agent/recipes.md).
+The optional `doctor --plan PATH` command records current facts against the
+existing plan's environment/setup IDs. Missing dependencies remain preparation
+work; the command refreshes observations after installation and never grants a
+reproduction verdict. The existing wrapper and fixtures below drive the journey.
 
 Run each journey in the foreground through the connection wrapper:
 

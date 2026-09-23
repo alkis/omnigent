@@ -1,4 +1,4 @@
-"""Observe the prepared runtime without inferring ticket fidelity from readiness."""
+"""Collect environment facts against the existing reproduction plan."""
 
 from __future__ import annotations
 
@@ -16,15 +16,6 @@ import httpx
 from .runtime import write_json
 from .transport import Relay
 
-_MACHINE_POLICIES = {
-    "claude-native": (
-        Path("/etc/claude-code/managed-settings.json"),
-        Path("/etc/claude-code/managed-settings.d"),
-        Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
-    ),
-    "codex-native": (Path("/etc/codex/managed_config.toml"), Path("/etc/codex/requirements.toml")),
-}
-
 
 def _command(args: list[str], root: Path) -> str | None:
     try:
@@ -35,150 +26,157 @@ def _command(args: list[str], root: Path) -> str | None:
 
 
 def launch_observations(root: Path) -> dict:
-    """Run inside the supervisor's isolated environment, before starting its children."""
     dirty = _command(["git", "status", "--porcelain", "--untracked-files=normal"], root)
-    index = root / "omnigent/server/static/web-ui/index.html"
-    observed = {
-        "build.commit": _command(["git", "rev-parse", "HEAD"], root),
-        "build.dirty": None if dirty is None else bool(dirty),
-        "build.diff_sha256": None,
-        "ui.index_sha256": hashlib.sha256(index.read_bytes()).hexdigest()
-        if index.is_file()
-        else None,
-        "ui.build_commit": None,
-        "os.system": platform.system(),
-        "os.machine": platform.machine(),
-        "python.version": platform.python_version(),
-        "model_backend": "mock",
-        "auth.provider": "header",
-        "auth.local_single_user": True,
-        "catalog.lookup_enabled": False,
-        "runner.idle_timeout_s": 0,
-        "surface": None,
-        "session.starting_state": None,
-        "session.harness": None,
-        "session.model": None,
+    return {
+        "captured_at": time.time(),
+        "commit": _command(["git", "rev-parse", "HEAD"], root),
+        "dirty": None if dirty is None else bool(dirty),
     }
-    diff = _command(["git", "diff", "HEAD", "--binary"], root)
-    if diff is not None:
-        observed["build.diff_sha256"] = hashlib.sha256(diff.encode()).hexdigest()
-    for harness, executable in (("claude-native", "claude"), ("codex-native", "codex")):
-        binary = shutil.which(executable)
-        observed[f"{harness}.binary"] = binary
-        observed[f"{harness}.version"] = _command([binary, "--version"], root) if binary else None
-        observed[f"{harness}.machine_policy_files"] = [
-            str(path) for path in _MACHINE_POLICIES[harness] if path.exists()
+
+
+def observe(output: Path, host_id: str | None) -> tuple[dict, list[str]]:
+    """Refresh shell tools after installation; distinguish them from runtime observations."""
+    facts = {"shell.os": platform.system(), "shell.arch": platform.machine()}
+    errors = []
+    for binary in ("claude", "codex"):
+        path = shutil.which(binary)
+        facts[f"shell.{binary}.installed"] = path is not None
+        facts[f"shell.{binary}.version"] = (
+            _command([path, "--version"], Path.cwd()) if path else None
+        )
+    try:
+        facts["shell.openai-agents.version"] = importlib.metadata.version("openai-agents")
+        facts["shell.openai-agents.installed"] = True
+    except importlib.metadata.PackageNotFoundError:
+        facts["shell.openai-agents.version"] = None
+        facts["shell.openai-agents.installed"] = False
+
+    state_path = output / "environment.json"
+    if not state_path.exists():
+        facts["runtime.status"] = "not_provisioned"
+        return facts, ["Prepared runtime is missing; use the existing workflow provisioning."]
+    state = json.loads(state_path.read_text())
+    facts.update(
+        {
+            "runtime.status": state.get("status"),
+            "runtime.model_backend": state.get("model_backend"),
+            "runtime.runner_id": state.get("runner_id"),
+            "runtime.lease_active": state.get("expires_at", 0) > time.time(),
+            "runtime.runner_online": None,
+        }
+    )
+    launch_path = output / "launch-observations.json"
+    if launch_path.exists():
+        launch = json.loads(launch_path.read_text())
+        facts.update(
+            {
+                "runtime.launch_commit": launch.get("commit"),
+                "runtime.launch_dirty": launch.get("dirty"),
+                "runtime.launch_captured_at": launch.get("captured_at"),
+            }
+        )
+    if host_id:
+        facts.update({"host.id": host_id, "host.registered": None, "host.online": None})
+    if state.get("status") != "ready" or not facts["runtime.lease_active"]:
+        return facts, [
+            "Prepared runtime is stopped, expired, or starting; inspect its diagnostics."
         ]
     try:
-        observed["openai-agents.version"] = importlib.metadata.version("openai-agents")
-    except importlib.metadata.PackageNotFoundError:
-        observed["openai-agents.version"] = None
-    return {"captured_at": time.time(), "observed": observed}
-
-
-def compare_requirements(observed: dict, requirements: list[dict]) -> list[dict]:
-    """Exact comparisons only; unknown or unsupported fields never become matches."""
-    comparisons = []
-    if not isinstance(requirements, list):
-        raise ValueError("requirements must be a list of {field, expected, source} objects")
-    for requirement in requirements:
-        if (
-            not isinstance(requirement, dict)
-            or set(requirement) != {"field", "expected", "source"}
-            or not isinstance(requirement["field"], str)
-            or not requirement["field"].strip()
-            or not isinstance(requirement["source"], str)
-            or not requirement["source"].strip()
-            or requirement["expected"] is None
+        with (
+            Relay(unix_target=output / "server.sock") as server,
+            httpx.Client(trust_env=False, timeout=5) as client,
         ):
-            raise ValueError("each requirement needs field, non-null expected, and source")
-        actual = observed.get(requirement["field"])
-        status = "unknown" if actual is None else "mismatch"
-        if actual is not None and type(actual) is type(requirement["expected"]):
-            if actual == requirement["expected"]:
-                status = "match"
-        comparisons.append({**requirement, "actual": actual, "status": status})
-    return comparisons
-
-
-def inspect_environment(output: Path, harness: str, requirements: list[dict]) -> dict:
-    state = json.loads((output / "environment.json").read_text())
-    manifest_path = output / "launch-observations.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    observed = manifest.get("observed", {})
-    checks = {
-        "supervisor_ready": state.get("status") == "ready",
-        "lease_active": state.get("expires_at", 0) > time.time(),
-        "harness_installed_at_launch": bool(observed.get(f"{harness}.version")),
-        "machine_policy_absent": harness == "openai-agents"
-        or observed.get(f"{harness}.machine_policy_files") == [],
-        "runner_online": False,
-        "model_reachable": False,
-    }
-    errors = []
-    if not checks["machine_policy_absent"]:
-        errors.append(
-            "Machine CLI policy is present or unobserved; isolated CLI homes do not prove "
-            "mock routing. Use the configured CI runtime for validation; do not override policy."
-        )
-    if checks["supervisor_ready"] and checks["lease_active"]:
-        try:
-            with (
-                Relay(unix_target=output / "server.sock") as server,
-                Relay(unix_target=output / "model.sock") as model,
-                httpx.Client(trust_env=False, timeout=5) as client,
-            ):
-                runner = client.get(
-                    f"http://127.0.0.1:{server.port}/v1/runners/{state['runner_id']}/status"
-                )
-                runner.raise_for_status()
-                checks["runner_online"] = runner.json().get("online") is True
-                response = client.get(f"http://127.0.0.1:{model.port}/stats")
+            base = f"http://127.0.0.1:{server.port}"
+            response = client.get(f"{base}/v1/runners/{state['runner_id']}/status")
+            response.raise_for_status()
+            facts["runtime.runner_online"] = response.json().get("online")
+            if host_id:
+                response = client.get(f"{base}/v1/hosts")
                 response.raise_for_status()
-                checks["model_reachable"] = True
-        except (OSError, httpx.HTTPError, ValueError, KeyError) as exc:
-            errors.append(f"{type(exc).__name__}: {exc}")
-    comparisons = compare_requirements(observed, requirements)
-    return {
-        "schema_version": 1,
-        "checked_at": time.time(),
-        "launch_captured_at": manifest.get("captured_at"),
-        "recipe": harness,
-        "runner_id": state.get("runner_id"),
-        "observed_at_launch": observed,
-        "live_checks": checks,
-        "ready_for_smoke": all(checks.values()),
-        "requirements": comparisons,
-        "requirements_status": (
-            "not_assessed"
-            if not comparisons
+                host = next((h for h in response.json()["hosts"] if h["host_id"] == host_id), None)
+                facts["host.registered"] = host is not None
+                facts["host.online"] = (
+                    False
+                    if host is None
+                    else None
+                    if host.get("status") is None
+                    else host["status"] == "online"
+                )
+    except (OSError, httpx.HTTPError, ValueError, KeyError) as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+    return facts, errors
+
+
+def compare(requirements: list[dict], checks: list[tuple], facts: dict) -> list[dict]:
+    results = {r["id"]: {"requirement": r, "comparisons": []} for r in requirements}
+    for requirement_id, field, expected in checks:
+        if requirement_id not in results:
+            raise ValueError(
+                f"Check {requirement_id!r} must name an environment/setup requirement"
+            )
+        if expected is None:
+            raise ValueError(
+                "Expected values cannot be null; leave unknown requirements unchecked"
+            )
+        actual = facts.get(field)
+        status = "unknown" if actual is None else "mismatch"
+        if type(actual) is type(expected) and actual == expected:
+            status = "match"
+        results[requirement_id]["comparisons"].append(
+            {
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+                "status": status,
+            }
+        )
+    for result in results.values():
+        statuses = [c["status"] for c in result["comparisons"]]
+        result["status"] = (
+            "unchecked"
+            if not statuses
             else "mismatch"
-            if any(c["status"] == "mismatch" for c in comparisons)
+            if "mismatch" in statuses
             else "unknown"
-            if any(c["status"] == "unknown" for c in comparisons)
-            else "match"
-        ),
+            if "unknown" in statuses
+            else "checks_match"
+        )
+    return list(results.values())
+
+
+def doctor(output: Path, plan_path: Path, checks: list[list[str]], host_id: str | None) -> Path:
+    raw = plan_path.read_bytes()
+    plan = json.loads(raw)
+    requirements = plan["requirements"]
+    selected = [r for r in requirements if r["phase"] in ("environment", "setup")]
+    ids = [r["id"] for r in selected]
+    if not selected or len(ids) != len(set(ids)):
+        raise ValueError("Plan needs environment/setup requirements with unique IDs")
+    parsed_checks = [(req, field, json.loads(expected)) for req, field, expected in checks]
+    compare(selected, parsed_checks, {})
+    facts, errors = observe(output, host_id)
+    report = {
+        "schema_version": 1,
+        "captured_at": time.time(),
+        "run_id": plan["run_id"],
+        "snapshot_sha256": plan["snapshot_sha256"],
+        "plan_file_sha256": hashlib.sha256(raw).hexdigest(),
+        "facts": facts,
+        "requirements": compare(selected, parsed_checks, facts),
         "errors": errors,
         "limitations": [
-            "Readiness does not prove a real turn, journey fidelity, or a reported bug.",
-            "Launch metadata is a snapshot; changed files or binaries require a fresh runtime.",
-            "CLI versions are installed prerequisites, not evidence of a session's process.",
-            "UI asset hash does not establish which commit built the SPA.",
-            "Diff hash covers tracked changes only; untracked code is not identified by it.",
-            "Surface, session configuration, and starting state need journey-specific evidence.",
-            "Mock providers cannot verify live-provider behavior.",
-            "model_backend describes the prepared service; session routing is unverified.",
-            "Requirements are caller-supplied; completeness needs independent review.",
+            "checks_match covers only the agent-selected comparisons, not the whole requirement.",
+            "Shell tools/OS describe this invocation's sandbox, not a tested product session.",
+            "Runtime backend is configured state; session routing still needs journey evidence.",
+            "Launch commit identifies the checkout, not SPA provenance or later file changes.",
+            "Unknown facts and unchecked requirements need investigation.",
+            "Missing tools: install/configure through existing setup and recheck.",
+            "This report neither gates execution nor verifies the report interpretation or bug.",
         ],
     }
-
-
-def doctor(output: Path, harness: str, requirements: list[dict], destination: Path) -> int:
-    report = inspect_environment(output, harness, requirements)
+    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = output / f"environment-check-{time.time_ns()}.json"
     write_json(destination, report)
     print(json.dumps(report, indent=2), flush=True)
-    return (
-        0
-        if report["ready_for_smoke"] and report["requirements_status"] in ("match", "not_assessed")
-        else 1
-    )
+    print(f"Saved environment observations: {destination}", flush=True)
+    return destination

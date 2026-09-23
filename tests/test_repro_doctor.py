@@ -1,5 +1,6 @@
-"""Environment fidelity must not be inferred from a connected mock runtime."""
+"""Check reported prerequisites without turning connectivity into a bug verdict."""
 
+import hashlib
 import json
 import subprocess
 import time
@@ -10,223 +11,214 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
-from dev.repro_env import doctor, evidence
-from dev.repro_env.__main__ import smoke
+from dev.repro_env import doctor
 from dev.repro_env.runtime import write_json
 
 
+def requirement(req_id="environment-1", phase="environment"):
+    return {
+        "id": req_id,
+        "phase": phase,
+        "description": "Reported environment requirement",
+        "source_ids": ["report-1"],
+        "certainty": "reported",
+        "uncertainty": "",
+        "method": "Use the existing product entry point",
+        "substitution": None,
+    }
+
+
+def plan_file(tmp_path):
+    plan = {
+        "schema_version": 1,
+        "run_id": "run-1",
+        "snapshot_sha256": "snapshot",
+        "requirements": [
+            requirement(),
+            requirement("setup-1", "setup"),
+            requirement("trigger-1", "trigger"),
+            requirement("observe-1", "observation"),
+        ],
+    }
+    path = tmp_path / "plan.json"
+    write_json(path, plan)
+    return path
+
+
 @pytest.mark.parametrize(
-    "observed,expected,status",
+    "actual,expected,status",
     [
-        ("Linux", "Linux", "match"),
         ("Linux", "Darwin", "mismatch"),
+        ("Linux", "Linux", "checks_match"),
         (None, "Linux", "unknown"),
-        (False, False, "match"),
         (False, 0, "mismatch"),
+        (False, False, "checks_match"),
     ],
 )
-def test_exact_requirement_comparison(observed, expected, status):
-    result = doctor.compare_requirements(
-        {"field": observed}, [{"field": "field", "expected": expected, "source": "report"}]
+def test_exact_selected_comparisons(actual, expected, status):
+    result = doctor.compare(
+        [requirement()], [("environment-1", "shell.os", expected)], {"shell.os": actual}
     )
     assert result[0]["status"] == status
-    assert result[0]["actual"] == observed
+    assert result[0]["requirement"]["source_ids"] == ["report-1"]
 
 
-def test_unsupported_requirement_is_unknown():
-    assert (
-        doctor.compare_requirements(
-            {}, [{"field": "mobile.keyboard", "expected": "iOS", "source": "comment"}]
-        )[0]["status"]
-        == "unknown"
+def test_unchecked_and_unsupported_requirements_remain_visible():
+    result = doctor.compare(
+        [requirement(), requirement("setup-1", "setup")],
+        [("environment-1", "session.policy", "inherited")],
+        {},
     )
+    assert [r["status"] for r in result] == ["unknown", "unchecked"]
 
 
 @pytest.mark.parametrize(
-    "requirements",
+    "check",
     [
-        {},
-        ["Linux"],
-        [{"field": "os.system", "expected": "Linux"}],
-        [{"field": "os.system", "expected": None, "source": "report"}],
-        [{"field": "os.system", "expected": "Linux", "source": " "}],
+        ("invented", "shell.os", "Linux"),
+        ("environment-1", "shell.os", None),
     ],
 )
-def test_invalid_requirements_fail_explicitly(requirements):
+def test_invalid_comparison_cannot_claim_coverage(check):
     with pytest.raises(ValueError):
-        doctor.compare_requirements({}, requirements)
+        doctor.compare([requirement()], [check], {})
 
 
-def _runtime(tmp_path, monkeypatch, *, online=True, expired=False):
+def test_plan_identity_and_history_survive_preparation(tmp_path, monkeypatch):
+    plan = plan_file(tmp_path)
+    observed = {"shell.claude.installed": False}
+    monkeypatch.setattr(doctor, "observe", lambda *_: (dict(observed), []))
+    output = tmp_path / "environment"
+    checks = [["environment-1", "shell.claude.installed", "true"]]
+    before = doctor.doctor(output, plan, checks, None)
+    observed["shell.claude.installed"] = True
+    after = doctor.doctor(output, plan, checks, None)
+    assert before != after
+    first, second = [json.loads(p.read_text()) for p in (before, after)]
+    assert first["requirements"][0]["status"] == "mismatch"
+    assert second["requirements"][0]["status"] == "checks_match"
+    assert second["requirements"][1]["status"] == "unchecked"
+    assert second["run_id"] == "run-1"
+    assert second["snapshot_sha256"] == "snapshot"
+    assert second["plan_file_sha256"] == hashlib.sha256(plan.read_bytes()).hexdigest()
+    assert len(second["requirements"]) == 2
+    assert "ready_for_smoke" not in second
+    assert json.loads(plan.read_text())["requirements"][0] == requirement()
+
+
+def test_trigger_cannot_be_passed_off_as_environment_check(tmp_path, monkeypatch):
+    observe = Mock(side_effect=AssertionError("must validate before observing"))
+    monkeypatch.setattr(doctor, "observe", observe)
+    with pytest.raises(ValueError, match="environment/setup"):
+        doctor.doctor(tmp_path, plan_file(tmp_path), [["trigger-1", "shell.os", '"Linux"']], None)
+    observe.assert_not_called()
+
+
+def test_duplicate_requirement_ids_rejected(tmp_path):
+    path = plan_file(tmp_path)
+    plan = json.loads(path.read_text())
+    plan["requirements"].append(requirement())
+    write_json(path, plan)
+    with pytest.raises(ValueError, match="unique IDs"):
+        doctor.doctor(tmp_path, path, [], None)
+
+
+def test_tool_availability_is_refreshed_after_install(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(doctor, "_command", lambda *_: "fixture-cli version")
+    before, _ = doctor.observe(tmp_path / "runtime", None)
+    assert before["shell.claude.installed"] is False
+    binary = tmp_path / "claude"
+    binary.write_text("test fixture")
+    binary.chmod(0o700)
+    after, _ = doctor.observe(tmp_path / "runtime", None)
+    assert after["shell.claude.installed"] is True
+    assert after["shell.claude.version"] == "fixture-cli version"
+    assert after["shell.codex.installed"] is False
+    result = doctor.compare(
+        [requirement()], [("environment-1", "shell.claude.installed", True)], after
+    )
+    assert result[0]["status"] == "checks_match"
+
+
+def mock_runtime(tmp_path, monkeypatch, hosts):
     write_json(
         tmp_path / "environment.json",
         {
             "status": "ready",
+            "expires_at": time.time() + 60,
             "runner_id": "runner",
-            "expires_at": time.time() + (-1 if expired else 60),
+            "model_backend": "mock",
         },
     )
-    write_json(
-        tmp_path / "launch-observations.json",
-        {
-            "captured_at": 100,
-            "observed": {
-                "claude-native.version": "test-cli",
-                "claude-native.machine_policy_files": [],
-                "model_backend": "mock",
-            },
-        },
-    )
+    monkeypatch.setattr(doctor, "_command", lambda *_: None)
     monkeypatch.setattr(doctor, "Relay", lambda **kwargs: nullcontext(SimpleNamespace(port=1234)))
-    client = Mock()
-    client.get.return_value = httpx.Response(
-        200, json={"online": online}, request=httpx.Request("GET", "http://localhost")
-    )
-    monkeypatch.setattr(doctor.httpx, "Client", lambda **kwargs: nullcontext(client))
-    return client
+    paths = []
+
+    def respond(request):
+        paths.append(request.url.path)
+        body = {"hosts": hosts} if request.url.path == "/v1/hosts" else {"online": True}
+        return httpx.Response(200, json=body)
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(doctor.httpx, "Client", lambda **kwargs: client)
+    return paths
 
 
-def test_connected_runtime_does_not_imply_reported_environment(tmp_path, monkeypatch):
-    _runtime(tmp_path, monkeypatch)
-    requirements = [{"field": "model_backend", "expected": "live", "source": "report"}]
-    path = tmp_path / "doctor.json"
-    assert doctor.doctor(tmp_path, "claude-native", requirements, path) == 1
-    report = json.loads(path.read_text())
-    assert report["ready_for_smoke"]
-    assert report["requirements_status"] == "mismatch"
+def test_online_runner_and_unrelated_host_do_not_satisfy_required_host(tmp_path, monkeypatch):
+    mock_runtime(tmp_path, monkeypatch, [{"host_id": "unrelated", "status": "online"}])
+    facts, errors = doctor.observe(tmp_path, "reported-host")
+    assert not errors
+    assert facts["runtime.runner_online"] is True
+    assert facts["host.id"] == "reported-host"
+    assert facts["host.registered"] is False
+    assert facts["host.online"] is False
 
 
-def test_missing_manifest_cannot_use_callers_cli_version(tmp_path, monkeypatch):
-    _runtime(tmp_path, monkeypatch)
-    (tmp_path / "launch-observations.json").unlink()
-    monkeypatch.setattr(doctor, "launch_observations", Mock(side_effect=AssertionError))
-    report = doctor.inspect_environment(tmp_path, "claude-native", [])
-    assert not report["ready_for_smoke"]
-    assert report["requirements_status"] == "not_assessed"
-    assert report["observed_at_launch"] == {}
+@pytest.mark.parametrize("status,online", [("online", True), ("offline", False)])
+def test_observes_selected_hosts_actual_state(tmp_path, monkeypatch, status, online):
+    mock_runtime(tmp_path, monkeypatch, [{"host_id": "selected", "status": status}])
+    facts, errors = doctor.observe(tmp_path, "selected")
+    assert not errors
+    assert facts["host.registered"] is True
+    assert facts["host.online"] is online
 
 
-@pytest.mark.parametrize("expired,online", [(True, True), (False, False)])
-def test_ready_file_alone_is_not_readiness(tmp_path, monkeypatch, expired, online):
-    client = _runtime(tmp_path, monkeypatch, expired=expired, online=online)
-    report = doctor.inspect_environment(tmp_path, "claude-native", [])
-    assert not report["ready_for_smoke"]
-    if expired:
-        client.get.assert_not_called()
+def test_no_host_requirement_does_not_impose_host_setup(tmp_path, monkeypatch):
+    paths = mock_runtime(tmp_path, monkeypatch, [])
+    facts, _ = doctor.observe(tmp_path, None)
+    assert "host.online" not in facts
+    assert paths == ["/v1/runners/runner/status"]
 
 
-def test_connection_failure_is_preserved(tmp_path, monkeypatch):
-    client = _runtime(tmp_path, monkeypatch)
-    client.get.side_effect = httpx.ConnectError("runner unavailable")
-    report = doctor.inspect_environment(tmp_path, "claude-native", [])
-    assert not report["ready_for_smoke"]
-    assert report["errors"] == ["ConnectError: runner unavailable"]
+def test_missing_host_status_stays_unknown(tmp_path, monkeypatch):
+    mock_runtime(tmp_path, monkeypatch, [{"host_id": "selected"}])
+    facts, errors = doctor.observe(tmp_path, "selected")
+    assert not errors
+    assert facts["host.registered"] is True
+    assert facts["host.online"] is None
 
 
-def test_machine_policy_blocks_native_mock_recipe(tmp_path, monkeypatch):
-    _runtime(tmp_path, monkeypatch)
-    manifest = tmp_path / "launch-observations.json"
-    data = json.loads(manifest.read_text())
-    data["observed"]["claude-native.machine_policy_files"] = ["/etc/managed-settings.json"]
-    write_json(manifest, data)
-    report = doctor.inspect_environment(tmp_path, "claude-native", [])
-    assert report["live_checks"]["runner_online"]
-    assert not report["ready_for_smoke"]
-    assert "Machine CLI policy" in report["errors"][0]
+def test_failed_observation_stays_unknown(tmp_path, monkeypatch):
+    mock_runtime(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(doctor, "Relay", Mock(side_effect=OSError("socket unavailable")))
+    facts, errors = doctor.observe(tmp_path, "selected")
+    assert facts["host.online"] is None
+    assert facts["runtime.runner_online"] is None
+    assert errors == ["OSError: socket unavailable"]
 
 
-def test_launch_records_policy_presence_without_copying_contents(tmp_path, monkeypatch):
-    policy = tmp_path / "managed.json"
-    policy.write_text('{"private": "not-for-evidence"}')
+def test_missing_runtime_is_preparation_work(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "_command", lambda *_: None)
+    facts, errors = doctor.observe(tmp_path, None)
+    assert facts["runtime.status"] == "not_provisioned"
+    assert "existing workflow provisioning" in errors[0]
+
+
+def test_unavailable_launch_identity_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        doctor,
-        "_MACHINE_POLICIES",
-        {"claude-native": (policy,), "codex-native": (tmp_path / "missing",)},
+        doctor.subprocess, "run", Mock(side_effect=subprocess.TimeoutExpired("git", 5))
     )
-    monkeypatch.setattr(doctor, "_command", lambda *args: None)
-    observed = doctor.launch_observations(tmp_path)["observed"]
-    assert observed["claude-native.machine_policy_files"] == [str(policy)]
-    assert observed["codex-native.machine_policy_files"] == []
-    assert "not-for-evidence" not in json.dumps(observed)
-
-
-def test_failed_version_probe_is_unknown(tmp_path, monkeypatch):
-    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/bin/{name}")
-    monkeypatch.setattr(
-        doctor.subprocess, "run", Mock(side_effect=subprocess.TimeoutExpired("version", 5))
-    )
-    observed = doctor.launch_observations(tmp_path)["observed"]
-    assert observed["claude-native.version"] is None
-    assert observed["build.commit"] is None
-    assert observed["build.dirty"] is None
-    assert observed["session.harness"] is None
-
-
-def test_smoke_does_not_launch_after_failed_doctor(tmp_path, monkeypatch):
-    monkeypatch.setattr(doctor, "doctor", lambda *args: 1)
-    execute = Mock(side_effect=AssertionError("must not execute"))
-    monkeypatch.setattr("dev.repro_env.__main__.execute", execute)
-    assert smoke(tmp_path, "claude-native") == 1
-    execute.assert_not_called()
-
-
-def test_failed_journey_captures_before_fixture_teardown(tmp_path, monkeypatch):
-    monkeypatch.setenv("OMNIGENT_REPRO_MODEL_URL", "http://model")
-    client = Mock()
-    client.get.return_value = httpx.Response(
-        200, json={"items": ["observed"]}, request=httpx.Request("GET", "http://session")
-    )
-    monkeypatch.setattr(evidence.httpx, "Client", lambda **kwargs: nullcontext(client))
-    report = SimpleNamespace(
-        when="call", outcome="failed", duration=1, longrepr="assertion failed", sections=[]
-    )
-    item = SimpleNamespace(
-        nodeid="test_smoke",
-        config=SimpleNamespace(getoption=lambda name: tmp_path),
-        funcargs={"native_codex_mock_session": ("http://server", "session")},
-    )
-    hook = evidence.pytest_runtest_makereport(item)
-    next(hook)
-    with pytest.raises(StopIteration):
-        hook.send(SimpleNamespace(get_result=lambda: report))
-    assert json.loads((tmp_path / "call.json").read_text())["outcome"] == "failed"
-    assert json.loads((tmp_path / "session.json").read_text())["session_id"] == "session"
-    assert json.loads((tmp_path / "items.json").read_text())["data"] == {"items": ["observed"]}
-    assert client.get.call_args_list[0].args == ("http://server/v1/sessions/session/items",)
-
-
-@pytest.mark.parametrize("outcome", [None, "skipped", "passed"])
-def test_missing_or_skipped_evidence_never_passes(tmp_path, outcome):
-    if outcome:
-        write_json(tmp_path / "call.json", {"outcome": outcome})
-    session = SimpleNamespace(
-        config=SimpleNamespace(getoption=lambda name: tmp_path), exitstatus=0
-    )
-    evidence.pytest_sessionfinish(session, 0)
-    assert session.exitstatus == 1
-
-
-def test_complete_smoke_evidence_can_pass(tmp_path):
-    write_json(tmp_path / "call.json", {"outcome": "passed"})
-    write_json(tmp_path / "items.json", {"data": {"data": [{"role": "assistant"}]}})
-    write_json(tmp_path / "model-requests.json", {"data": {"requests": [{"model": "mock"}]}})
-    session = SimpleNamespace(
-        config=SimpleNamespace(getoption=lambda name: tmp_path), exitstatus=0
-    )
-    evidence.pytest_sessionfinish(session, 0)
-    assert session.exitstatus == 0
-    assert json.loads((tmp_path / "result.json").read_text())["status"] == "passed"
-
-
-def test_empty_captures_fail_a_passing_assertion(tmp_path):
-    write_json(tmp_path / "call.json", {"outcome": "passed"})
-    write_json(tmp_path / "items.json", {"data": {"data": []}})
-    write_json(tmp_path / "model-requests.json", {"data": {"requests": []}})
-    session = SimpleNamespace(
-        config=SimpleNamespace(getoption=lambda name: tmp_path), exitstatus=0
-    )
-    evidence.pytest_sessionfinish(session, 0)
-    assert session.exitstatus == 1
-    result = json.loads((tmp_path / "result.json").read_text())
-    assert result["status"] == "failed"
-    assert len(result["evidence_failures"]) == 2
+    result = doctor.launch_observations(tmp_path)
+    assert result["commit"] is None
+    assert result["dirty"] is None

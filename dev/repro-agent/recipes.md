@@ -1,125 +1,94 @@
-# Prepared-runtime driving recipes
+# Prepare the environment required by the report
 
-These are opt-in tools for checking a driving path. They do not reproduce a
-ticket by themselves or change the workflow's feature flags. Use the ticket's
-actual actions, surface, state, and timing for the reproduction test.
+Use the existing reproduction plan's environment/setup requirements. The workflow
+already installs standard dependencies and provisions the persistent server,
+runner, real native CLIs, and mock model described in
+[repro_env](../repro_env/README.md). Prepare only what this journey additionally
+needs; a generic successful conversation is not a prerequisite for reproduction.
 
-## Launch
+1. **Inspect.** Read `.omnigent/ci-worktree-bootstrap.json` when present and the
+   prepared runtime's `environment.json`. For each environment/setup requirement,
+   compare its reported value, source, and proposed method with what is available.
+   A runner being online does not establish that the journey's host is connected.
+2. **Prepare.** After the coordinated plan is accepted, install missing packages
+   or CLIs through the existing launcher/environment setup instructions. CI's
+   package instructions take precedence over `dev/agent-environment.md`. Reuse
+   provisioned dependencies, configure the required provider/host/session, and
+   record commands and results. For a missing host, follow the existing
+   `omnigent host --server <nested server URL>` path and check the actual host
+   used by the journey. Respect the workflow's persistent-sandbox lifecycle;
+   backgrounding a process in one agent shell does not keep it alive.
+3. **Recheck.** Retry the failed prerequisite check after preparation. Preserve
+   both observations. Missing tools alone are not an unavailable environment;
+   an attempted install or configuration failure needs its concrete diagnostic.
+   If a required platform/provider cannot be supplied, disclose the difference
+   and its impact through the existing plan revision/account. Never replace the
+   requirement with an easier one just to pass a check.
+4. **Drive.** Use the existing fixture/driver to perform the reported actions,
+   capturing the trigger and outcome. Preserve reported bad state: offline hosts,
+   missing dependencies, expired credentials, or setup failures may themselves be
+   the bug. Their setup/installation action then belongs in the recorded journey.
 
-Use the workflow-owned runtime described in [repro_env](../repro_env/README.md).
-Do not launch a second server inside a workflow attempt. For isolated local
-development, build the SPA, then run `python -m dev.repro_env serve` in a
-persistent terminal; use another terminal in the same checkout for commands
-below. Native recipes need the real `claude` / `codex` binaries; OpenAI Agents
-needs the `openai-agents` Python package. All need pytest-playwright and Chromium.
-No live-provider credentials are needed: these recipes are intended for mock
-model responses. Machine-managed CLI policy can override that routing, even
-with an isolated CLI home. Doctor blocks native smoke runs when known machine
-policy files are present (or their absence was not recorded); validate in the
-configured CI runtime instead of overriding company policy.
+## Observe against the plan
 
-## Doctor
-
-```sh
-python -m dev.repro_env doctor --harness claude-native
-```
-
-Select `claude-native`, `codex-native`, or `openai-agents`. Doctor saves a unique
-`doctor-*.json` in `.omnigent/repro-env/` and prints it. It checks the runner and
-model connection live and reads launch-time observations from the supervisor's
-own environment: checkout revision/dirty state, SPA index hash, OS, Python,
-CLI/SDK versions, and the prepared runtime's configuration. A missing version
-blocks the smoke check. An older runtime without launch observations must be
-restarted in a fresh output directory; Doctor does not guess from the caller's
-machine. Restart after changing source or binaries.
-
-To compare material requirements from the report, supply a JSON file:
-
-```json
-[
-  {"field": "os.system", "expected": "Darwin", "source": "Reporter: macOS"},
-  {"field": "model_backend", "expected": "live", "source": "Reporter: live provider"}
-]
-```
+Run Doctor in the same agent execution sandbox used for preparation, using the
+existing `.omnigent/reproduction-plan.json`; no second requirements file is needed.
+Checks refer to its requirement IDs. For example, if `environment-1` requires
+Claude and `setup-1` requires the selected host online:
 
 ```sh
-python -m dev.repro_env doctor --harness codex-native --requirements requirements.json
+python -m dev.repro_env doctor --plan .omnigent/reproduction-plan.json \
+  --host '<actual-host-id>' \
+  --check environment-1 shell.claude.installed true \
+  --check setup-1 host.online true
 ```
 
-This example flags the Linux/mock substitutions. Comparisons are exact and
-type-sensitive; unsupported fields and missing observations are `unknown`.
-Unknowns and mismatches return a nonzero exit code. Without requirements the
-result is `not_assessed`, even if connectivity passes. Record each mismatch or
-unknown in the reproduction plan, with its impact on the reported trigger.
-Do not quietly change the expected value to get a pass.
+Replace the IDs and expectations with the actual report. Omit `--host` for a
+journey without a host requirement. Expected values are JSON; for a reported OS,
+use e.g. `--check environment-1 shell.os '"Darwin"'`. A version is compared exactly,
+not as a version range. An offline-host journey may correctly expect `false`.
 
-Doctor does not inspect a future session: its surface, model selection, policies,
-history, and starting state remain unknown. Confirm those in the ticket-specific
-journey. The UI hash identifies an asset, not the source commit that built it.
-`model_backend` describes the prepared mock service, not proven session routing.
-The supplied requirements still need review for completeness and relevance.
+The command writes a new `environment-check-*.json` on every invocation under the
+repro-env directory, which existing cleanup/bundling preserves. It retains the
+plan's run/snapshot identity, a hash of the exact plan file, every environment/setup
+requirement and its source IDs, selected comparisons, and observation errors.
+The file hash is not the coordinator's accepted-plan hash and does not register a
+plan. The command never executes the plan's method text or installs software.
 
-## Drive
+| Facts | What they establish |
+| --- | --- |
+| `shell.os`, `shell.arch` | This shell's platform, not a remote device or browser surface. |
+| `shell.claude.installed/version`, `shell.codex.installed/version`, `shell.openai-agents.installed/version` | Current tool availability in this sandbox. Refreshed after installation; not proof of a session's process. |
+| `runtime.launch_commit`, `runtime.launch_dirty` | Checkout recorded at supervisor startup. Older runtimes may lack it; SPA provenance and later changes remain unverified. |
+| `runtime.status`, `runtime.lease_active`, `runtime.runner_online` | Saved lifecycle state plus a live query of the prepared runner. |
+| `runtime.model_backend` | Configured backend, not proof of effective session routing or live-provider fidelity. |
+| `host.id`, `host.registered`, `host.online` | Live state for the exact requested host; an unrelated online host cannot satisfy this check. |
 
-Run one recipe at a time; they share mock state:
+Missing observations are `unknown`; requirements without checks stay `unchecked`.
+`checks_match` means only the selected facts matched. The agent still needs to
+inspect session configuration, policies, surface, and starting state through the
+product and cite the results in its account. Unsupported facts stay unknown.
+Choosing the right checks and interpreting material differences require review.
+Exit zero means the report was written, **not** that reproduction may be declared.
+Managed configuration-file presence alone does not block execution; investigate
+actual routing/configuration conflicts in the supported sandbox.
 
-```sh
-python -m dev.repro_env smoke --harness claude-native
-python -m dev.repro_env smoke --harness codex-native
-python -m dev.repro_env smoke --harness openai-agents
-```
+## Reuse the existing driving paths
 
-Each command runs Doctor, then an existing browser test against the prepared
-runtime. It fails if prerequisites are missing, the test skips or fails, or
-required evidence cannot be saved. A passed test checks a benign interaction
-with controlled replies. It says nothing about whether a reported bug exists.
+| Reported path | Existing starting point | Boundary to preserve |
+| --- | --- | --- |
+| Claude-native chat/terminal | `native_claude_mock_session`; `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Claude CLI; drive the reported composer or terminal action. A synthetic hook is not native tool execution. |
+| Codex-native chat/terminal | `native_codex_mock_session`; `tests/e2e_ui/messages/test_native_codex_render_parity.py` | Real Codex CLI; native slash commands must be typed into the terminal. An SDK call does not exercise that path. |
+| OpenAI Agents web journey | `custom_agent_session`; `tests/e2e_ui/messages/test_message_render_parity.py` | Real web composer and executor; a direct Python helper bypasses the user journey. |
 
-| Recipe | Session setup and user entry points | Existing driver | Incorrect substitute |
-| --- | --- | --- | --- |
-| Claude-native | Product session API creates the native wrapper session; runner starts real Claude Code. Two web composer turns, then input typed into the connected terminal. | `tests/e2e_ui/messages/test_native_claude_render_parity.py` / `native_claude_mock_session` | Calling a Python callback, inserting transcript items, or drawing fake terminal output does not drive Claude Code. |
-| Codex-native | Product session API creates the native wrapper session with its workspace; runner starts real Codex. Two web composer turns, then real terminal input. | `tests/e2e_ui/messages/test_native_codex_render_parity.py` / `native_codex_mock_session` | An SDK-only turn does not exercise the native bridge. An HTTP request cannot stand in for a reported terminal shortcut or slash command. |
-| OpenAI Agents | Product session API creates a custom agent using the OpenAI Agents executor. Five real web composer turns. | `tests/e2e_ui/messages/test_message_render_parity.py::test_custom_agent_message_render_parity` / `custom_agent_session` | A direct executor/function call bypasses the web/runner journey. This recipe has no native vendor TUI. |
+Adapt the relevant driver to the ticket; these existing tests are references,
+not required smoke stages. Fixtures create sessions through the product API as
+setup, which does not exercise a reported session-creation/onboarding trigger.
+Mocks cannot establish live-provider behavior. A browser response interception
+must be disclosed; it does not prove a connected host supplied the data.
 
-All three check unique user/reply markers in the visible UI and canonical
-transcript. Those are related views of the same interaction, not independent
-proof of the ticket's failure. Mock requests give additional execution context.
-These recipes cover an existing session; API-created session setup does **not**
-test CLI onboarding, session creation UI, authentication, or reconnect history.
-
-For the real reproduction, reuse the appropriate fixture in an authored test,
-replace the benign actions with the reported journey, and assert the specific
-symptom. Preserve setup/trigger/observation separately. Start recording before
-the trigger; a negative observation needs a confirmed trigger and a justified
-waiting interval. Browser route interception, mock approvals, injected product
-events, or a different harness must be disclosed as substitutions; they cannot
-silently replace the native action. A mock provider is unsuitable for claims
-about actual model/provider behavior.
-
-## Evidence
-
-Every smoke command prints its unique directory under
-`.omnigent/repro-env/smoke/`. It contains Doctor, pytest setup/call/teardown
-outcomes, the session ID, transcript items and captured model requests, plus
-Playwright video and trace. The opt-in pytest capture runs before session fixture
-cleanup, including when the test assertion fails. A setup failure can have no
-session evidence; it must remain a failed check. Skips never count as success.
-`result.json` records the final exit status; a missing or empty transcript/model
-capture fails the command even if pytest's interaction assertion passed.
-Model requests cover only the period since the driver's last mock reset; some
-existing drivers reset between turns. This is not a complete per-turn request log.
-The files are local diagnostics and may contain prompt or workspace content;
-review them before publishing.
-
-For an authored journey, save its session/transcript and model requests before
-deleting the session or resetting the mock, and close the browser context in
-`finally`. Automatic evidence collection for arbitrary journeys is separate
-work; the small smoke capture plugin only supports the three recipes above.
-
-## Cleanup
-
-Pytest closes its browser and removes its temporary session; saved evidence
-survives. The workflow owns server/runner shutdown and bundles the repro-env
-directory. For a locally started runtime, run `python -m dev.repro_env stop` and
-wait for `serve` to exit. Shutdown also saves process logs, the database, and
-model requests since the last reset. Retain the attempt directory; a new `serve`
-needs a fresh `--output PATH`. Do not stop a shared workflow runtime yourself.
+Use `python -m dev.repro_env exec -- <authored journey command>`, preserve session
+IDs and evidence before mock resets/session deletion, and follow
+[recording-lanes](../recording-lanes.md). Keep failed/incomplete turns when they
+show the reported symptom. The existing workflow owns shutdown and bundling.
+Independent execution collection and claim verification remain separate work.
