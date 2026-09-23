@@ -2406,16 +2406,32 @@ def create_app(
                 "A backing service is at its concurrent request limit; retry shortly.",
                 code=ErrorCode.RESOURCE_EXHAUSTED,
             )
+            # Stamp the per-request audit row (as _handle_omnigent_error does
+            # for every coded error) so these 503s stay queryable by owner/impact.
+            add_audit_attrs(
+                code=str(mapped.code),
+                http_status=str(mapped.http_status),
+                error_category=mapped.category.value,
+                error_impact=mapped.impact.value,
+                error_phase=mapped.phase.value,
+            )
             _logger.warning(
                 "Upstream resource exhausted: %s",
                 exc,
+                exc_info=exc,
                 extra=_error_audit_extra(
                     request,
                     phase="resource_exhausted",
                     code=str(mapped.code),
                     http_status=str(mapped.http_status),
+                    error_category=mapped.category.value,
+                    error_impact=mapped.impact.value,
+                    error_phase=mapped.phase.value,
+                    error_type=type(exc).__name__,
                 ),
             )
+            # Answered directly, not via _handle_omnigent_error: that handler
+            # books every 5xx on the ERROR stream and carries no Retry-After.
             return JSONResponse(
                 status_code=mapped.http_status,
                 headers={"Retry-After": str(_RESOURCE_EXHAUSTED_RETRY_AFTER_S)},

@@ -1,16 +1,17 @@
 """Store RESOURCE_EXHAUSTED must reach session clients as a retryable 503.
 
 Drive the real in-process route, snapshot builder and exception handler
-with an injected grpc.RpcError at the store boundary. This simulates WHS
-quota exhaustion; the internal encrypted store and live WHS are not
-available here. Keep the per-read permission check intact."""
+with a gRPC-shaped RESOURCE_EXHAUSTED error injected at the store boundary.
+This simulates WHS quota exhaustion; the internal encrypted store and live
+WHS are not available here. Keep the per-read permission check intact."""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+from types import SimpleNamespace
 
-import grpc
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -33,11 +34,15 @@ _WHS_LIMIT_MESSAGE = (
 )
 
 
-class _ResourceExhaustedRpcError(grpc.RpcError):
+class RpcError(Exception):
+    """Structural mirror of ``grpc.RpcError``; grpcio is not a test dependency."""
+
+
+class _ResourceExhaustedRpcError(RpcError):
     """Simulate WHS rejecting a request above its concurrency budget."""
 
-    def code(self) -> grpc.StatusCode:
-        return grpc.StatusCode.RESOURCE_EXHAUSTED
+    def code(self) -> SimpleNamespace:
+        return SimpleNamespace(name="RESOURCE_EXHAUSTED")
 
     def details(self) -> str:
         return _WHS_LIMIT_MESSAGE
@@ -71,6 +76,7 @@ async def test_resource_exhausted_fetch_is_retryable_not_unhandled_500(
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A burst of conversation fetches that exhaust the workspace budget must
     surface as retry-able 503s, never as unhandled 500 ``internal_error``.
@@ -79,13 +85,13 @@ async def test_resource_exhausted_fetch_is_retryable_not_unhandled_500(
     reaches ``_handle_unhandled_exception``, and every fetch returns a bare
     500 ``internal_error`` -- the user's session load / turn fails.
 
-    Post-fix: the transient exhaustion is retried and then mapped to a
-    retry-able 503, so it is handled (an ``OmnigentError``-shaped response),
-    not an unhandled 500.
+    Post-fix: the transient exhaustion is mapped to a retry-able 503, so it
+    is handled (an ``OmnigentError``-shaped response), not an unhandled 500.
 
     :param app: The in-process FastAPI app (real stores, real routes).
     :param db_uri: SQLite database URI shared with the app.
     :param monkeypatch: pytest attribute patcher (auto-reverted per test).
+    :param caplog: Captures the server's error-stream attribution.
     :returns: None.
     """
     session_id = _seed_session(db_uri)
@@ -109,9 +115,10 @@ async def test_resource_exhausted_fetch_is_retryable_not_unhandled_500(
     # by Starlette's ServerErrorMiddleware into the in-process test).
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        responses = await asyncio.gather(
-            *[client.get(f"/v1/sessions/{session_id}") for _ in range(_BURST)]
-        )
+        with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+            responses = await asyncio.gather(
+                *[client.get(f"/v1/sessions/{session_id}") for _ in range(_BURST)]
+            )
 
     # The burst actually reached the exhausted gate on every fetch (guards
     # against the test passing because the route short-circuited earlier).
@@ -128,7 +135,7 @@ async def test_resource_exhausted_fetch_is_retryable_not_unhandled_500(
         )
         assert not is_unhandled_500, (
             "WHS RESOURCE_EXHAUSTED escaped as an unhandled 500 "
-            "(_handle_unhandled_exception) instead of being retried / mapped "
+            "(_handle_unhandled_exception) instead of being mapped "
             f"to a retry-able 503. Response body: {resp.json()}"
         )
         # Fix target: a transient upstream-budget exhaustion is a retry-able
@@ -137,3 +144,15 @@ async def test_resource_exhausted_fetch_is_retryable_not_unhandled_500(
             "expected a retry-able 503 for a transient WHS RESOURCE_EXHAUSTED, "
             f"got HTTP {resp.status_code}: {resp.json()}"
         )
+
+    # KPI attribution: a transient upstream condition must not be booked on
+    # the ERROR stream (that inflates the mid-session error KPI).
+    error_records = [
+        record
+        for record in caplog.records
+        if record.name == "omnigent.server.app" and record.levelno >= logging.ERROR
+    ]
+    assert not error_records, (
+        "transient RESOURCE_EXHAUSTED was booked on the ERROR stream: "
+        f"{[record.getMessage()[:160] for record in error_records]}"
+    )
