@@ -479,6 +479,11 @@ omnigent login https://your-host    # sign in once; run / attach / host reuse th
 omnigent host  https://your-host    # new sessions can now run on this machine
 ```
 
+A running host restarts itself once a day at 4 AM in your timezone, but only
+when no session is running; if sessions are still busy at 8 AM it skips that
+day. To turn this off, add `daily_restart: false` under the `host:` section of
+`~/.omnigent/config.yaml`.
+
 > [!TIP]
 > On your own network you don't need a deploy. Open your machine's LAN
 > address on your phone (e.g. `http://192.168.x.x:6767`).

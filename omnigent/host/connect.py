@@ -21,6 +21,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
@@ -50,6 +51,13 @@ from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+from omnigent.host.daily_restart import (
+    DAILY_RESTART_MIN_UPTIME_S,
+    DAILY_RESTART_WINDOW_S,
+    daily_restart_enabled,
+    next_daily_restart,
+    resolve_user_timezone,
+)
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
@@ -403,6 +411,10 @@ try:
     _LIFECYCLE_POLL_INTERVAL_S = float(os.environ.get("OMNIGENT_HOST_LIFECYCLE_POLL_S", "60"))
 except ValueError:
     _LIFECYCLE_POLL_INTERVAL_S = 60.0
+# Chunked wall-clock sleep for the daily-restart wait: asyncio.sleep uses the
+# monotonic clock, which pauses during system suspend, so one long sleep
+# across a laptop nap would overshoot the target time.
+_DAILY_RESTART_POLL_S = 60.0
 # Keep first startup tolerant of a cold server, but do not spend the library's
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
@@ -1042,6 +1054,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        daily_restart: bool = False,
     ) -> None:
         """Initialize the host process.
 
@@ -1052,9 +1065,13 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param daily_restart: When ``True``, run the daily-restart loop (see
+            :meth:`_daily_restart_loop`). Off by default so constructing a
+            ``HostProcess`` never starts extra background work unless asked.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._started_at = time.time()
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
             if interactive_shells is not None
@@ -1205,6 +1222,12 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+        self._daily_restart_enabled = daily_restart
+        self._daily_restart_task: asyncio.Task[None] | None = None
+        # Set when the daemon retired itself for the daily restart (as
+        # opposed to a normal stop); run_host_process reads this to decide
+        # whether to re-exec.
+        self.restart_requested = False
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -3612,6 +3635,8 @@ class HostProcess:
                 "Host daemon record for %s is gone or reassigned; self-terminating.",
                 lock.target,
             )
+            # Shared retire signal: run() breaks its serve loop on this Event
+            # (see also _daily_restart_loop).
             self._lifecycle_lost.set()
             self._abort_live_tunnel()
             return
@@ -3635,6 +3660,82 @@ class HostProcess:
                 transport.abort()
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
+
+    def _is_idle_for_restart(self) -> bool:
+        """Whether this host has no live session or host-owned work.
+
+        Runners self-exit after ``runner.idle_timeout_s`` (default 1h) once
+        they have no active work, so no live runner means no session is
+        doing anything right now.
+
+        :returns: ``True`` when a daily restart can safely retire this host.
+        """
+        return (
+            not self._alive_runner_ids()
+            and not self._frame_tasks
+            and not self._runner_stop_tasks
+            and not self._host_subprocess_tasks
+        )
+
+    async def _daily_restart_loop(self) -> None:
+        """Restart the host once a day, at 04:00 local time, while idle.
+
+        Schedules the next restart target each cycle (re-resolving the
+        user's timezone so a change is picked up the next day), waits for
+        it using wall-clock sleeps — ``asyncio.sleep`` runs on the monotonic
+        clock, which stops across a laptop suspend — then polls for an idle
+        moment for up to :data:`~omnigent.host.daily_restart.DAILY_RESTART_WINDOW_S`
+        past the target. If the host is still busy (or asleep) when the
+        window closes, that day's restart is skipped and the loop schedules
+        the next one.
+
+        A restart retires this daemon exactly like the lifecycle monitor: it
+        sets ``restart_requested``, then the shared ``_lifecycle_lost``
+        signal and aborts the live tunnel so :meth:`run` breaks out and its
+        ``finally`` cleans up. ``run_host_process`` reads ``restart_requested``
+        afterward to decide whether to re-exec.
+
+        :returns: None. Runs until cancelled, or returns once it hands off
+            the retire signal for a restart.
+        """
+        while True:
+            try:
+                tz = await asyncio.to_thread(resolve_user_timezone)
+                now = datetime.now(UTC)
+                not_before = datetime.fromtimestamp(
+                    self._started_at + DAILY_RESTART_MIN_UPTIME_S, UTC
+                )
+                target = next_daily_restart(now=now, not_before=not_before, tz=tz)
+                deadline_ts = target.timestamp() + DAILY_RESTART_WINDOW_S
+                _logger.info("Daily restart scheduled for %s", target.isoformat())
+
+                while (remaining := target.timestamp() - time.time()) > 0:
+                    await asyncio.sleep(min(remaining, _DAILY_RESTART_POLL_S))
+
+                deferred_logged = False
+                while time.time() < deadline_ts:
+                    if self._is_idle_for_restart():
+                        _logger.info("Daily restart: host is idle; restarting")
+                        self.restart_requested = True
+                        self._lifecycle_lost.set()
+                        self._abort_live_tunnel()
+                        return
+                    if not deferred_logged:
+                        _logger.info("Daily restart: host is busy; deferring until idle")
+                        deferred_logged = True
+                    await asyncio.sleep(
+                        min(_DAILY_RESTART_POLL_S, max(0.0, deadline_ts - time.time()))
+                    )
+                _logger.info(
+                    "Daily restart skipped for %s: host was busy or asleep "
+                    "through the restart window",
+                    target.isoformat(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception("Daily restart loop iteration failed")
+                await asyncio.sleep(60.0)
 
     async def run(self) -> None:
         """Run the host process with reconnection.
@@ -3665,6 +3766,10 @@ class HostProcess:
             self._lifecycle_lock.acquire()
             self._lifecycle_task = asyncio.create_task(
                 self._lifecycle_monitor_loop(), name="host-lifecycle-monitor"
+            )
+        if self._daily_restart_enabled:
+            self._daily_restart_task = asyncio.create_task(
+                self._daily_restart_loop(), name="host-daily-restart"
             )
         try:
             self._maintenance_janitor = HostMaintenanceJanitor.for_host(
@@ -3881,6 +3986,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._lifecycle_task
                 self._lifecycle_task = None
+            if self._daily_restart_task is not None:
+                self._daily_restart_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._daily_restart_task
+                self._daily_restart_task = None
             if self._capability_init_task is not None:
                 self._capability_init_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4603,7 +4713,7 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
-) -> None:
+) -> bool:
     """Entry point for ``omnigent host``.
 
     Loads (or creates) the host identity from the ``host`` section
@@ -4622,6 +4732,10 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :returns: True when the host retired itself for the daily restart and
+        the caller should re-exec it (see
+        :func:`omnigent.host.daily_restart.reexec_host_process`); False on
+        a normal stop.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -4705,11 +4819,13 @@ def run_host_process(
 
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
+    daily_restart = daily_restart_enabled(path)
     host = HostProcess(
         identity,
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        daily_restart=daily_restart,
     )
     try:
         asyncio.run(host.run())
@@ -4725,3 +4841,4 @@ def run_host_process(
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    return host.restart_requested

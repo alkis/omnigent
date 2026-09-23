@@ -2,7 +2,8 @@
 
 Spawned by ``_ensure_host_daemon`` in ``cli.py`` when ``run`` /
 ``claude`` / ``codex`` register this machine as a host. Runs the same
-:class:`HostProcess` loop as ``omnigent host``.
+:class:`HostProcess` loop as ``omnigent host``, and re-execs itself in
+place after a daily restart.
 
 Two modes:
 
@@ -25,12 +26,17 @@ def main() -> None:
 
     Exactly one of ``--server <url>`` or ``--local`` must be given. In
     ``--local`` mode the daemon starts/reuses the background local AP
-    server itself and connects to that.
+    server itself and connects to that. Re-execs this same process in
+    place when the host retires itself for its daily restart.
 
     :returns: None.
     :raises SystemExit: If neither / both of ``--server`` and ``--local``
         are provided.
     """
+    # The host mutates os.environ in-process (telemetry, workspace/user ids,
+    # a Databricks profile), so a later re-exec must start from the
+    # environment this daemon was actually launched with.
+    launch_env = dict(os.environ)
     parser = argparse.ArgumentParser(
         description="Background host daemon",
     )
@@ -71,6 +77,7 @@ def main() -> None:
         )
         return
 
+    restart = False
     try:
         from omnigent.host.identity import load_or_create_host_identity
 
@@ -98,13 +105,20 @@ def main() -> None:
 
         from omnigent.host.connect import run_host_process
 
-        run_host_process(
+        restart = run_host_process(
             server_url=server_url,
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
         )
     finally:
         lifecycle_lock.release()
+
+    if restart:
+        # Re-exec after releasing the lock (also CLOEXEC) so the new process
+        # can claim it again under the same pid.
+        from omnigent.host.daily_restart import reexec_host_process
+
+        reexec_host_process(launch_env)
 
 
 if __name__ == "__main__":

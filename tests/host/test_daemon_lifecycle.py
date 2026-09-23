@@ -282,6 +282,87 @@ def test_background_daemon_loser_exits_before_connecting(
         owner.release()
 
 
+def test_background_daemon_reexecs_after_release_when_restart_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A daily-restart retire re-execs the daemon after releasing its lifecycle lock."""
+    from omnigent.host import _daemon_entry
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    target = "https://server.example.com"
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_TEST_LAUNCH_MARKER", "from-launch")
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_elected", name="elected"),
+    )
+    monkeypatch.setattr("omnigent.host.connect.run_host_process", lambda **_kw: True)
+
+    calls: list[str] = []
+    original_release = DaemonLifecycleLock.release
+
+    def _recording_release(self: DaemonLifecycleLock) -> None:
+        calls.append("release")
+        original_release(self)
+
+    monkeypatch.setattr(DaemonLifecycleLock, "release", _recording_release)
+
+    captured_env: list[dict[str, str]] = []
+
+    def _fake_reexec(launch_env: dict[str, str]) -> None:
+        calls.append("reexec")
+        captured_env.append(dict(launch_env))
+
+    monkeypatch.setattr("omnigent.host.daily_restart.reexec_host_process", _fake_reexec)
+
+    _daemon_entry.main()
+
+    # The lock is released — and the fd it guards freed — before the
+    # re-exec'd process tries to claim it again under the same pid.
+    assert calls == ["release", "reexec"]
+    assert captured_env[0].get("OMNIGENT_TEST_LAUNCH_MARKER") == "from-launch"
+
+
+def test_background_daemon_normal_stop_does_not_reexec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal daemon stop (no restart pending) never re-execs."""
+    from omnigent.host import _daemon_entry
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    target = "https://server.example.com"
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--server", target])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_elected", name="elected"),
+    )
+    monkeypatch.setattr("omnigent.host.connect.run_host_process", lambda **_kw: False)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.daily_restart.reexec_host_process",
+        lambda launch_env: calls.append("reexec"),
+    )
+
+    _daemon_entry.main()
+
+    assert calls == []
+
+
 def _record(target: str, pid: int) -> HostDaemonRecord:
     from omnigent import cli
 

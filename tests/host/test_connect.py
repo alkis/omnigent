@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -5440,6 +5441,222 @@ async def test_run_survives_host_maintenance_start_failure(
     await host.run()
 
     assert host._maintenance_janitor is None
+
+
+# --- Daily restart ------------------------------------------------------
+#
+# The host self-restarts once a day, at 04:00 in the user's timezone, but
+# only while idle. These tests drive ``_daily_restart_loop`` directly
+# (monkeypatching the daily_restart module functions it calls) rather than
+# through a real day-long clock.
+
+
+def _immediate_target(**_kwargs: object) -> datetime:
+    """Fake ``next_daily_restart`` that schedules for right now."""
+    return datetime.now(UTC)
+
+
+async def test_daily_restart_loop_restarts_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An idle host restarts as soon as the scheduled target arrives."""
+    monkeypatch.setattr("omnigent.host.connect.resolve_user_timezone", lambda: UTC)
+    monkeypatch.setattr("omnigent.host.connect.next_daily_restart", _immediate_target)
+    monkeypatch.setattr("omnigent.host.connect._DAILY_RESTART_POLL_S", 0.01)
+    host = _make_host_process()
+    aborted: list[bool] = []
+    monkeypatch.setattr(host, "_abort_live_tunnel", lambda: aborted.append(True))
+
+    await asyncio.wait_for(host._daily_restart_loop(), timeout=2.0)
+
+    assert host.restart_requested is True
+    assert host._lifecycle_lost.is_set()
+    assert aborted == [True]
+
+
+async def test_daily_restart_loop_defers_for_live_runner_then_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy host waits for the runner to finish, then restarts."""
+    monkeypatch.setattr("omnigent.host.connect.resolve_user_timezone", lambda: UTC)
+    monkeypatch.setattr("omnigent.host.connect.next_daily_restart", _immediate_target)
+    monkeypatch.setattr("omnigent.host.connect._DAILY_RESTART_POLL_S", 0.01)
+    host = _make_host_process()
+    aborted: list[bool] = []
+    monkeypatch.setattr(host, "_abort_live_tunnel", lambda: aborted.append(True))
+    poll_count = 0
+
+    def _fake_alive_runner_ids() -> list[str]:
+        nonlocal poll_count
+        poll_count += 1
+        return ["s1"] if poll_count <= 2 else []
+
+    monkeypatch.setattr(host, "_alive_runner_ids", _fake_alive_runner_ids)
+
+    await asyncio.wait_for(host._daily_restart_loop(), timeout=2.0)
+
+    assert poll_count > 2
+    assert host.restart_requested is True
+    assert aborted == [True]
+
+
+async def test_daily_restart_loop_skips_when_busy_through_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that stays busy past the restart window skips that day."""
+    monkeypatch.setattr("omnigent.host.connect.resolve_user_timezone", lambda: UTC)
+    monkeypatch.setattr("omnigent.host.connect._DAILY_RESTART_POLL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect.DAILY_RESTART_WINDOW_S", 0.05)
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_alive_runner_ids", lambda: ["s1"])
+    schedule_calls: list[int] = []
+
+    def _spy_next_daily_restart(**_kwargs: object) -> datetime:
+        schedule_calls.append(1)
+        return datetime.now(UTC)
+
+    monkeypatch.setattr("omnigent.host.connect.next_daily_restart", _spy_next_daily_restart)
+
+    task = asyncio.create_task(host._daily_restart_loop())
+    try:
+
+        async def _wait_for_two_schedules() -> None:
+            while len(schedule_calls) < 2:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_two_schedules(), timeout=2.0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert host.restart_requested is False
+    assert not host._lifecycle_lost.is_set()
+    assert len(schedule_calls) >= 2
+
+
+@pytest.mark.parametrize(
+    "attr_name", ["_frame_tasks", "_runner_stop_tasks", "_host_subprocess_tasks"]
+)
+async def test_is_idle_for_restart_false_while_host_work_in_flight(
+    monkeypatch: pytest.MonkeyPatch, attr_name: str
+) -> None:
+    """A populated in-flight task set keeps the host busy even with no live runners."""
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_alive_runner_ids", list)
+
+    assert host._is_idle_for_restart() is True
+
+    task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        getattr(host, attr_name).add(task)
+        assert host._is_idle_for_restart() is False
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_is_idle_for_restart_false_with_live_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live runner alone keeps the host busy even with no in-flight tasks."""
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_alive_runner_ids", lambda: ["s1"])
+
+    assert host._is_idle_for_restart() is False
+
+
+async def test_run_starts_daily_restart_task_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run() only starts the daily-restart loop when built with daily_restart=True."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    started = asyncio.Event()
+
+    async def _fake_loop(self: HostProcess) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(HostProcess, "_daily_restart_loop", _fake_loop)
+    identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
+    host = HostProcess(identity, "https://app.example.databricks.com", daily_restart=True)
+
+    await host.run()
+
+    assert started.is_set()
+    assert host._daily_restart_task is None
+
+
+async def test_run_skips_daily_restart_task_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run() does not start the daily-restart loop unless asked to."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    calls: list[str] = []
+
+    async def _fake_loop(self: HostProcess) -> None:
+        calls.append("started")
+
+    monkeypatch.setattr(HostProcess, "_daily_restart_loop", _fake_loop)
+    host = _host()  # daily_restart defaults to False
+
+    await host.run()
+
+    assert calls == []
+    assert host._daily_restart_task is None
+
+
+def test_run_host_process_returns_restart_requested_and_passes_daily_restart_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run_host_process`` surfaces the retire-for-restart signal to its caller."""
+    monkeypatch.setattr("omnigent.host.connect.daily_restart_enabled", lambda path: True)
+    captured: dict[str, object] = {}
+
+    class _FakeHostProcess:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.restart_requested = True
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.setattr("omnigent.host.connect.HostProcess", _FakeHostProcess)
+
+    result = run_host_process(
+        server_url="https://app.example.databricks.com",
+        config_path=tmp_path / "config.yaml",
+    )
+
+    assert result is True
+    assert captured.get("daily_restart") is True
+
+
+def test_run_host_process_returns_false_on_normal_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A host that stops normally (not a restart) reports no restart pending."""
+    monkeypatch.setattr("omnigent.host.connect.daily_restart_enabled", lambda path: False)
+    captured: dict[str, object] = {}
+
+    class _FakeHostProcess:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.restart_requested = False
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.setattr("omnigent.host.connect.HostProcess", _FakeHostProcess)
+
+    result = run_host_process(
+        server_url="https://app.example.databricks.com",
+        config_path=tmp_path / "config.yaml",
+    )
+
+    assert result is False
+    assert captured.get("daily_restart") is False
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(

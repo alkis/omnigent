@@ -137,6 +137,74 @@ def test_host_no_server_starts_local_backend(
     assert captured_url == ["http://127.0.0.1:8123"]
 
 
+def test_host_daily_restart_reexecs_without_stop_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daily-restart retire re-execs the host and skips the stop-server prompt.
+
+    ``run_host_process`` returning ``True`` means the host retired itself for
+    the restart, not a user-initiated stop, so the local server this daemon
+    spawned must stay up for the re-exec'd host to reuse.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    reexec_calls: list[dict[str, str]] = []
+    prompt_calls: list[bool] = []
+
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process", lambda server_url, **kwargs: True
+    )
+    monkeypatch.setattr(
+        "omnigent.host.daily_restart.reexec_host_process",
+        lambda launch_env: reexec_calls.append(dict(launch_env)),
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._prompt_stop_local_server", lambda: prompt_calls.append(True)
+    )
+
+    with patch(
+        "omnigent.cli.ensure_local_omnigent_server",
+        # spawned=True: proves the restart path skips the prompt even though
+        # this run would otherwise offer to stop the server it started.
+        lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=True),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["host"])
+
+    assert result.exit_code == 0, result.output
+    assert len(reexec_calls) == 1
+    assert prompt_calls == []
+
+
+def test_host_normal_stop_does_not_reexec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal stop (not a daily restart) never re-execs the host."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    reexec_calls: list[dict[str, str]] = []
+
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process", lambda server_url, **kwargs: False
+    )
+    monkeypatch.setattr(
+        "omnigent.host.daily_restart.reexec_host_process",
+        lambda launch_env: reexec_calls.append(dict(launch_env)),
+    )
+
+    with patch(
+        "omnigent.cli.ensure_local_omnigent_server",
+        lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["host"])
+
+    assert result.exit_code == 0, result.output
+    assert reexec_calls == []
+
+
 def test_host_reads_server_from_global_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -9007,6 +9007,9 @@ def host(
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
     """
+    # Snapshot before anything below can mutate os.environ, so a later daily
+    # restart re-execs from the environment this command was actually launched with.
+    launch_env = dict(os.environ)
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
     ctx.obj["non_interactive"] = non_interactive
@@ -9060,6 +9063,7 @@ def host(
     # exit). A connection failure (SystemExit) leaves this False so we don't
     # prompt over an error.
     stopped_cleanly = False
+    restart = False
     try:
         # Sign in first when the remote server is Databricks-fronted and we
         # hold no usable credentials — otherwise the tunnel upgrade is
@@ -9070,8 +9074,10 @@ def host(
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
-        run_host_process(server_url=server, daemon_target=target)
-        stopped_cleanly = True
+        restart = run_host_process(server_url=server, daemon_target=target)
+        # A restart isn't a user-initiated stop: don't offer to also tear
+        # down the local server the re-exec'd host needs to reconnect to.
+        stopped_cleanly = not restart
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it
         # so we can prompt below instead of exiting with an "Aborted!" trace.
@@ -9086,6 +9092,11 @@ def host(
         # spawned is fair game.
         if stopped_cleanly and spawned_local_server:
             _prompt_stop_local_server()
+
+    if restart:
+        from omnigent.host.daily_restart import reexec_host_process
+
+        reexec_host_process(launch_env)
 
 
 def _host_group_option(ctx: click.Context, key: str) -> str | None:
