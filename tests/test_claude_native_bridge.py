@@ -10520,6 +10520,85 @@ def test_a_late_blank_capture_does_not_shorten_the_settle(
     )
 
 
+def test_a_repaint_after_a_dismissed_surface_is_not_escaped_on_sight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dismissed surface's confirmation does not carry over to a later frame.
+
+    After the ctrl+r search is Escaped and another writer's draft is waited
+    on, a single composer-less repaint frame must not receive an Escape on
+    first sight: the two-frame guard exists so a repaint artifact can never
+    draw the Escape that interrupts a running turn.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    settle = [_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1)
+    events = _events_tmux(
+        monkeypatch,
+        [
+            _REVERSE_SEARCH_PANE,
+            _REVERSE_SEARCH_PANE,
+            _IDLE_PANE,
+            *[_composer_pane("fix the flaky test")] * 5,
+            "● Working on it",  # one composer-less repaint
+            *settle,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    escapes = events.count("send:send-keys:Escape")
+    assert escapes == 1, f"Only the search may be Escaped, not the repaint frame; events: {events}"
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:")]
+    assert tails[-3:] == ["C-u", "/effort high", "Enter"], f"Unexpected keystrokes: {tails}"
+
+
+def test_a_surface_reopened_after_a_draft_wait_is_dismissed_before_typing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A surface reopened later gets its own dismissal budget.
+
+    The search is Escaped, another writer's draft is waited on for ~3 s, and
+    the search is opened again. Inheriting the first surface's budget would
+    make the new one look already expired on first sight, and the command
+    would be typed into the search filter; it must be Escaped first.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    draft_frames = int(3.0 / poll)
+    settle = [_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1)
+    reopened = [_REVERSE_SEARCH_PANE] * 3
+    events = _events_tmux(
+        monkeypatch,
+        [
+            _REVERSE_SEARCH_PANE,
+            _REVERSE_SEARCH_PANE,
+            _IDLE_PANE,
+            *[_composer_pane("fix the flaky test")] * draft_frames,
+            *reopened,
+            *settle,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert events.count("send:send-keys:Escape") == 2, (
+        f"The reopened search must get its own Escape; events: {events[:60]}"
+    )
+    first_cu = events.index("send:send-keys:C-u")
+    captures_before = sum(1 for event in events[:first_cu] if event == "capture")
+    assert captures_before >= 3 + draft_frames + len(reopened), (
+        f"C-u fired while the reopened search was still up; events: {events[:60]}"
+    )
+
+
 def test_a_slash_command_draft_that_never_renders_submits_blind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

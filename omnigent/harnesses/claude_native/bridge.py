@@ -5427,6 +5427,13 @@ def _restore_occupied_input(
                 time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
                 continue
             torn_deadline = now + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
+            # The composer is back, so a surface seen later is a new one: it
+            # gets its own two-frame confirmation and dismissal budget rather
+            # than inheriting a dismissed surface's (an Escape on first sight,
+            # or an already-expired budget that would leave it undismissed).
+            confirmed = False
+            last_escape = None
+            deadline = None
             if _composer_holds_draft(pane):
                 free_polls = 0
                 if draft_deadline is None:
