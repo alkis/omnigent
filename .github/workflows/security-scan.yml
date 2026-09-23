@@ -40,12 +40,7 @@ concurrency:
 jobs:
   scan:
     name: Security Scan
-    # Larger runner: the per-workflow security gates poll THIS check and cannot
-    # proceed until it completes, so when it queued behind a saturated standard
-    # pool it stalled every gated CI workflow. Its own pool lets it start
-    # promptly -- it's fast once running (p90 ~0.4 min), so this is
-    # pool-separation, not a compute upgrade.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       # Route uv at PyPI for the semgrep fetch.
@@ -137,7 +132,7 @@ jobs:
 
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the

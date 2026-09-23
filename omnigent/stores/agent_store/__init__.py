@@ -120,6 +120,7 @@ class AgentStore(ABC):
         self,
         agent_id: str,
         bundle_location: str,
+        created_by: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump its version, and
@@ -130,6 +131,11 @@ class AgentStore(ABC):
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param created_by: When set, stamps the agent's owner only if
+            it is not already recorded (claim-on-write). Used by the
+            session-scoped mutation routes to heal pre-migration rows
+            whose ``created_by`` is ``None``; template-refresh callers
+            leave it ``None`` so template rows stay unowned.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -141,38 +147,17 @@ class AgentStore(ABC):
         bundle_location: str,
         previous_bundle_location: str | None = None,
     ) -> builtins.list[str]:
-        """
-        Repoint stale, uncustomized session-scoped clones of a template
-        agent to its current bundle.
+        """Repoint uncustomized session clones to the template's current bundle.
 
-        Fork/switch clone a template's ``bundle_location`` verbatim into a
-        session-scoped row, and bundle keys are content-addressed under the
-        source template's id (``"{template_id}/{sha256}"``). A session row
-        still keyed under *source_agent_id* (or under the template's
-        previous artifact-key prefix — legacy rows keep an ``ag_``-prefixed
-        physical key) but with different content is therefore a stale,
-        uncustomized copy; without repointing, sessions bound to it keep
-        running the spec captured at clone time after every template
-        update. A clone customized after cloning (per-session MCP edits
-        re-key the bundle under the clone's OWN id) no longer matches and
-        stays pinned to its customized bundle.
+        Match bundles under the source ID or previous artifact-key prefix,
+        including legacy ag_ keys. Customized clones use their own ID and stay pinned.
+        Backends without clone tracking keep the default no-op behavior.
 
-        Default implementation is a no-op so backends without clone
-        tracking keep the prior leave-pinned behavior.
-
-        :param source_agent_id: The updated template agent's id,
-            e.g. ``"ag_abc123"``.
-        :param bundle_location: The template's current artifact key,
-            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
-        :param previous_bundle_location: The template's artifact key before
-            this update, when known. Its prefix catches clones of legacy
-            rows whose key segment differs from the row id.
-        :returns: Ids of session-scoped clone rows whose cached bundle may
-            be stale — rows repointed now plus rows already at the current
-            location (another replica may have repointed them while this
-            process's cache still held the old extraction). Callers evict
-            each from the agent cache so the next load re-fetches.
-        """
+        :param source_agent_id: Updated template ID.
+        :param bundle_location: Current template artifact key.
+        :param previous_bundle_location: Previous artifact key, when known.
+        :returns: Clone IDs needing cache eviction, including already-current clones
+            another replica may have repointed without refreshing this process."""
         del source_agent_id, bundle_location, previous_bundle_location
         return []
 

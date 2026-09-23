@@ -6,7 +6,7 @@ name: E2E Tests
 #
 # Triggers:
 #   schedule            09:00 UTC daily (alongside nightly.yml).
-#   workflow_dispatch   manual run. Inputs: `branch` (non-main ref) and
+#   workflow_dispatch   manual run on the selected workflow ref. Input:
 #                       `parallelism` (pytest `-n` worker count).
 #   pull_request        PR gate for ALL PRs -- same-repo AND fork. This suite
 #                       runs entirely against the in-process mock LLM (no
@@ -26,10 +26,6 @@ on:
     paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
   workflow_dispatch:
     inputs:
-      branch:
-        description: "Branch to run e2e tests against"
-        required: false
-        default: "main"
       parallelism:
         description: "Number of pytest workers per shard (-n flag). Default 2 keeps per-shard concurrency low so the 4 shards * 2 workers = 8 concurrent gateway calls stays below the nightly's pain point (20 concurrent triggered 429s)."
         required: false
@@ -39,7 +35,7 @@ concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
   # by SHA so each merge to `main` gets its own run. Label events append the
   # label name so they get an isolated slot and never cancel a code-push run.
-  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name || 'run' }}
+  group: e2e-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.ref) || github.sha }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name || 'run' }}
   cancel-in-progress: true
 
 permissions:
@@ -67,19 +63,13 @@ jobs:
       (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
-    # Larger runner: the gate blocks setup + the shards below it, so keeping it
-    # on the saturated standard pool throttled the whole workflow.
-    with:
-      runner: ubuntu-latest-m
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
   # default; draft PRs resolve to an empty matrix.
   setup:
     name: setup
     needs: gate
-    # Larger runner: setup sits upstream of the e2e shards (which `needs: setup`),
-    # so on the saturated standard pool it throttled them before they could start.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -109,10 +99,7 @@ jobs:
     # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     needs: setup
-    # Larger runner: this 4-shard suite is a top consumer of standard-runner
-    # slots; moving it to the separate larger-runner pool cuts its queue wait
-    # and frees standard slots for other workflows.
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
     timeout-minutes: 35
@@ -125,12 +112,9 @@ jobs:
 
     steps:
       - name: Checkout
+        # The default is the PR merge commit for pull_request and the workflow
+        # ref for schedule/dispatch, keeping checked-out code in its cache scope.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          # PRs (same-repo and fork) test the merge result (refs/pull/N/merge --
-          # absent when the PR conflicts, so a conflicted PR fails checkout by
-          # design). Schedule / dispatch fall back to the branch / ref.
-          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.event.inputs.branch || github.ref }}
 
       # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
       # job via the composite action, so the two never drift. server_version

@@ -9,6 +9,7 @@ from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy import update as sql_update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
@@ -22,6 +23,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    run_write_transaction,
 )
 from omnigent.entities import Agent, PagedList
 from omnigent.stores.agent_store import AgentStore
@@ -59,6 +61,11 @@ class SqlAlchemyAgentStore(AgentStore):
             self._engine,
             query_name_prefix="omnigent.agent_store",
         )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.agent_store",
+            immediate=True,
+        )
         conv_uri = conversation_storage_location or storage_location
         self._conv_engine = (
             self._engine
@@ -93,6 +100,11 @@ class SqlAlchemyAgentStore(AgentStore):
         a replica has not caught up to. ``conversations`` lives on the AP DB, so
         this runs on the conversation engine.
 
+        This lookup is NOT used to authorize agent-code mutation: a legacy
+        (``created_by`` NULL) agent may be referenced by several unrelated roots
+        after reuse, so agent mutation gates on ``created_by`` and admin status
+        only (see ``require_agent_owner``), never on this reverse lookup.
+
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
         :returns: The agent's spawn-tree root conversation id, or ``None`` when
             no conversation points at this agent.
@@ -126,16 +138,9 @@ class SqlAlchemyAgentStore(AgentStore):
         :param description: Optional free-text description.
         :returns: The newly created :class:`Agent`.
         """
-        row = SqlAgent(
-            id=agent_id,
-            created_at=now_epoch(),
-            name=name,
-            bundle_location=bundle_location,
-            version=1,
-            kind=encode_agent_kind("template"),
-            description=description,
-        )
-        with self._session("create_agent") as session:
+        created_at = now_epoch()
+
+        def write(session: Session) -> Agent:
             # Template names are unique within a workspace. This can't be a
             # partial unique index (MySQL has none), so enforce it here.
             conflict = session.execute(
@@ -151,8 +156,19 @@ class SqlAlchemyAgentStore(AgentStore):
                     params={"name": name},
                     orig=Exception(f"UNIQUE constraint: name={name!r}"),
                 )
+            row = SqlAgent(
+                id=agent_id,
+                created_at=created_at,
+                name=name,
+                bundle_location=bundle_location,
+                version=1,
+                kind=encode_agent_kind("template"),
+                description=description,
+            )
             session.add(row)
             return sql_agent_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "create_agent", write)
 
     def get(self, agent_id: str) -> Agent | None:
         """
@@ -283,6 +299,7 @@ class SqlAlchemyAgentStore(AgentStore):
         self,
         agent_id: str,
         bundle_location: str,
+        created_by: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump version, and set
@@ -292,16 +309,31 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param created_by: When set, records the owner only if the row
+            does not already have one (claim-on-write). Heals
+            pre-migration session-scoped rows on their first authorized
+            mutation; ``None`` leaves any existing owner untouched.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
-        with self._session("update_agent") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> SqlAgent | None:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return None
             row.bundle_location = bundle_location
             row.version = row.version + 1
-            row.updated_at = now_epoch()
+            row.updated_at = updated_at
+            # Claim-on-write: only fill an empty owner, never overwrite one.
+            if created_by is not None and row.created_by is None:
+                row.created_by = created_by
+            session.flush()
+            return row
+
+        row = run_write_transaction(self._session_immediate, "update_agent", write)
+        if row is None:
+            return None
         # Reverse lookup targets the AP DB — see _session_id_for_agent.
         session_id: str | None = None
         if row.kind == encode_agent_kind("session"):
@@ -314,36 +346,17 @@ class SqlAlchemyAgentStore(AgentStore):
         bundle_location: str,
         previous_bundle_location: str | None = None,
     ) -> builtins.list[str]:
-        """
-        Repoint stale, uncustomized session-scoped clones to *bundle_location*.
+        """Repoint uncustomized session clones and return IDs needing cache eviction.
 
-        Bundle keys are content-addressed under the source template's id
-        (``"{template_id}/{sha256}"``) and fork/switch copy them verbatim, so a
-        session-scoped row whose key still lives under *source_agent_id* — in
-        its bare or legacy ``ag_``-prefixed spelling (the uuid migration
-        stripped row-id prefixes but left physical bundle keys untouched) — or
-        under *previous_bundle_location*'s prefix, but differs from the
-        current location, is a stale, uncustomized clone. Per-session customization re-keys the
-        bundle under the clone's own id, so customized clones never match and
-        stay pinned.
+        Match source-ID bundle prefixes (bare or legacy ag_) and the previous
+        artifact-key prefix. Customized clones have their own prefix and stay pinned.
+        Bump repointed versions to invalidate runner caches. Return already-current
+        clones too, without version churn: another replica may have repointed them
+        while this server still caches their old bundle.
 
-        Bumps each repointed row's ``version`` so the runner's version-keyed
-        spec cache re-fetches. Callers evict every returned id from the
-        server's :class:`AgentCache` (it trusts its per-id entry without
-        checking ``bundle_location``) — the return includes clones ALREADY at
-        the current location, because another replica (or a prior boot that
-        crashed before evicting) may have committed the repoint while this
-        process's cache still holds the old extraction. Already-current rows
-        are only returned, never mutated (no version churn).
-
-        :param source_agent_id: The updated template agent's id.
-        :param bundle_location: The template's current artifact key.
-        :param previous_bundle_location: The template's pre-update artifact
-            key, when known, e.g. a legacy ``"ag_foo/sha"``.
-        :returns: Ids of session-scoped clone rows whose cached bundle may be
-            stale: rows repointed now, plus rows already at
-            *bundle_location*.
-        """
+        :param source_agent_id: Updated template ID.
+        :param bundle_location: Current template artifact key.
+        :param previous_bundle_location: Previous artifact key, when known."""
         # ``autoescape`` neutralizes ``%``/``_`` wildcards in ids. The
         # ``ag_``-prefixed spelling is the pre-uuid-migration id form: the
         # migration stripped the prefix from row ids but deliberately left
@@ -407,9 +420,12 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: ``True`` if the agent was deleted, ``False`` if
             it did not exist.
         """
-        with self._session("delete_agent") as session:
+
+        def write(session: Session) -> bool:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return False
             session.delete(row)
             return True
+
+        return run_write_transaction(self._session_immediate, "delete_agent", write)

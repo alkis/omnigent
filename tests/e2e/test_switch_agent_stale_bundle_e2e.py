@@ -1,38 +1,9 @@
-"""E2E: a switch-created agent clone must not pin a stale bundle forever.
+"""Switch-created agent clones must serve the current template after a redeploy.
 
-Switching a session's agent (``POST /v1/sessions/{id}/switch-agent``) clones
-the target built-in into a session-scoped agent row named
-``"<name> (switch <id>)"`` whose ``bundle_location`` is copied verbatim. That
-row is never touched again: startup ``--agent`` re-registration resolves the
-template by name and updates only the template row, so after a bundle change
-plus server restart (a redeploy) the clone still points at the old blob.
-
-The user-visible failure: the new-session picker discovers the clone from
-the session scan under a near-identical name, and a session started from it
-runs the PRE-change spec — old prompt, old policy, old sandbox grants —
-with no staleness indication anywhere in the UI.
-
-Journey (all user-observable):
-
-1. Register an agent from a bundle directory (server boots with
-   ``--agent <dir>``, bundle content "V1").
-2. In a session, switch the agent to it — the ``"<name> (switch <id>)"``
-   session-scoped clone row is created.
-3. Change the bundle on disk and restart the server so startup
-   registration picks the new content up (a redeploy).
-4. Start a new session from the switch clone (what the picker binds).
-5. The new session must run the CURRENT spec — on the broken build it
-   serves the pre-change bundle, silently.
-
-Hermetic: no LLM turn and no runner are needed. The spec a session runs is
-exactly what ``GET /v1/sessions/{id}/agent/contents`` serves (the runner
-fetches its bundle from that endpoint on cache miss), so asserting on the
-served bundle bytes IS asserting on the spec the session executes.
-
-Usage::
-
-    pytest tests/e2e/test_switch_agent_stale_bundle_e2e.py -v
-"""
+Register V1, switch to it, update the bundle and restart the real server.
+A new session from the clone must serve V2 through its agent/contents
+endpoint. This checks served bundle bytes; it does not launch a runner
+or execute a model turn."""
 
 from __future__ import annotations
 
@@ -242,19 +213,7 @@ class _Rig:
 
 @pytest.mark.timeout(300)
 def test_new_session_from_switch_clone_serves_current_bundle(tmp_path: Path) -> None:
-    """A session started from a switch clone must not run a stale spec.
-
-    The ``"<name> (switch <id>)"`` clone
-    row pins the bundle_location captured at switch time and is invisible
-    to startup ``--agent`` re-registration (which resolves by the CLEAN
-    template name). After a bundle change + restart, a new session bound
-    to the clone silently serves the pre-change bundle while a session on
-    the template serves the current one.
-
-    Passes when a session from the clone serves the CURRENT bundle content
-    — the clone tracks its source template across redeploys, and binding a
-    clone the caller could already bind keeps working.
-    """
+    """After a template update and server restart, a clone-bound session must serve V2."""
     probe_dir = tmp_path / "agents" / "pinned-probe"
     source_dir = tmp_path / "agents" / "switch-source"
     _write_bundle(probe_dir, _V1_MARKER)
