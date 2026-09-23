@@ -374,6 +374,21 @@ _MODEL_PICKER_OPEN_HINT = "use this session only"
 # accepted rather than confirmation-gated.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
+# How long an injector waits for text another writer put in the input box
+# to submit before treating it as a person's unsent draft and proceeding as
+# before. The runner (slash commands) and the harness (messages) type into
+# the same pane from different processes; a submit clears the box within a
+# second or two, so a draft that outlives this is not one in flight.
+_FOREIGN_DRAFT_WAIT_TIMEOUT_S = 5.0
+# Consecutive free-composer polls a slash command needs before it types.
+# On a freshly mounted composer both writers wake on the same frame; the
+# slash command yields so a paste already in flight lands first, then it
+# queues behind that draft instead of clearing it.
+_SLASH_COMMAND_SETTLE_POLLS = 5
+# The dim suggestion Claude Code shows in an EMPTY input box on some starts
+# (``Try "fix lint errors"``). It is chrome, not a draft: the first keystroke
+# replaces it, so a box showing only this is free.
+_COMPOSER_PLACEHOLDER_PREFIX = 'Try "'
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -3864,7 +3879,11 @@ def inject_user_message(
     from the embedded terminal — a ctrl+r history search, a rewind
     dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
     Escape (see :func:`_restore_occupied_input`), so the message reclaims
-    the input box instead of being typed into that surface.
+    the input box instead of being typed into that surface. Text another
+    writer has in the box — a slash command the runner is submitting from
+    its own process — is waited out rather than cleared, so neither
+    message is lost; only a draft that outlives that wait is cleared as a
+    person's leftover.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -4303,7 +4322,10 @@ def inject_slash_command(
     Anything the person left occupying the composer from the embedded
     terminal (ctrl+r history search, rewind dialog, ``!`` shell mode) is
     dismissed first — see :func:`_restore_occupied_input` — so the
-    command cannot be typed into it.
+    command cannot be typed into it. A message the harness is pasting
+    from its own process is waited out, and the command settles for a
+    few polls on a freshly mounted composer so such a paste lands first;
+    the C-u below then clears only a person's leftover draft.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
@@ -4342,13 +4364,20 @@ def inject_slash_command(
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Same reclaim as inject_user_message: a surface left occupying the
-    # composer would swallow the C-u and the typed command.
-    _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # composer would swallow the C-u and the typed command. The settle
+    # makes this writer yield to a message the harness is pasting from its
+    # own process: the C-u below would otherwise wipe that draft.
+    _restore_occupied_input(
+        socket_path,
+        tmux_target,
+        bridge_dir=bridge_dir,
+        settle_polls=_SLASH_COMMAND_SETTLE_POLLS,
+    )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
         )
-    # ``C-u`` clears any draft the user is mid-typing; otherwise the
+    # ``C-u`` clears a draft the person left mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
@@ -5289,10 +5318,14 @@ def acknowledge_auto_mode_billing_notice(
 
 
 def _restore_occupied_input(
-    socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
+    socket_path: str,
+    tmux_target: str,
+    *,
+    bridge_dir: Path | None = None,
+    settle_polls: int = 1,
 ) -> None:
     """
-    Dismiss a terminal-opened surface occupying Claude's input box.
+    Reclaim Claude's input box: dismiss a surface over it, wait out a draft.
 
     A person can leave the composer taken over from the embedded terminal
     in two shapes, both reported by :func:`_occupying_surface`: an overlay
@@ -5322,14 +5355,31 @@ def _restore_occupied_input(
     caller's readiness gate or delivery verification fails loud, exactly
     as it did before this restore existed.
 
+    A free composer can still hold text this writer did not type: the
+    runner injects slash commands (effort, model, permission mode) and
+    the harness pastes web messages into the same pane from different
+    processes, so one writer's draft can be sitting in the box when the
+    other arrives. Clearing or appending to it loses whichever message
+    was there, so the box is waited free for up to
+    :data:`_FOREIGN_DRAFT_WAIT_TIMEOUT_S`; a draft that outlives that is
+    a person's unsent text and is left to the caller, exactly as before.
+    *settle_polls* consecutive free polls are required before returning:
+    the writer that settles yields the fresh composer to a paste already
+    in flight from the other process.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
+    :param settle_polls: Consecutive free-composer polls to see before
+        returning, e.g. ``5`` for a slash command; ``1`` returns on the
+        first free frame.
     :returns: None.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+    draft_deadline = time.monotonic() + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
+    free_polls = 0
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
@@ -5343,9 +5393,28 @@ def _restore_occupied_input(
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return
         surface = _occupying_surface(pane)
-        if surface is None:
-            return
         now = time.monotonic()
+        if surface is None:
+            if not pane.strip():
+                # A torn capture says nothing; proceed as before.
+                return
+            if _composer_holds_draft(pane):
+                free_polls = 0
+                if now >= draft_deadline:
+                    _logger.warning(
+                        "claude-native: input box still holds another draft after "
+                        "%.1fs; proceeding",
+                        _FOREIGN_DRAFT_WAIT_TIMEOUT_S,
+                    )
+                    return
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
+            free_polls += 1
+            if free_polls >= settle_polls:
+                return
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
+        free_polls = 0
         if now >= deadline:
             _logger.warning(
                 "claude-native: input box still occupied (%s) after %.1fs; proceeding",
@@ -5402,6 +5471,35 @@ def _occupying_surface(pane: str) -> str | None:
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return "shell mode"
+
+
+def _composer_holds_draft(pane: str) -> bool:
+    """
+    Return whether Claude's chat input box holds unsubmitted text.
+
+    The box is located structurally (:func:`_composer_row`) and must be
+    the chat composer, led by :data:`_CLAUDE_PROMPT_GLYPH`. Anything after
+    the glyph is a draft: a message another writer pasted and has not yet
+    submitted, a slash command mid-flight, a person's unsent text, or the
+    ``[Pasted text …]`` placeholder of a large paste. An empty box renders
+    the bare glyph, or the glyph plus the dim ``Try "…"`` suggestion
+    (:data:`_COMPOSER_PLACEHOLDER_PREFIX`) that the first keystroke
+    replaces; Claude Code separates a draft from the glyph with a
+    non-breaking space, which ``str.strip`` removes.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the chat composer is rendered and non-empty.
+    """
+    row = _composer_row(pane)
+    if row is None:
+        return False
+    stripped = row.strip()
+    if not stripped.startswith(_CLAUDE_PROMPT_GLYPH):
+        return False
+    tail = stripped[len(_CLAUDE_PROMPT_GLYPH) :].strip()
+    if tail.startswith(_COMPOSER_PLACEHOLDER_PREFIX) and tail.endswith('"'):
+        return False
+    return bool(tail)
 
 
 def _composer_row(pane: str) -> str | None:
@@ -5733,6 +5831,7 @@ def _wait_for_claude_prompt_ready(
     exited_status: str | None = None
     pane_exited = False
     dialog_headline: str | None = None
+    foreign_draft_seen_at: float | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5750,7 +5849,23 @@ def _wait_for_claude_prompt_ready(
         else:
             empty_polls += 1
         if _claude_prompt_rendered(pane):
-            return
+            if not _composer_holds_draft(pane):
+                return
+            # Text another writer put in the box (a slash command the runner
+            # is submitting from its own process): pasting now would clear or
+            # merge with it, so hold until it submits. A draft that outlives
+            # the wait is a person's unsent text and is treated as before.
+            if foreign_draft_seen_at is None:
+                foreign_draft_seen_at = time.monotonic()
+            elif time.monotonic() - foreign_draft_seen_at >= _FOREIGN_DRAFT_WAIT_TIMEOUT_S:
+                _logger.warning(
+                    "claude-native: input box still holds another draft after %.1fs; "
+                    "pasting anyway",
+                    _FOREIGN_DRAFT_WAIT_TIMEOUT_S,
+                )
+                return
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         billing_notice = auto_mode_billing_notice_visible(pane)
         if billing_notice:
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)

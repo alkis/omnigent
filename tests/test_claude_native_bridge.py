@@ -9675,11 +9675,11 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
     sends = _fake_tmux(
         monkeypatch,
-        # Idle at the occupied-input check, then the typed command
+        # Idle through the reclaim's settle window, then the typed command
         # renders, the submit pops the dialog, the accept clears it —
         # one capture per delivery stage.
         [
-            _IDLE_PANE,
+            *[_IDLE_PANE] * claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS,
             _composer_pane("/model databricks-claude-sonnet-5"),
             dialog,
             dialog,
@@ -10078,6 +10078,200 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
 
     with pytest.raises(RuntimeError, match="was not delivered"):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+
+def _events_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+    panes: list[str],
+) -> list[str]:
+    """
+    Patch tmux so captures and keystrokes land in one ordered event list.
+
+    Captures walk *panes* (the last frame repeats) and are logged as
+    ``"capture"``; every tmux send is logged as ``"send:<verb>:<last arg>"``,
+    so a test can assert what was on screen before a keystroke fired.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param panes: Pane frames to return in order; the last one repeats.
+    :returns: The ordered event list.
+    """
+    events: list[str] = []
+    served = {"n": 0}
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        events.append(f"send:{args[0]}:{args[-1]}")
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        events.append("capture")
+        frame = panes[min(served["n"], len(panes) - 1)]
+        served["n"] += 1
+        return frame
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    return events
+
+
+def _captures_before_first_send(events: list[str]) -> int:
+    """
+    Count the pane captures taken before the first tmux keystroke.
+
+    :param events: Event list from :func:`_events_tmux`.
+    :returns: Number of ``"capture"`` entries preceding the first send.
+    """
+    first_send = next(i for i, event in enumerate(events) if event.startswith("send:"))
+    return sum(1 for event in events[:first_send] if event == "capture")
+
+
+def test_a_message_paste_waits_for_a_slash_command_in_the_box_to_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A paste holds while another writer's text sits in the composer.
+
+    The runner types ``/effort high`` from its own process while the harness
+    delivers the first web message. The paste's clear would wipe that
+    command and the runner's ``C-u`` the pasted message, so the harness must
+    not touch the box until the slash command has submitted and the box is
+    empty again.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    foreign = [_composer_pane("/effort high")] * 3
+    events = _events_tmux(monkeypatch, [*foreign, _IDLE_PANE])
+
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert _captures_before_first_send(events) > len(foreign), (
+        f"No keystroke may fire while the slash command is in the box; events: {events}"
+    )
+    keystrokes = [event for event in events if event.startswith("send:send-keys:")]
+    assert keystrokes[:2] == ["send:send-keys:C-a", "send:send-keys:C-k"], (
+        f"The paste's clear must run once the box is free; keystrokes: {keystrokes}"
+    )
+
+
+def test_a_slash_command_yields_to_a_message_being_pasted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A slash command waits out a pasted message instead of clearing it.
+
+    Its ``C-u`` exists to clear a person's leftover draft; a web message the
+    harness has pasted and is about to submit is not that, and clearing it
+    silently loses the message. The command must queue behind the paste and
+    only type once the composer has been free for the settle window.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    pasted = [_composer_pane("fix the flaky test")] * 2
+    settle = [_IDLE_PANE] * claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS
+    events = _events_tmux(
+        monkeypatch, [*pasted, *settle, _composer_pane("/effort high"), _IDLE_PANE]
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert _captures_before_first_send(events) >= len(pasted) + len(settle), (
+        f"C-u must wait for the paste to submit and the box to settle; events: {events}"
+    )
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:")]
+    assert tails == ["C-u", "/effort high", "Enter"], f"Unexpected keystrokes: {tails}"
+
+
+def test_a_slash_command_settles_on_a_freshly_mounted_composer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A slash command does not type on the first frame the composer mounts.
+
+    The runner's slash command and the harness's first message both wait on
+    the same boot; the frame that mounts the composer wakes both. The command
+    yields for the settle window so a paste already in flight lands first
+    (and is then waited out), instead of both writers typing into one box.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    settle = [_IDLE_PANE] * claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS
+    events = _events_tmux(
+        monkeypatch,
+        ["Starting Claude Code...", *settle, _composer_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert _captures_before_first_send(events) >= 1 + len(settle), (
+        f"C-u must wait for the settle window after the composer mounts; events: {events}"
+    )
+    assert "send:send-keys:Escape" not in events, (
+        f"A boot screen seen in one frame must not be Escaped; events: {events}"
+    )
+
+
+def test_a_leftover_draft_still_receives_the_message_after_the_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A person's unsent draft delays a web message; it does not block it.
+
+    Text that outlives the foreign-draft wait is nobody's in-flight submit,
+    so the paste proceeds exactly as before the wait existed: the draft is
+    cleared and the message delivered.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    events = _events_tmux(monkeypatch, [_composer_pane("my half-typed thought")])
+
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    verbs = [event.split(":")[1] for event in events if event.startswith("send:")]
+    assert "paste-buffer" in verbs, f"The message must still be pasted; events: {events}"
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:send-keys:")]
+    assert tails == ["C-a", "C-k", "Enter"], f"Unexpected keystrokes: {tails}"
+
+
+def test_a_leftover_draft_is_still_cleared_for_a_slash_command_after_the_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A person's unsent draft delays a slash command, then is cleared as before.
+
+    The ``C-u`` semantics for a leftover draft are unchanged; only text that
+    another writer is still submitting is waited out.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    events = _events_tmux(monkeypatch, [_composer_pane("my half-typed thought")])
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:")]
+    assert tails == ["C-u", "/effort high", "Enter"], f"Unexpected keystrokes: {tails}"
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_composer_pane(), False),
+        (_composer_pane("fix the flaky test"), True),
+        # Claude Code 2.1.280 separates the draft from the glyph with a
+        # non-breaking space.
+        ("─" * 30 + "\n❯\xa0/effort high\n" + "─" * 30 + "\n", True),
+        (_composer_pane("[Pasted text #1 +12 lines]"), True),
+        # The dim suggestion an empty box shows on some starts is chrome, not a draft.
+        ("─" * 30 + '\n❯\xa0Try "create a util logging.py that..."\n' + "─" * 30 + "\n", False),
+        # Shell mode is another input mode, not a chat draft.
+        ("─" * 30 + "\n! ls\n" + "─" * 30 + "\n", False),
+        ("Starting Claude Code...\n", False),
+        ("", False),
+    ],
+)
+def test_composer_holds_draft(pane: str, expected: bool) -> None:
+    """The draft check reads only the framed chat composer's own text."""
+    assert claude_native_bridge._composer_holds_draft(pane) is expected
 
 
 def test_a_slash_command_draft_that_never_renders_submits_blind(
