@@ -1,41 +1,9 @@
-"""E2E: WebSearch under a gateway-backed launch must not surface a US-only error.
+"""Gateway-backed Claude launches must withhold unsupported WebSearch.
 
-Claude Code's WebSearch client tool executes by issuing a *nested*
-``/v1/messages`` request that carries the server-side ``web_search`` tool.
-That nested request follows ``ANTHROPIC_BASE_URL`` too, so when Omnigent
-launches a native Claude terminal against a gateway (the Databricks AI
-Gateway path), it lands on the gateway, which rejects the server tool with a
-region-restriction error. Claude Code surfaces that rejection to the user as
-the WebSearch outcome ("API Error: 400 ... only available in the US ...").
-Against api.anthropic.com the identical nested request succeeds.
-
-Claude Code disables WebSearch itself for the provider paths it can detect
-(Bedrock, Vertex, its own enterprise-gateway mode), but a launch that only
-pins ``ANTHROPIC_BASE_URL`` reads as first-party to it, so the tool stays
-enabled and fails at use time. Omnigent knows the endpoint is a gateway, so
-the launch composition must withhold the tool.
-
-The journey is the user's own, driven end to end through the REAL ``claude``
-CLI launched with the REAL product composition
-(:func:`omnigent.claude_native._claude_terminal_request` — the same terminal
-spec the claude-native launch paths build):
-
-1. Omnigent composes the native-Claude terminal spec for a gateway-backed
-   provider (``ANTHROPIC_BASE_URL`` pointed at the gateway).
-2. The user asks Claude to search the web.
-3. The mock endpoint plays both the model and the gateway leg: any request
-   carrying the server ``web_search`` tool gets the gateway's real-world
-   US-only rejection; everything else behaves normally, and the model calls
-   WebSearch whenever it is offered.
-
-Expected (post-fix): the turn completes without surfacing the region
-restriction to the user — WebSearch is not offered under a gateway that
-cannot serve it, so the model answers without it. Before the fix the final
-output contains the API error text and this test FAILS.
-
-Self-contained: mocks only the gateway HTTP endpoint; the claude CLI and the
-launch composition are real. Requires no server, no credentials, no network.
-"""
+Run the real Claude CLI with the product terminal composition against a
+loopback mock gateway. The mock requests WebSearch when offered and rejects
+its nested server-side web_search tool with a region error. The visible
+turn must finish without that error. No live provider credentials are used."""
 
 from __future__ import annotations
 
@@ -51,8 +19,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_native import ClaudeNativeUcodeConfig, _claude_terminal_request
-from omnigent.claude_native_bridge import prepare_bridge_dir
+from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir
+from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig, _claude_terminal_request
 from tests.e2e._harness_probes import cli_unavailable_reason
 
 RESTRICTION_MESSAGE = (
@@ -62,18 +30,10 @@ RESTRICTION_MESSAGE = (
 
 
 class _MockGateway(http.server.ThreadingHTTPServer):
-    """Loopback stand-in for a Databricks AI Gateway Anthropic endpoint.
+    """Mock a model requesting WebSearch and a gateway rejecting its nested server tool.
 
-    Plays both roles the journey needs:
-
-    - the *model*: calls the ``WebSearch`` client tool whenever it is offered
-      (expanding it through ``ToolSearch`` first when deferred), echoes a
-      WebSearch outcome so it is user-visible, and answers in plain text when
-      no search tool is available;
-    - the *gateway leg*: any request whose ``tools`` carry the server-side
-      ``web_search`` tool is rejected with the US-only region restriction —
-      the exact behavior that breaks WebSearch on gateway-backed launches.
-    """
+    Expand deferred search through ToolSearch; answer normally when search
+    is absent and echo search outcomes when present."""
 
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -300,16 +260,7 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A web-search turn on a gateway-backed launch must not error US-only.
-
-    The launch is composed by the real
-    :func:`omnigent.claude_native._claude_terminal_request` (the claude-native
-    terminal spec) against a gateway that — like the Databricks AI Gateway —
-    rejects the server ``web_search`` tool with a region restriction. The
-    user-observable outcome must not be that rejection: before the fix the
-    final output contains ``API Error: 400 Web search is only available in
-    the US ...`` and this test fails.
-    """
+    """The real Claude launch must not expose the mock gateway's WebSearch region error."""
     reason = cli_unavailable_reason("claude")
     if reason is not None:
         pytest.skip(f"requires a runnable 'claude' CLI; {reason}")
@@ -383,7 +334,7 @@ def test_websearch_under_gateway_launch_does_not_surface_us_only_error(
 
     output = f"{proc.stdout}\n{proc.stderr}"
     model_turns = [r for r in gateway.requests if "/messages" in r["path"]]
-    assert model_turns, "the claude CLI never reached the gateway endpoint"
+    assert model_turns, f"the claude CLI never reached the gateway endpoint: {output[-2000:]}"
     assert proc.returncode == 0, f"claude CLI exited {proc.returncode}: {output[-2000:]}"
     assert proc.stdout.strip(), f"claude CLI produced no answer: {output[-2000:]}"
 
