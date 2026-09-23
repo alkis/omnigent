@@ -5399,6 +5399,19 @@ async def _forward_event_to_runner(
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id, created_by=created_by)
+    # Bind the validated submission id server-side (a raw client claim is
+    # stripped by _build_new_item) so a committed item can confirm an
+    # uncertain POST, matching the native drained-pending linkage.
+    raw_stable_id = body.data.get("stable_id")
+    if (
+        isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and isinstance(raw_stable_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+    ):
+        item = item.model_copy(
+            update={"data": item.data.model_copy(update={"client_submission_id": raw_stable_id})}
+        )
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
