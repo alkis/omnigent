@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { getBasePath, withBasePath } from "./basePath.ts";
+
 /**
  * Embed host integration seam.
  *
@@ -318,12 +320,10 @@ function recoverExpiredHostSession(error: unknown): void {
   }
 }
 
-/**
- * Single network choke point. Delegates to the host fetcher when embedded,
- * otherwise calls native `fetch` with the path unchanged (standalone).
- */
+/** Route embedded requests through the host and standalone requests through the base path. */
 export async function hostFetch(path: string, init?: RequestInit): Promise<Response> {
   if (hostConfig.fetcher) {
+    // The host owns path rebasing; `withBasePath` is standalone-only.
     try {
       const response = await hostConfig.fetcher(path, init);
       if (path === "/v1/me" && response.ok && !hostSessionRecoveryPending) {
@@ -339,7 +339,7 @@ export async function hostFetch(path: string, init?: RequestInit): Promise<Respo
       throw error;
     }
   }
-  return fetch(path, init);
+  return fetch(withBasePath(path), init);
 }
 
 export function resolveWebSocketUrl(path: string): string {
@@ -347,15 +347,15 @@ export function resolveWebSocketUrl(path: string): string {
     return hostConfig.resolveWebSocketUrl(path);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${path}`;
+  return `${scheme}//${window.location.host}${withBasePath(path)}`;
 }
 
 /**
  * Full server URL for CLI `--server` flags shown in in-product docs.
- * Returns `window.location.origin` plus the optional
- * {@link OmnigentHostConfig.cliServerUrlSuffix}.
+ * Returns `window.location.origin` plus the configured base path plus the
+ * optional {@link OmnigentHostConfig.cliServerUrlSuffix}.
  */
 export function getCliServerUrl(): string {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  return origin + (hostConfig.cliServerUrlSuffix ?? "");
+  return origin + getBasePath() + (hostConfig.cliServerUrlSuffix ?? "");
 }

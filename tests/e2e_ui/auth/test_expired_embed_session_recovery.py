@@ -1,30 +1,6 @@
-"""E2E: an expired embedded user session must recover, not wedge the app.
+"""Browser journey for one-shot embedded session recovery.
 
-Omnigent embedded in a host application (the Databricks monolith) routes every
-API call through the host's ``fetcher`` (``workspaceFetch``). Once the host
-user session expires, that fetcher REJECTS with
-``Error("Fetch request failed due to expired user session")`` instead of
-returning a ``Response``. The web app surfaced that rejection raw -- query
-surfaces (e.g. the sidebar session list) rendered
-"Failed to load: Fetch request failed due expired user session" and the app
-stayed wedged until the user manually reloaded the page.
-
-Expected behavior: the embed reloads the current URL once so the host can
-renew its session (or show its sign-in flow), after which the app recovers.
-
-The Databricks monolith itself cannot be driven in this harness, so the test
-mounts the REAL embed island (``web/src/embed.tsx`` -- ``OmnigentApp`` +
-``setOmnigentHostConfig``) inside a minimal stand-in host page, per the same
-embed contract the monolith uses: the host owns the page, the React tree, the
-router, and the transport ``fetcher``. The harness fetcher same-origin-proxies
-to the spawned live server and can be flipped into the expired state, from
-which every request rejects with the exact message ``workspaceFetch`` produces.
-A fresh page load models the host renewing its session (the monolith
-re-authenticates on navigation), so a recovery reload un-wedges the app while
-an unfixed build stays stuck on the raw error forever.
-
-Part of the gated e2e suite (needs ``pnpm`` + a vite build); see this
-package's ``conftest`` module docstring for how the suite is run.
+Uses the real embed UI with a local host fetcher that can reject after expiry.
 """
 
 from __future__ import annotations
@@ -48,21 +24,13 @@ from playwright.sync_api import Page, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WEB_DIR = _REPO_ROOT / "web"
-# Lives under web/ so the harness page's bare imports, Tailwind source
-# scanning, and the `@` alias resolve through web/node_modules exactly like
-# the production build. Generated + built by the fixture below; never
-# committed (only `dist`-like build output lands here).
+# Generated under web so imports and Tailwind resolve through its dependencies.
 _HARNESS_DIR = _WEB_DIR / ".e2e-embed-host"
 
-# The exact rejection the Databricks monolith's workspaceFetch produces once
-# the workspace user session has expired (see web/README.md, "Embedded
-# session recovery"). User reports carry the same message minus the "to",
-# so the assertion pattern tolerates both spellings.
 _EXPIRED_MESSAGE = "Fetch request failed due to expired user session"
 _EXPIRED_PATTERN = re.compile(r"Fetch request failed due (?:to )?expired user session")
 
-# Same-origin paths the harness server forwards to the spawned omnigent
-# server -- the set the SPA's own dev proxy forwards (web/vite.config.ts).
+# Match the SPA development proxy surface.
 _PROXY_PREFIXES = ("/v1", "/api", "/auth", "/health")
 
 _INDEX_HTML = """\
@@ -186,12 +154,7 @@ export default defineConfig({
 
 @pytest.fixture
 def browser_context_args(browser_context_args: dict[str, Any]) -> dict[str, Any]:
-    """Honor ``OMNIGENT_E2E_RECORD_DIR`` for the sync ``page`` fixture.
-
-    The conftest's ``_record_video`` monkeypatch only covers tests that drive
-    the *async* Playwright API themselves; this test uses pytest-playwright's
-    sync ``page`` fixture, whose context is built from these args.
-    """
+    """Honor ``OMNIGENT_E2E_RECORD_DIR`` for the synchronous page fixture."""
     record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
     if record_dir:
         return {**browser_context_args, "record_video_dir": record_dir}
@@ -200,24 +163,15 @@ def browser_context_args(browser_context_args: dict[str, Any]) -> dict[str, Any]
 
 @pytest.fixture(scope="session")
 def embed_host_dist(built_spa: None) -> Path:
-    """Write the embed-host harness sources under ``web/`` and vite-build them.
-
-    :param built_spa: Depended on to guarantee the web toolchain is installed
-        (``pnpm install``); the harness build does not use its output.
-    :returns: The harness ``dist`` directory (assets at its root, the page at
-        ``.e2e-embed-host/index.html``).
-    """
+    """Build the local embed-host harness after the web toolchain is installed."""
     _HARNESS_DIR.mkdir(exist_ok=True)
     (_HARNESS_DIR / "index.html").write_text(_INDEX_HTML)
     (_HARNESS_DIR / "host-entry.tsx").write_text(_HOST_ENTRY_TSX)
     (_HARNESS_DIR / "vite.config.mjs").write_text(_VITE_CONFIG_MJS)
     env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
-    # Reuse the SPA build lock: concurrent pytest sessions in the same
-    # worktree would otherwise clobber each other's emptyOutDir.
+    # Share the SPA build lock because both builds empty their output directory.
     with filelock.FileLock(str(_WEB_DIR / ".build.lock"), timeout=600):
-        # Invoke the vite binary directly: `pnpm exec` runs a deps-status
-        # check that can kick off a TTY-gated `pnpm install` and abort under
-        # captured pytest output.
+        # Avoid pnpm's interactive dependency check under captured pytest output.
         vite_bin = _WEB_DIR / "node_modules" / ".bin" / "vite"
         assert vite_bin.exists(), (
             f"{vite_bin} missing -- run `pnpm install --filter web` first "
@@ -241,16 +195,10 @@ def embed_host_dist(built_spa: None) -> Path:
 
 
 class _EmbedHostHandler(http.server.BaseHTTPRequestHandler):
-    """Static server + API proxy standing in for the monolith's page origin.
-
-    Serves the built harness page (SPA fallback for extension-less paths) and
-    forwards :data:`_PROXY_PREFIXES` requests to the spawned omnigent server,
-    so the embed's host fetcher stays same-origin exactly like
-    ``workspaceFetch`` (the omnigent server itself sends no CORS headers).
-    """
+    """Serve the harness and proxy its API calls to the local Omnigent server."""
 
     protocol_version = "HTTP/1.1"
-    # Injected onto the subclass by the fixture:
+    # Injected by the fixture's bound subclass.
     dist_root: Path
     index_html: bytes
     upstream: str
@@ -288,8 +236,7 @@ class _EmbedHostHandler(http.server.BaseHTTPRequestHandler):
 
     def _proxy(self) -> None:
         if "upgrade" in self.headers.get("Connection", "").lower():
-            # WebSockets go directly to the upstream (see resolveWebSocketUrl
-            # in the harness page); this HTTP-only proxy can't carry them.
+            # The harness routes WebSockets directly to the upstream.
             self.send_error(501, "WebSocket upgrade not supported by e2e proxy")
             return
         body = None
@@ -316,9 +263,7 @@ class _EmbedHostHandler(http.server.BaseHTTPRequestHandler):
         payload = upstream_resp.content
         self.send_response(upstream_resp.status_code)
         for k, v in upstream_resp.headers.items():
-            # httpx transparently decompressed the payload, so the encoding
-            # and length headers no longer describe it; hop-by-hop headers
-            # don't survive proxying at all.
+            # httpx decompressed the payload, invalidating encoding and length.
             if k.lower() in (
                 "content-length",
                 "content-encoding",
@@ -359,10 +304,7 @@ class _ThreadingServer(http.server.ThreadingHTTPServer):
 
 @pytest.fixture
 def embed_host_url(embed_host_dist: Path, live_server: str) -> Iterator[str]:
-    """Serve the built harness page on a random loopback port.
-
-    :returns: The harness origin, e.g. ``http://127.0.0.1:54321``.
-    """
+    """Serve the built harness on a random loopback port."""
     ws_base = "ws://" + live_server.removeprefix("http://")
     index_html = (
         (embed_host_dist / ".e2e-embed-host" / "index.html")
@@ -391,37 +333,17 @@ def test_expired_embedded_host_session_recovers(
     seeded_session: tuple[str, str],
     embed_host_url: str,
 ) -> None:
-    """An expired host session must trigger recovery, not a permanent raw error.
-
-    Journey (mirrors the user report): use embedded Omnigent normally,
-    let the host user session expire behind the tab, then interact again. The
-    unfixed app wedges on
-    "Failed to load: Fetch request failed due expired user session" until a
-    manual reload; the fixed app reloads itself once so the host renews the
-    session, and the UI comes back healthy.
-    """
     _, session_id = seeded_session
 
-    # --- the app works while the host session is alive -------------------
     page.goto(f"{embed_host_url}/")
     sidebar = page.get_by_test_id("sidebar-conversation-list")
     expect(sidebar).to_be_visible(timeout=30_000)
-    # The seeded session's row proves real data flowed through the host
-    # fetcher (not just static chrome); match by its /c/<id> link target,
-    # which is stable regardless of the row's display title.
+    # The seeded row proves data flowed through the host fetcher.
     expect(sidebar.locator(f'a[href="/c/{session_id}"]')).to_be_visible(timeout=15_000)
 
-    # --- the host user session expires behind the tab --------------------
     page.evaluate("window.__omnigentEmbedHarness.expire()")
 
-    # --- the next interaction loads data through the expired fetcher -----
-    # Switching the sidebar filter fires a fresh (uncached) session-list
-    # query; on the unfixed build its rejection surfaces raw in the sidebar
-    # ("Failed to load: ..." -- Sidebar's conversationsQuery error branch).
-    # On a fixed build a background poll (e.g. runner health) may already
-    # reject and trigger the recovery reload mid-click; that navigation makes
-    # a click throw, which is the recovery itself -- fall through to the
-    # verdict loop rather than failing the trigger.
+    # A background request may start recovery before the filter click completes.
     try:
         session_filter = page.get_by_test_id("session-filter")
         session_filter.hover()
@@ -430,30 +352,24 @@ def test_expired_embedded_host_session_recovers(
     except PlaywrightError:
         pass
 
-    # --- verdict: recovery reload vs. permanent wedge --------------------
-    # Fixed: the embed reloads the page once (hostFetch's expired-session
-    # recovery); a fresh page load renews the harness host session, so the
-    # in-memory `expired` flag reads False again. Buggy: no reload ever
-    # happens -- the flag stays True and the raw message sits on screen.
     deadline = time.monotonic() + 45.0
     recovered = False
     error_visible_since: float | None = None
     while time.monotonic() < deadline:
-        # Cooperative wait so Playwright keeps servicing page events.
         page.wait_for_timeout(250)
         try:
             still_expired = page.evaluate(
                 "window.__omnigentEmbedHarness && window.__omnigentEmbedHarness.expired()"
             )
         except PlaywrightError:
-            continue  # navigation in flight -- the recovery reload
+            continue
         if still_expired is False:
             recovered = True
             break
         if page.get_by_text(_EXPIRED_PATTERN).first.is_visible():
             error_visible_since = error_visible_since or time.monotonic()
             if time.monotonic() - error_visible_since > 8.0:
-                break  # wedged: raw error on screen, no recovery reload
+                break
 
     if not recovered:
         if error_visible_since is not None:
@@ -470,7 +386,5 @@ def test_expired_embedded_host_session_recovers(
             "query; check the harness trigger"
         )
 
-    # Fixed behavior, second half: after the recovery reload the renewed
-    # session must actually restore the app -- sidebar back, raw error gone.
     expect(page.get_by_test_id("sidebar-conversation-list")).to_be_visible(timeout=30_000)
     expect(page.get_by_text(_EXPIRED_PATTERN)).to_have_count(0)
