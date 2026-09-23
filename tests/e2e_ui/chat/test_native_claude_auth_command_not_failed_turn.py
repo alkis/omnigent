@@ -1,47 +1,7 @@
-r"""E2E: ``/login`` from web chat must not surface as a FAILED turn.
+"""Web /login and /logout must produce guidance without failing the native turn.
 
-On a claude-native session, typing ``/login`` or ``/logout`` into the web
-composer is intercepted before injection (``run_turn`` in
-``omnigent/inner/claude_native_executor.py``) and answered with the remedy
-that actually re-authenticates: "Claude Code's sign-in runs in its own
-terminal, so /login and /logout do nothing from the web chat. Run omni setup
-on the host to sign in again — or to sign out — then retry."
-
-The interception (pointing at ``omni setup``) is correct — but it delivers that guidance
-by yielding ``ExecutorError``. The executor adapter re-raises that as
-``RuntimeError("inner executor error: …")``
-(``omnigent/runtime/harnesses/_executor_adapter.py``), the runner classifies
-it as a broken turn, and:
-
-- the session status flips to ``failed`` with ``{'code': 'runner_error', …}``,
-- ``_publish_turn_status`` logs the canonical failed-turn KPI ERROR line
-  ``"turn surfaced to UI as failed for … (harness=claude-native): …"``
-  (``omnigent/runner/app.py``) — polluting the failed-turn KPI with an
-  expected, user-remediable dead end, and
-- the SPA shows the **destructive** error pill
-  ("Something went wrong setting up the turn on the host.", code
-  ``runner_error``) with the guidance buried behind "Expand for details".
-
-So an expected, user-remediable dead end is counted and displayed as an
-Omnigent turn failure. This test drives the real journey (a live ``claude``
-CLI in the session terminal) and asserts the desired contract:
-
-- the ``omni setup`` guidance must still reach the user (the interception
-  must not regress into silently spending a model turn), and
-- the turn must NOT surface as a failed turn (no destructive
-  ``data-level="error"`` pill carrying the guidance).
-
-While the bug is live the second assertion trips and the test FAILS. A fix
-that surfaces the guidance as a non-failed outcome — e.g. an ``info``-level
-notice pill (``ErrorBanner level="info"``) or a plain assistant/system
-message — makes both halves pass without pinning the fix's exact UI shape.
-
-The test deliberately keys on the failed-turn **status/pill** (published by
-the runner's own ``session.status`` stream), not on any assistant transcript
-bubble: the claude-native transcript forwarder is not required to observe this
-failure, so the reproduction holds even where transcript forwarding is
-unavailable.
-"""
+Drive the composer on a live, idle Claude terminal; distinguish terminal-startup
+failures from the intercepted auth command, then verify the durable notice."""
 
 from __future__ import annotations
 
@@ -77,11 +37,7 @@ _OUTCOME_WATCH_S = 120.0
 
 
 def _send(page: Page, text: str) -> None:
-    """Type *text* into the web composer and click Send.
-
-    :param page: The Playwright page, on the session's chat surface.
-    :param text: The message body to send.
-    """
+    """Submit text through the web composer."""
     composer = page.get_by_role("textbox", name=_COMPOSER_LABEL)
     expect(composer).to_be_editable(timeout=30_000)
     composer.fill(text)
@@ -108,36 +64,18 @@ def test_auth_slash_command_does_not_surface_as_failed_turn(
     native_claude_mock_session: tuple[str, str],
     command: str,
 ) -> None:
-    """An intercepted ``/login``/``/logout`` must inform, not fail, the turn.
-
-    Journey: open a claude-native session in the web chat, let the terminal
-    come up, then send the auth command. The ``omni setup`` guidance must
-    reach the user WITHOUT the turn surfacing as failed (destructive error
-    pill / ``runner_error`` classification / the failed-turn KPI ERROR log it
-    funnels through).
-
-    :param page: Playwright page (fresh context per test).
-    :param native_claude_mock_session: ``(base_url, session_id)`` on the
-        real claude-native wrapper.
-    :param command: The auth slash command under test.
-    """
+    """Intercepted auth commands must produce a notice and leave the turn successful."""
     base_url, session_id = native_claude_mock_session
 
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
 
-    # Wait for the composer to become editable, then let the claude-native
-    # terminal finish auto-launching. Sending the auth command against a live,
-    # idle terminal ensures it reaches run_turn's interception (not the
-    # mid-turn live-injection queue).
+    # An idle terminal routes the command through interception instead of live injection.
     composer = page.get_by_role("textbox", name=_COMPOSER_LABEL)
     expect(composer).to_be_editable(timeout=_FIRST_TURN_TIMEOUT_MS)
     time.sleep(_TERMINAL_SETTLE_S)
 
-    # Environment guard: if the claude-native terminal failed to launch here,
-    # a proactive destructive pill appears whose body is a launch error, NOT
-    # this bug's guidance. Distinguish that from the bug so we never claim a
-    # reproduction on an environment failure.
+    # Distinguish terminal-startup failures from the auth-command behavior under test.
     pre = page.locator(_DESTRUCTIVE_PILL)
     if pre.count() > 0:
         pre.first.click()
