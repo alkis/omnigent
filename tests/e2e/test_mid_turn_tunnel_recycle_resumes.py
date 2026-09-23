@@ -1,44 +1,7 @@
-"""E2E regression test: a mid-turn tunnel recycle must resume, not abort.
+"""A mid-turn tunnel recycle must resume without aborting the turn.
 
-Reproduces the reported failure: a websocket-tunnel close between the runner
-and the server (a routine server-side recycle -- close 1012 / a MAS pod
-recycle) aborts the in-flight turn the user is waiting on, surfacing as
-``session turn failed: Runner disconnected unexpectedly.`` -- even though the
-runner reconnects within a second and its turn is still running.
-
-The failing sites are the server's two disconnect publishers (the per-session
-relay supervisor and the runner-disconnect grace timer): both used to race a
-fixed reconnect grace against the runner's reconnect and publish the hard
-failure whenever the reconnect was slower, so a benign recycle read to the
-user as a failed turn instead of being held across the reconnect.
-
-Journey (user-observable):
-
-  1. A host/runner is online and bound to a session.
-  2. The user sends a turn; it starts running on the runner (mid-turn).
-  3. The runner<->server tunnel is recycled mid-turn (the runner survives and
-     keeps retrying -- a server-side pod recycle, NOT a runner death). The
-     recycled endpoint takes a little longer than the server's fixed reconnect
-     grace to come back (a routine MAS pod cold start / reschedule).
-  4. The user's turn fails on their live session stream with "Runner
-     disconnected unexpectedly." instead of resuming across the reconnect --
-     even though the runner reconnects seconds later and its turn completes.
-
-This stands up a real ``omnigent server`` (posture: accept exactly our
-token-bound runner) with a restartable TCP proxy in front of its runner tunnel,
-connects a real runner THROUGH the proxy so the tunnel can be severed on demand,
-opens a runner-bound session, live-tails that session's client SSE stream the
-way the web SPA does, drives a turn that the mock LLM holds open on a gate (so
-the turn is genuinely in-flight), recycles the tunnel and holds the endpoint
-down a little past the reconnect grace (``RUNNER_DISCONNECT_GRACE_S``), lets the
-runner reconnect, releases the gate, and asserts the user's stream did NOT
-surface the disconnect failure while the turn's answer still streamed across the
-reconnect.
-
-Run with::
-
-    .venv/bin/python -m pytest tests/e2e/test_mid_turn_tunnel_recycle_resumes.py -v
-"""
+Run the real server and runner through a controllable TCP proxy. Drop their
+tunnel during a turn, then verify reconnect and the client-facing SSE outcome."""
 
 from __future__ import annotations
 
@@ -85,14 +48,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _RecyclableProxy:
-    """A TCP proxy that can recycle its live tunnels on demand.
-
-    While forwarding, every accepted connection is piped byte-for-byte to the
-    backend (HTTP and WebSocket alike). :meth:`recycle` severs all live piped
-    connections -- exactly what a MAS pod / ingress recycle does to a tunnel --
-    while continuing to accept and forward NEW connections immediately, so the
-    runner's prompt reconnect lands on a healthy proxy.
-    """
+    """Forward TCP connections to the backend and allow active tunnels to be severed."""
 
     def __init__(self, backend_host: str, backend_port: int) -> None:
         self._backend = (backend_host, backend_port)
@@ -163,14 +119,7 @@ class _RecyclableProxy:
                 dst.shutdown(socket.SHUT_WR)
 
     def recycle(self, *, block_new: bool = False) -> None:
-        """Sever every live tunnel (server-side recycle).
-
-        :param block_new: When ``True``, also refuse new connections until
-            :meth:`resume` is called -- the recycled endpoint stays down, so the
-            runner's prompt reconnect attempts fail until the pod is back. When
-            ``False`` (default), new connections keep being accepted, so the
-            runner reconnects immediately onto a healthy proxy.
-        """
+        """Sever active tunnels and optionally refuse new connections until resume."""
         with self._lock:
             if block_new:
                 self._accepting = False
@@ -194,21 +143,7 @@ class _RecyclableProxy:
 
 
 class _SessionStreamViewer:
-    """Subscribe to the client-facing session SSE stream, as the web SPA does.
-
-    The web app opens ``GET /v1/sessions/{id}/stream`` (``Accept:
-    text/event-stream``) to live-tail a session; every ``session.status`` /
-    ``response.*`` event the server publishes reaches the user through it. This
-    viewer records the raw frames so the test can assert on what the user
-    actually saw. It reconnects on stream close (exactly as the SPA's live-tail
-    does), so a terminal ``failed`` event that ends one connection does not stop
-    it from also capturing the turn's later resumed output.
-
-    The viewer talks to the server DIRECTLY (not through the recyclable proxy),
-    so the recycle severs only the runner tunnel -- the user's stream stays up,
-    just like a real browser whose connection to the app is unaffected by a
-    backend pod recycling its runner tunnel.
-    """
+    """Collect the session SSE events consumed by the web client."""
 
     def __init__(self, base_url: str, session_id: str) -> None:
         self._url = f"{base_url}/v1/sessions/{session_id}/stream"
@@ -265,12 +200,7 @@ class _SessionStreamViewer:
 def _spawn_server(
     *, tmp_path: Path, mock_llm_server_url: str, binding_token: str
 ) -> tuple[subprocess.Popen[bytes], str, Path]:
-    """Start an ``omnigent server`` that accepts our own proxied runner.
-
-    Installs the tunnel allow-list token that authorizes exactly the runner we
-    spawn ourselves (through the proxy), matching the live E2E server posture.
-    Points the LLM and the server-side policy classifier at the mock server.
-    """
+    """Start a server allowing the isolated runner token used by this test."""
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "server.db"
@@ -359,12 +289,7 @@ def _spawn_runner(
     binding_token: str,
     runner_id: str,
 ) -> tuple[subprocess.Popen[bytes], Path]:
-    """Spawn a real runner that dials *dial_url* (the proxy) with *binding_token*.
-
-    Mirrors the live E2E server fixture's runner wiring: an explicit
-    ``OMNIGENT_RUNNER_ID`` (the token-bound id the server allow-lists), the
-    binding token, and its process log routed to a file.
-    """
+    """Start a real runner connected through the fault-injection proxy."""
     runner_log = tmp_path / "runner.log"
     log_handle = open(runner_log, "w")  # noqa: SIM115 -- lives for Popen's lifetime
     # PYTHONPATH must point at the worktree root so the harness subprocess the
@@ -412,28 +337,7 @@ def test_mid_turn_tunnel_recycle_resumes_rather_than_aborts(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """A mid-turn tunnel recycle must be ridden out, not failed.
-
-    A server-side tunnel recycle severs the runner<->server tunnel while a turn
-    is in flight; the runner survives and keeps reconnecting with an unchanged
-    token, and its turn stays fully viable (blocked on the mock gate).
-
-    ``RunnerRegistry.deregister`` aborts everything in flight on the close.
-    Pre-fix, the only thing that could save the turn was the relay/disconnect
-    reconnect grace (``RUNNER_DISCONNECT_GRACE_S`` = 10s) -- a fixed race: a
-    recycled endpoint that takes longer than the grace to accept the reconnect
-    (a routine MAS pod cold start / reschedule) exhausted it, and the server
-    published a hard ``failed`` -- "Runner disconnected unexpectedly." -- to the
-    user's live session stream, even though the runner never died and its turn
-    resumes and completes moments later. The fix holds a mid-turn outage for
-    ``RUNNER_TURN_RESUME_WINDOW_S`` instead.
-
-    This asserts, on the client-facing SSE stream the web SPA consumes, that the
-    user does NOT see the disconnect failure and that the turn's answer streams
-    across the reconnect. Pre-fix, the fixed grace lost that race and the
-    failure was published; the mid-turn hold across the turn-resume window
-    keeps the user's stream clean.
-    """
+    """Reconnect after a mid-turn tunnel recycle without publishing a failed turn."""
     if mock_llm_server_url is None:
         pytest.skip("requires the mock LLM server (mock mode)")
 
