@@ -167,6 +167,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
+    _cancel_pending_archive_stop,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
     _ensure_runner_relay_ready,
@@ -2582,14 +2583,20 @@ def register_core_routes(
             # rejected after this point can't leave a stopped-but-unarchived
             # session. Detached, not awaited: the response must not wait out
             # the stop's per-runner timeouts (seconds against a wedged or
-            # asleep runner). Archive has no client-side stop, so this also
-            # carries the host-runner teardown.
+            # asleep runner). The stop itself waits out the undo grace window
+            # so a prompt Undo restores a still-running session. Archive has
+            # no client-side stop, so this also carries the host-runner
+            # teardown.
             _spawn_archive_stop(
                 session_id,
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
             )
+        elif body.archived is False:
+            # Undo within the grace window: withdraw the deferred archive
+            # stop so the restored session keeps its running agent.
+            _cancel_pending_archive_stop(session_id)
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries
         # (today: claude-native, whose ``claude`` binary has

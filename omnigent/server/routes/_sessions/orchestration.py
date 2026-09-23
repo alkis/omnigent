@@ -712,6 +712,16 @@ async def _best_effort_stop(
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
+# Archive stops still waiting out their grace sleep, keyed by session id, so
+# an unarchive within the undo window can withdraw the teardown.
+# custom-lint: disable-next=workspace-scoped-cache -- Task registry
+_pending_archive_stops: dict[str, asyncio.Task[None]] = {}
+
+# How long an archive-triggered stop waits before firing. Covers the web
+# client's 3s post-archive Undo toast plus request latency, so an Undo
+# reaches the server while the stop can still be cancelled.
+_ARCHIVE_UNDO_GRACE_S = 5.0
+
 
 async def _archive_stop(
     session_id: str,
@@ -786,13 +796,23 @@ def _spawn_archive_stop(
     host_registry: Any = None,
 ) -> None:
     """
-    Run :func:`_archive_stop` as a retained background task.
+    Run :func:`_archive_stop` as a retained background task after the
+    undo grace window.
 
     Archiving needs the stop to *happen*, not to have happened before
     the response is written: awaiting it inline held the PATCH for the
     stop's per-runner timeouts (seconds per running session against a
     wedged or asleep runner) even though the archive proceeds
     regardless of the stop's outcome.
+
+    Nor may the stop fire before the client's post-archive Undo window
+    has passed: stopping the moment the flag committed tore the runner
+    down seconds before an Undo could land, so Undo restored a dead
+    session. The task sleeps out :data:`_ARCHIVE_UNDO_GRACE_S` first;
+    an unarchive in the meantime cancels it via
+    :func:`_cancel_pending_archive_stop`, and the archived flag is
+    re-checked after the sleep so an unarchive that bypassed the cancel
+    still keeps its runner.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
@@ -801,11 +821,61 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     """
-    task = asyncio.create_task(
-        _archive_stop(session_id, conversation_store, runner_router, host_registry)
-    )
+    # A re-archive replaces any still-pending stop, restarting the grace.
+    _cancel_pending_archive_stop(session_id)
+
+    async def _stop_after_grace() -> None:
+        await asyncio.sleep(_ARCHIVE_UNDO_GRACE_S)
+        # Leave the registry before stopping: a cancel from here on would
+        # interrupt a stop already in flight and leave it half torn down.
+        _pending_archive_stops.pop(session_id, None)
+        stop = True
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001
+            # Lookup failed; archived is the last state known committed.
+            _logger.debug(
+                "Archive-stop grace re-check failed for %s; stopping anyway",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            # A row unarchived during the grace keeps its runner; a deleted
+            # row already carried its own stop.
+            stop = conv is not None and conv.archived
+        if stop:
+            await _archive_stop(session_id, conversation_store, runner_router, host_registry)
+
+    task = asyncio.create_task(_stop_after_grace())
     _detached_stop_tasks.add(task)
-    task.add_done_callback(_detached_stop_tasks.discard)
+    _pending_archive_stops[session_id] = task
+
+    def _discard(done: asyncio.Task[None]) -> None:
+        _detached_stop_tasks.discard(done)
+        if _pending_archive_stops.get(session_id) is done:
+            del _pending_archive_stops[session_id]
+
+    task.add_done_callback(_discard)
+
+
+def _cancel_pending_archive_stop(session_id: str) -> bool:
+    """
+    Cancel a scheduled archive stop that has not fired yet.
+
+    Unarchiving within the undo grace window must restore a session
+    whose runner never stopped, so the deferred teardown from
+    :func:`_spawn_archive_stop` is withdrawn. A stop already past its
+    grace sleep has left the registry and proceeds untouched.
+
+    :param session_id: Session/conversation identifier.
+    :returns: ``True`` when a pending stop was cancelled.
+    """
+    task = _pending_archive_stops.pop(session_id, None)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
 
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
@@ -11019,6 +11089,7 @@ async def _get_session_snapshot(
 
 
 __all__ = [
+    "_ARCHIVE_UNDO_GRACE_S",
     "_accumulate_session_usage",
     "_archive_stop",
     "_best_effort_stop",
@@ -11026,6 +11097,7 @@ __all__ = [
     "_build_native_terminal_message_event",
     "_build_session_list_item",
     "_build_session_response",
+    "_cancel_pending_archive_stop",
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
@@ -11056,6 +11128,7 @@ __all__ = [
     "_maybe_wake_stale_resumable_managed_sandbox",
     "_native_subagent_wrapper_labels",
     "_native_terminal_runtime",
+    "_pending_archive_stops",
     "_persist_external_antigravity_subagent_start",
     "_persist_external_codex_subagent_start",
     "_persist_external_conversation_item",

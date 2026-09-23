@@ -16,6 +16,7 @@ import asyncio
 import gzip
 import io
 import tarfile
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -109,6 +110,16 @@ async def test_unarchive_restores_session_to_default_listing(
 # ── Best-effort stop before archive ───────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _no_undo_grace() -> Iterator[None]:
+    """Collapse the archive-stop undo grace so stop assertions are immediate.
+
+    Tests that exercise the grace window itself re-patch a real value.
+    """
+    with patch.object(_sessions_orchestration, "_ARCHIVE_UNDO_GRACE_S", 0.0):
+        yield
+
+
 async def _drain_detached_stops() -> None:
     """
     Wait out the archive PATCH's detached best-effort stop.
@@ -179,11 +190,12 @@ async def test_archive_does_not_block_on_slow_stop(
             assert resp.status_code == 200
             assert resp.json()["archived"] is True
             # The detached task starts on a subsequent loop pass and parks
-            # on the release gate — the stop still runs.
+            # on the release gate — the stop still runs. Real sleeps: the
+            # task hops through a to_thread store re-check before stopping.
             for _ in range(100):
                 if stopped:
                     break
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
             assert stopped == [session_id]
             release.set()
             await _drain_detached_stops()
@@ -411,6 +423,132 @@ async def test_unarchive_skips_stop(
             )
         assert resp.status_code == 200
         assert resp.json()["archived"] is False
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+# ── Post-archive undo grace window ───────────────────────
+
+
+async def test_archive_stop_waits_out_undo_grace(
+    client: httpx.AsyncClient,
+) -> None:
+    """The archive stop fires only after the undo grace window elapses.
+
+    Stopping the moment the archived flag committed tore the runner down
+    seconds before the client's ~3s Undo toast could land, so Undo
+    restored a dead session.
+    """
+    session = await create_test_session(client, name="archive-grace-defer")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_orchestration, "_ARCHIVE_UNDO_GRACE_S", 0.75),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True},
+            )
+            assert resp.status_code == 200
+            # Well inside the grace window the runner must be untouched.
+            await asyncio.sleep(0.25)
+            mock_stop.assert_not_awaited()
+            await asyncio.sleep(0.75)
+            await _drain_detached_stops()
+        mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_unarchive_within_grace_preserves_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """An unarchive during the grace window cancels the pending stop.
+
+    This is the post-archive Undo: the restored session must keep its
+    running agent rather than come back dead.
+    """
+    session = await create_test_session(client, name="archive-grace-undo")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_orchestration, "_ARCHIVE_UNDO_GRACE_S", 0.75),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": False},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["archived"] is False
+            # Wait past where the stop would have fired, then drain.
+            await asyncio.sleep(1.0)
+            await _drain_detached_stops()
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_rearchive_after_undo_schedules_fresh_stop(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archive → undo → archive again stops the session exactly once."""
+    session = await create_test_session(client, name="archive-grace-rearchive")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_orchestration, "_ARCHIVE_UNDO_GRACE_S", 0.3),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            await client.patch(f"/v1/sessions/{session_id}", json={"archived": False})
+            await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            await asyncio.sleep(0.5)
+            await _drain_detached_stops()
+        mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_grace_recheck_skips_stop_when_unarchived_out_of_band(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An unarchive that bypasses the PATCH route still keeps the runner.
+
+    The deferred stop re-checks the archived flag after its grace sleep,
+    so a flag flipped without going through the route's cancel (a future
+    bulk path, or a cancel it raced) does not strand a stopped-but-
+    unarchived session.
+    """
+    session = await create_test_session(client, name="archive-grace-oob")
+    session_id = session["id"]
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with (
+            patch.object(_sessions_orchestration, "_ARCHIVE_UNDO_GRACE_S", 0.3),
+            patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+        ):
+            await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            # Flip the flag directly in the store, bypassing the route.
+            await asyncio.to_thread(conv_store.update_conversation, session_id, archived=False)
+            await asyncio.sleep(0.5)
+            await _drain_detached_stops()
         mock_stop.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
