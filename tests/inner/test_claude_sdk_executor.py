@@ -555,7 +555,10 @@ class TestConstructor(unittest.TestCase):
         # Proves the selector is --profile, not --host. A regression to --host
         # makes a two-profiles-one-host workspace yield an empty token → 401.
         self.assertIn('databricks auth token --profile "oss"', helper)
-        self.assertNotIn("--host", helper)
+        # Scope to the CLI mint: it selects by --profile. The sdk fallback
+        # separately passes --host for its own workspace guard (identity is
+        # still pinned by --profile), so assert on the mint, not the whole helper.
+        self.assertNotIn("databricks auth token --host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
         # stays behind a `--help` capability probe — an older CLI rejects the
         # unknown flag and yields an empty token → silent 401.
@@ -761,6 +764,111 @@ class TestConstructor(unittest.TestCase):
             self.assertEqual(captured["model"], "system.ai.claude-opus-5")
 
         _run(_t())
+
+    def test_databricks_profile_model_resolution_cached_across_turns(self):
+        """The unpinned-session catalog resolution runs once per executor."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: list[str | None] = []
+            resolve_calls: list[str | None] = []
+
+            def fake_resolver(profile):
+                resolve_calls.append(profile)
+                return "system.ai.claude-opus-5"
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured.append(model)
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor._resolve_databricks_claude_model",
+                    side_effect=fake_resolver,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError):
+                        async for _ in executor.run_turn(
+                            [{"role": "user", "content": "hi"}], [], ""
+                        ):
+                            pass
+
+            self.assertEqual(captured, ["system.ai.claude-opus-5"] * 2)
+            self.assertEqual(len(resolve_calls), 1)
+
+        _run(_t())
+
+    def test_databricks_profile_model_substitution_warns(self):
+        """An unpinned session's silent model pick must emit a WARNING."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(
+                    host="https://example.cloud.databricks.com", token="dapi_test_token"
+                ),
+            ),
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+                return_value=SimpleNamespace(
+                    families={
+                        "sonnet": "system.ai.claude-sonnet-5",
+                        "opus": "system.ai.claude-opus-5",
+                    }
+                ),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "system.ai.claude-opus-5")
+        self.assertTrue(
+            any("system.ai.claude-opus-5" in message for message in logs.output),
+            f"no WARNING names the substituted model: {logs.output}",
+        )
+
+    def test_databricks_catalog_fallback_substitution_warns(self):
+        """The bundled-catalog fallback is also a substitution; it must warn."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+                side_effect=RuntimeError("live listing unavailable"),
+            ),
+            patch(
+                "omnigent.models.model_catalog.resolve_catalog_model",
+                return_value=SimpleNamespace(model_id="databricks-claude-default"),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "databricks-claude-default")
+        self.assertTrue(
+            any(
+                "databricks-claude-default" in message and "bundled catalog" in message
+                for message in logs.output
+            ),
+            f"no WARNING names the catalog-fallback model: {logs.output}",
+        )
 
     def test_neutral_gateway_no_model_does_not_inject_databricks_default(self):
         """Neutral gateway (base URL supplied directly) + no model → ``None``.
@@ -1007,16 +1115,28 @@ class TestConstructor(unittest.TestCase):
                 captured["model"] = model
                 raise RuntimeError("stop after model resolution")
 
-            with patch.object(
-                executor,
-                "_get_or_create_client",
-                side_effect=fake_get_or_create_client,
+            with (
+                patch(
+                    "omnigent.models.model_catalog.subprocess.run",
+                    side_effect=AssertionError("unexpected authentication subprocess"),
+                ) as auth_subprocess,
+                patch(
+                    "omnigent.models.model_catalog.httpx.Client",
+                    side_effect=AssertionError("unexpected model-listing HTTP client"),
+                ) as http_client,
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
             self.assertEqual(captured["model"], "databricks-claude-sonnet-4-6")
+            auth_subprocess.assert_not_called()
+            http_client.assert_not_called()
 
         _run(_t())
 
@@ -1506,9 +1626,45 @@ class TestResolveGatewayEnv(unittest.TestCase):
         with (
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.databricks_executor._read_databrickscfg", return_value=None),
+            # Host derivation no longer needs a static token, so "no creds"
+            # must also mean no host is resolvable from ~/.databrickscfg.
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg_host",
+                return_value=None,
+            ),
         ):
             env = _resolve_gateway_env()
             self.assertEqual(env, {})
+
+    def test_oauth_profile_without_token_resolves_from_host(self):
+        """An OAuth U2M profile (host, no static token) must resolve.
+
+        The SDK resolver returns ``None`` when it cannot mint a bearer
+        (e.g. no Databricks CLI OAuth state on this machine), but the
+        profile's ``host`` is always present — and the generated auth
+        command mints the bearer at request time — so the gateway env
+        must still resolve instead of failing with "requires gateway
+        credentials".
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("omnigent.inner.databricks_executor._read_databrickscfg", return_value=None),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg_host",
+                return_value="https://adb-12345.azuredatabricks.net",
+            ),
+        ):
+            env = _resolve_gateway_env("my-oauth-profile")
+        self.assertEqual(
+            env["ANTHROPIC_BASE_URL"],
+            "https://adb-12345.azuredatabricks.net/ai-gateway/anthropic",
+        )
+        self.assertIn(
+            'databricks auth token --profile "my-oauth-profile"',
+            env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
+        )
 
     def test_host_override_skips_profile_lookup(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -5651,11 +5807,6 @@ async def test_terminal_error_carries_observed_usage() -> None:
     assert usage["output_tokens"] == 0
 
 
-# ---------------------------------------------------------------------------
-# Tests: a cached client whose CLI child terminated is evicted between turns
-# ---------------------------------------------------------------------------
-
-
 def _make_transport_with_process(returncode):
     """Fake ``SubprocessCLITransport`` whose child reports *returncode*."""
 
@@ -5731,17 +5882,7 @@ def _make_recovery_fake_sdk():
 
 @pytest.mark.asyncio
 async def test_terminated_cli_client_is_evicted_and_turn_recovers() -> None:
-    """A cached client whose CLI child died is rebuilt, not written to.
-
-    The executor keeps one ``ClaudeSDKClient`` per session across turns. When
-    the ``claude`` CLI child is killed between turns (OS / cgroup / idle reap;
-    SIGTERM exits it with 143), nothing evicted the dead client, so the next
-    turn's ``query()`` hit the SDK transport's "Cannot write to terminated
-    process" and the crash boundary wedged the session permanently. The
-    executor must instead detect the terminated child before building the
-    prompt, discard the dead client, and run the turn on a fresh client with
-    full history replayed.
-    """
+    """Rebuild a cached client after its CLI child exits."""
     from omnigent.inner.claude_sdk_executor import (
         ClaudeSDKExecutor,
         _ClaudeClientState,
@@ -5771,31 +5912,23 @@ async def test_terminated_cli_client_is_evicted_and_turn_recovers() -> None:
     assert not errors, f"Turn after a terminated CLI must recover, got: {errors}"
     assert any(isinstance(e, TurnComplete) for e in events)
 
-    # The dead client was never written to; a fresh client ran the turn.
     dead_client.query.assert_not_called()
     assert len(fake_sdk.created_clients) == 1
     fresh = fake_sdk.created_clients[0]
     assert executor._clients["sess-1"].client is fresh
 
-    # The rebuilt session replays full history (resume_session was False).
     assert len(fresh.prompts) == 1
     prompt = fresh.prompts[0]
     assert isinstance(prompt, str)
     assert "first question" in prompt
     assert "second question" in prompt
 
-    # The eviction must not mark the session crashed: recovery, not poison.
     assert "sess-1" not in executor._crashed_sessions
 
 
 @pytest.mark.asyncio
 async def test_live_cached_client_is_reused_between_turns() -> None:
-    """A cached client with a running CLI child is reused, not rebuilt.
-
-    Guards the eviction check's polarity: only a positively terminated child
-    (``returncode`` set) triggers a rebuild. A live child keeps the resume
-    path — the turn sends just the trailing user content to the same client.
-    """
+    """Reuse a cached client while its CLI child is running."""
     from omnigent.inner.claude_sdk_executor import (
         ClaudeSDKExecutor,
         _ClaudeClientState,
@@ -5804,8 +5937,6 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
     fake_sdk = _make_recovery_fake_sdk()
     executor = ClaudeSDKExecutor()
 
-    # Seed a live cached client of the fake SDK's own type (so it can serve
-    # the turn), with a transport whose child is still running.
     live_client = fake_sdk.ClaudeSDKClient(options=None)
     fake_sdk.created_clients.clear()
     executor._clients["sess-1"] = _ClaudeClientState(client=live_client, model=None)
@@ -5821,7 +5952,6 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
     assert any(isinstance(e, TurnComplete) for e in events)
     assert not [e for e in events if isinstance(e, ExecutorError)]
 
-    # No rebuild: the cached client served the turn on the resume path.
     assert fake_sdk.created_clients == []
     assert executor._clients["sess-1"].client is live_client
     assert live_client.prompts == ["second question"]
