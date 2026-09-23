@@ -1124,18 +1124,29 @@ def _grant_reexpose_after_mask(
     Mirroring :func:`_interpreter_reexpose_after_mask`, re-emit exactly
     the hidden granted paths after the mask so they win right back. The
     masked dotdir itself is never re-bound, so grant siblings (e.g.
-    ``~/.omnigent/chat.db``) stay hidden. Two deny levers still beat a
-    grant:
+    ``~/.omnigent/chat.db``) stay hidden.
+
+    Replayed grants and replayed masks are emitted sorted by path depth
+    (shallowest first), so under bwrap's last-mount-wins layering the
+    most specific mount decides each path: a grant inside a mask stays
+    visible, a mask inside a grant stays hidden, a deeper grant inside
+    that mask stays visible, and overlapping read/write grants keep the
+    main bind pass's write-over-read precedence. A mask sorts before an
+    equal-path grant, so an explicitly granted dotpath beats its own
+    walker mask. Two deny levers still beat a grant:
 
     - an operator-declared ``mask_paths`` entry at or above the grant
-      (explicit deny outranks explicit allow), and
+      is never lifted: the grant under it is not re-exposed and the
+      mask itself is replayed unconditionally (explicit deny outranks
+      explicit allow), and
     - dotfile hygiene INSIDE a re-exposed grant directory: the masked
       ancestor made the cwd walk prune (and the extra-roots walk drop)
       before reaching the grant, so the grant subtree is scanned here
       and its masks are emitted after the re-expose bind — the same
-      masking the grant gets when no dotdir mask covers it. A re-mask
-      that would itself cover another explicit grant is dropped so the
-      deeper grant survives.
+      masking the grant gets when no dotdir mask covers it. A deeper
+      explicit grant wins back over such a re-mask by being re-bound
+      after it, never by dropping the re-mask, so the granted path's
+      ungranted siblings stay hidden.
 
     :param policy: Resolved sandbox policy carrying the grant lists.
     :param mask_args: The mask args produced by
@@ -1156,13 +1167,15 @@ def _grant_reexpose_after_mask(
         *(("--bind-try", fpath, False) for fpath in policy.write_files),
         *(("--ro-bind-try", root, True) for root in (policy.read_roots or [])),
     ]
-    granted_paths = [path for _, path, _ in grants]
     operator_masks = policy.mask_paths or []
 
     def _covered(path: Path, covers: Sequence[Path]) -> bool:
         return any(_is_within(path, c, resolve=False) for c in covers)
 
-    out: list[str] = []
+    # (depth, tie, tokens) layers, emitted depth-sorted so the deepest
+    # mount lands last and wins. Masks tie-sort before grants so an
+    # equal-path grant is emitted after its mask.
+    layers: list[tuple[int, int, list[str]]] = []
     seen: set[str] = set()
     reexposed_dirs: list[Path] = []
     for flag, path, is_dir in grants:
@@ -1174,17 +1187,14 @@ def _grant_reexpose_after_mask(
             continue
         if _covered(path, operator_masks):
             continue
-        out.extend([flag, str(path), str(path)])
+        layers.append((len(path.parts), 1, [flag, str(path), str(path)]))
         if is_dir:
             reexposed_dirs.append(path)
 
-    if not reexposed_dirs:
-        return out
+    seen_masks: set[str] = set()
 
-    seen_inner: set[str] = set()
-
-    def _add_inner(triple: list[str], dest: Path) -> None:
-        """Append a mask that must win back over a re-exposed grant."""
+    def _add_mask(tokens: list[str], dest: Path) -> None:
+        """Queue a mask that must win back over a re-exposed grant."""
         # Only masks strictly inside a re-exposed grant were shadowed by
         # the re-expose bind; anything else is already in effect.
         if not any(
@@ -1192,56 +1202,61 @@ def _grant_reexpose_after_mask(
             for g in reexposed_dirs
         ):
             return
-        # Never re-void another explicit grant: the deeper grant wins.
-        if any(_is_within(g, dest, resolve=False) for g in granted_paths):
-            return
         key = str(dest)
-        if key in seen_inner:
+        if key in seen_masks:
             return
-        seen_inner.add(key)
-        out.extend(triple)
+        seen_masks.add(key)
+        layers.append((len(dest.parts), 0, tokens))
 
-    # Original mask entries (walker hits and operator mask_paths) that
-    # the re-expose bind shadowed.
-    i = 0
-    while i < len(mask_args):
-        if mask_args[i] == "--tmpfs":
-            _add_inner(list(mask_args[i : i + 2]), Path(mask_args[i + 1]))
-            i += 2
-        elif mask_args[i] == "--bind-try":
-            _add_inner(list(mask_args[i : i + 3]), Path(mask_args[i + 2]))
-            i += 3
-        else:
-            i += 1
+    if reexposed_dirs:
+        # Original mask entries (walker hits and operator mask_paths)
+        # that a re-expose bind shadowed. Replayed unconditionally: a
+        # deeper explicit grant is re-bound after its covering mask via
+        # the depth sort, so ungranted content under the mask stays
+        # hidden and operator masks stay unconditional denies.
+        i = 0
+        while i < len(mask_args):
+            if mask_args[i] == "--tmpfs":
+                _add_mask(list(mask_args[i : i + 2]), Path(mask_args[i + 1]))
+                i += 2
+            elif mask_args[i] == "--bind-try":
+                _add_mask(list(mask_args[i : i + 3]), Path(mask_args[i + 2]))
+                i += 3
+            else:
+                i += 1
 
-    # Fresh dotfile scan of each re-exposed grant subtree, which the
-    # pruned cwd walk and the under-cwd root drop never reached.
-    safe_roots = _bwrap_safe_roots(cwd, policy, argv=argv)
-    allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
-    skip_roots = policy.mask_scan_skip_roots or []
-    for root in reexposed_dirs:
-        if _covered(root, skip_roots):
-            continue
-        try:
-            entries = scan_cwd_mask_entries(
-                root,
-                allow_hidden=allow_hidden,
-                safe_roots=safe_roots,
-                max_entries=policy.cwd_hidden_scan_max_entries,
-                overflow=policy.cwd_hidden_scan_overflow,
-                recursive=policy.cwd_hidden_scan_recursive,
-                logger_name=__name__,
-                scope_label="re-exposed grant",
-            )
-        except OSError as err:
-            raise OSError(
-                f"dotfile mask scan overflowed while walking the re-exposed "
-                f"grant root {root}. Narrow the grant or tune the scan "
-                f"limits. {err}"
-            ) from err
-        for entry in entries:
-            _add_inner(_mask_entry_args([entry]), entry.path)
+        # Fresh dotfile scan of each re-exposed grant subtree, which the
+        # pruned cwd walk and the under-cwd root drop never reached.
+        safe_roots = _bwrap_safe_roots(cwd, policy, argv=argv)
+        allow_hidden = policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else []
+        skip_roots = policy.mask_scan_skip_roots or []
+        for root in reexposed_dirs:
+            if _covered(root, skip_roots):
+                continue
+            try:
+                entries = scan_cwd_mask_entries(
+                    root,
+                    allow_hidden=allow_hidden,
+                    safe_roots=safe_roots,
+                    max_entries=policy.cwd_hidden_scan_max_entries,
+                    overflow=policy.cwd_hidden_scan_overflow,
+                    recursive=policy.cwd_hidden_scan_recursive,
+                    logger_name=__name__,
+                    scope_label="re-exposed grant",
+                )
+            except OSError as err:
+                raise OSError(
+                    f"dotfile mask scan overflowed while walking the re-exposed "
+                    f"grant root {root}. Narrow the grant or tune the scan "
+                    f"limits. {err}"
+                ) from err
+            for entry in entries:
+                _add_mask(_mask_entry_args([entry]), entry.path)
 
+    layers.sort(key=lambda layer: (layer[0], layer[1]))
+    out: list[str] = []
+    for _, _, tokens in layers:
+        out.extend(tokens)
     return out
 
 

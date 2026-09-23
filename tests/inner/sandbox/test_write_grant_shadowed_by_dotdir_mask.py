@@ -228,11 +228,15 @@ def test_read_through_granted_path_under_home_cwd(
     os_env = create_os_environment(_codex_bridge_spec(home, home))
     try:
         result = run_async(os_env.read(str(codex_home / "config.toml")))
+        sibling = run_async(os_env.read(str(home / ".omnigent" / "chat.db")))
     finally:
         os_env.close()
 
     assert "error" not in result, f"granted CODEX_HOME is invisible inside the sandbox: {result}"
     assert "gpt-5-codex" in str(result.get("content", ""))
+    assert "error" in sibling or "secret" not in str(sibling.get("content", "")), (
+        f"~/.omnigent content outside the grant must stay masked in the namespace: {sibling}"
+    )
 
 
 @pytest.mark.skipif(
@@ -262,3 +266,93 @@ def test_read_through_granted_path_with_project_cwd(
         f"control read of granted CODEX_HOME with a project cwd failed: {result}"
     )
     assert "gpt-5-codex" in str(result.get("content", ""))
+
+
+@pytest.mark.skipif(
+    not _bwrap_functional(),
+    reason="bwrap cannot create namespaces on this host",
+)
+def test_write_through_granted_child_of_read_root_under_home_cwd(
+    tmp_path: Path,
+    sandbox_pythonpath_env: None,
+) -> None:
+    """End-to-end: a write grant nested under a read root stays writable.
+
+    Both grants live under a masked cwd dotdir, so both are replayed
+    after the mask; the read-only parent must not be mounted on top of
+    the writable child, and the parent itself must stay read-only.
+    """
+    home = tmp_path / "home"
+    read_root = home / ".cfg" / "service"
+    write_child = read_root / "child"
+    write_child.mkdir(parents=True)
+
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(home),
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap",
+            read_paths=[_repo_root_for_pythonpath(), str(read_root)],
+            write_paths=[str(write_child)],
+            allow_network=False,
+        ),
+    )
+    os_env = create_os_environment(spec)
+    try:
+        granted = run_async(os_env.write(str(write_child / "data.txt"), "written\n"))
+        denied = run_async(os_env.write(str(read_root / "nope.txt"), "denied\n"))
+    finally:
+        os_env.close()
+
+    assert "error" not in granted, (
+        f"write into the granted child under an overlapping read root failed: {granted}"
+    )
+    assert "error" in denied, (
+        f"the read root outside the write child must stay read-only: {denied}"
+    )
+
+
+@pytest.mark.skipif(
+    not _bwrap_functional(),
+    reason="bwrap cannot create namespaces on this host",
+)
+def test_granted_file_stays_visible_while_masked_siblings_stay_hidden(
+    tmp_path: Path,
+    sandbox_pythonpath_env: None,
+) -> None:
+    """End-to-end: a granted file inside a re-masked dotdir is readable
+    while its ungranted siblings stay hidden inside the namespace.
+    """
+    home = tmp_path / "home"
+    grant = home / ".grant"
+    secret_dir = grant / ".secret"
+    secret_dir.mkdir(parents=True)
+    auth = secret_dir / "auth.json"
+    auth.write_text('{"token": "granted"}\n')
+    (secret_dir / "other.txt").write_text("private\n")
+
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(home),
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap",
+            read_paths=[_repo_root_for_pythonpath()],
+            write_paths=[str(grant)],
+            write_files=[str(auth)],
+            allow_network=False,
+        ),
+    )
+    os_env = create_os_environment(spec)
+    try:
+        granted = run_async(os_env.read(str(auth)))
+        sibling = run_async(os_env.read(str(secret_dir / "other.txt")))
+    finally:
+        os_env.close()
+
+    assert "error" not in granted, (
+        f"the granted file inside the re-masked dotdir is invisible: {granted}"
+    )
+    assert "granted" in str(granted.get("content", ""))
+    assert "error" in sibling or "private" not in str(sibling.get("content", "")), (
+        f"an ungranted sibling of the granted file leaked through the mask: {sibling}"
+    )
