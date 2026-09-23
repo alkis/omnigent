@@ -10434,6 +10434,86 @@ def test_a_surface_before_a_draft_does_not_shorten_the_draft_wait(
     )
 
 
+def test_a_late_blank_capture_does_not_end_the_draft_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A torn frame late in a draft wait does not end that wait.
+
+    A search occupies the first 2.55 s, another writer's draft appears at
+    2.70 s, and a blank capture lands at 5.10 s while the draft is still in
+    the box. A blank bound anchored at entry would already be expired and
+    hand the box back for the C-u; the bound must follow the last frame that
+    showed the composer instead.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    search_frames = int(2.55 / poll)
+    draft_before_blank = int(2.4 / poll)
+    draft_after_blank = int(0.9 / poll)
+    settle = [_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1)
+    events = _events_tmux(
+        monkeypatch,
+        [
+            *[_REVERSE_SEARCH_PANE] * search_frames,
+            *[_composer_pane("fix the flaky test")] * draft_before_blank,
+            "",
+            *[_composer_pane("fix the flaky test")] * draft_after_blank,
+            *settle,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    first_cu = events.index("send:send-keys:C-u")
+    captures_before = sum(1 for event in events[:first_cu] if event == "capture")
+    assert captures_before >= search_frames + draft_before_blank + 1 + draft_after_blank, (
+        f"C-u fired on the blank frame while the draft was still in the box; events: {events[:70]}"
+    )
+
+
+def test_a_late_blank_capture_does_not_shorten_the_settle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A torn frame during the settle neither counts nor ends the settle.
+
+    After a long surface and draft wait (over five seconds from entry), two
+    free frames, a blank, then more free frames: the command may type only
+    once the full settle window of free frames has been seen.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    search_frames = int(3.0 / poll)
+    draft_frames = int(2.55 / poll)
+    settle_polls = claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS
+    events = _events_tmux(
+        monkeypatch,
+        [
+            *[_REVERSE_SEARCH_PANE] * search_frames,
+            *[_composer_pane("fix the flaky test")] * draft_frames,
+            _IDLE_PANE,
+            _IDLE_PANE,
+            "",
+            *[_IDLE_PANE] * (settle_polls - 2 + 1),  # rest of the settle + pending check
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    first_cu = events.index("send:send-keys:C-u")
+    captures_before = sum(1 for event in events[:first_cu] if event == "capture")
+    assert captures_before >= search_frames + draft_frames + settle_polls + 1, (
+        f"C-u fired after the blank frame with the settle incomplete; events: {events[:80]}"
+    )
+
+
 def test_a_slash_command_draft_that_never_renders_submits_blind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

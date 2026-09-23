@@ -5389,14 +5389,15 @@ def _restore_occupied_input(
     # Each budget starts when its subject is first seen, not at entry: time
     # spent dismissing a surface must not shorten the draft wait, and time
     # spent waiting out a draft must not leave a surface that opens afterwards
-    # without one Escape attempt. Torn frames are bounded from entry.
+    # without one Escape attempt. A run of torn (blank) frames is bounded
+    # from the last frame that showed the composer, so it can neither end an
+    # active draft wait nor a settle early, nor spin forever.
     deadline: float | None = None
     draft_deadline: float | None = None
-    torn_deadline = time.monotonic() + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
+    torn_deadline: float | None = None
     last_escape: float | None = None
     confirmed = False
     free_polls = 0
-    saw_composer = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
@@ -5413,14 +5414,15 @@ def _restore_occupied_input(
         now = time.monotonic()
         if surface is None:
             if not pane.strip():
-                # A torn capture says nothing. Before any decisive frame it is
+                # A torn capture says nothing. Before any composer frame it is
                 # handed back as before; mid-wait it is neither a free box nor a
-                # draft, so it counts for nothing and the wait goes on (bounded).
-                if not saw_composer or now >= torn_deadline:
+                # draft, so it counts for nothing and the wait goes on, bounded
+                # from the last composer frame.
+                if torn_deadline is None or now >= torn_deadline:
                     return None
                 time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
                 continue
-            saw_composer = True
+            torn_deadline = now + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
             if _composer_holds_draft(pane):
                 free_polls = 0
                 if draft_deadline is None:
