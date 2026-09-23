@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from websockets.datastructures import Headers
@@ -415,6 +415,112 @@ async def test_handle_model_options_uses_host_pi_configuration(
     )
 
 
+@pytest.mark.parametrize("harness", ["devin-native", "native-devin", "devin"])
+async def test_handle_model_options_missing_devin_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+) -> None:
+    """Repeated picker requests for an absent optional CLI must not flood host logs."""
+    from omnigent.harnesses.devin_native import main as devin_native
+
+    monkeypatch.setattr(devin_native, "resolve_cli_binary", lambda *_args, **_kwargs: None)
+    run = Mock(side_effect=AssertionError("a missing CLI must not spawn a subprocess"))
+    monkeypatch.setattr(devin_native, "subprocess", SimpleNamespace(run=run))
+    host = _make_host_process()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        for i in range(3):
+            result = await host._handle_model_options(
+                HostModelOptionsFrame(request_id=f"missing_{i}", harness=harness),
+            )
+            assert result.status == "failed"
+            assert result.models == []
+            assert result.error is not None
+            assert "requires the 'devin' CLI" in result.error
+            assert "OMNIGENT_DEVIN_PATH" in result.error
+
+    run.assert_not_called()
+    assert not caplog.records
+
+
+async def test_handle_model_options_devin_recovers_after_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed preview must not hide a later install or configured executable."""
+    from omnigent.harnesses.devin_native import main as devin_native
+
+    resolve = Mock(return_value=None)
+    monkeypatch.setattr(devin_native, "resolve_cli_binary", resolve)
+    monkeypatch.setenv("OMNIGENT_DEVIN_PATH", "/custom/bin/devin")
+    host = _make_host_process()
+    host._configured_harnesses = {"devin-native": False}
+    first = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="missing", harness="devin-native"),
+    )
+    assert first.status == "failed"
+
+    resolve.return_value = "/custom/bin/devin"
+    run = Mock(
+        return_value=SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "default_model": "test-family",
+                    "families": [{"slug": "test-family", "family_label": "Test Family"}],
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(devin_native, "subprocess", SimpleNamespace(run=run))
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="installed", harness="devin-native"),
+    )
+
+    assert result.status == "ok"
+    assert result.models == [
+        {
+            "id": "test-family",
+            "displayName": "Test Family",
+            "isDefault": True,
+            "source": {"kind": "subscription", "label": "Subscription", "name": "devin"},
+        }
+    ]
+    assert resolve.call_args.args == ("/custom/bin/devin",)
+    assert run.call_args.args[0] == ["/custom/bin/devin", "models", "list", "--format", "json"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.CalledProcessError(1, "devin"),
+        subprocess.TimeoutExpired("devin", 10),
+        ValueError("invalid model catalog"),
+    ],
+)
+async def test_handle_model_options_devin_probe_failure_still_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    """Failures from an installed CLI remain diagnosable in the host log."""
+    from omnigent.harnesses.devin_native import main as devin_native
+
+    monkeypatch.setattr(devin_native, "list_devin_cli_model_options", Mock(side_effect=failure))
+    host = _make_host_process()
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="failed", harness="devin-native"),
+        )
+
+    assert result.status == "failed"
+    assert result.models == []
+    assert result.error == "failed to resolve Devin model options"
+    record = next(r for r in caplog.records if r.message == "Devin model catalog unavailable")
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
+    assert record.exc_info[1] is failure
+
+
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str
@@ -615,9 +721,11 @@ async def test_handle_launch_spawns_subprocess(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    binding_token: str,
 ) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
@@ -629,7 +737,7 @@ async def test_handle_launch_fails_for_bad_workspace(
     host = _make_host_process()
     frame = HostLaunchRunnerFrame(
         request_id="req_002",
-        binding_token="token_xyz",
+        binding_token=binding_token,
         workspace="/nonexistent/path/that/does/not/exist",
         session_id="session_missing_workspace",
     )
@@ -644,6 +752,17 @@ async def test_handle_launch_fails_for_bad_workspace(
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
     assert result.runner_id is None
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    assert failure.session_id == frame.session_id
+    assert failure.attributes["runner_id"] == (
+        token_bound_runner_id(binding_token) if binding_token.strip() else None
+    )
+    assert failure.attributes["host_request_id"] == frame.request_id
+    assert failure.attributes["error_code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "session_missing_workspace" in caplog.text
     assert "/nonexistent/path/that/does/not/exist" in caplog.text
     output = capsys.readouterr().out
@@ -652,9 +771,11 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "/nonexistent/path/that/does/not/exist" in output
 
 
+@pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    binding_token: str,
 ) -> None:
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
@@ -678,7 +799,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
 
     frame = HostLaunchRunnerFrame(
         request_id="req_unconfigured",
-        binding_token="token_abc",
+        binding_token=binding_token,
         workspace=str(workspace),
         harness="codex",
     )
@@ -3256,6 +3377,43 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     # The named var reaches the runner; an unnamed one does not.
     assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
     assert "DATABRICKS_UNNAMED" not in runner_env
+
+
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+@pytest.mark.parametrize("setting", [None, "1", "0"])
+async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    setting: str | None,
+) -> None:
+    """Forward an explicit capture setting without enabling capture by default."""
+    from omnigent.cli import _build_host_daemon_env
+
+    flag_name = "OMNIGENT_HARNESS_STDERR_ENABLED"
+    sibling_name = "OMNIGENT_HARNESS_STDERR_UNRELATED"
+    monkeypatch.delenv(flag_name, raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setenv(sibling_name, "must-not-forward")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    if setting is not None:
+        monkeypatch.setenv(flag_name, setting)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:8000",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    for env in (daemon_env, runner_env):
+        if setting is None:
+            assert flag_name not in env
+        else:
+            assert env[flag_name] == setting
+    assert sibling_name not in runner_env
 
 
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
@@ -5999,6 +6157,152 @@ async def test_slow_frame_does_not_head_of_line_block(
     release_slow.set()
     await _drain_frame_tasks(host)
     assert any('"req_slow"' in frame for frame in ws.sent)
+
+
+@pytest.mark.parametrize("stage", ["queued", "preflight", "spawn"])
+async def test_runner_status_waits_for_pending_launch(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pending launches must not look absent, including while queued."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    loop = asyncio.get_running_loop()
+    launch_started = asyncio.Event()
+    status_started = asyncio.Event()
+    release_launch = threading.Event()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+
+    def _pause() -> None:
+        loop.call_soon_threadsafe(launch_started.set)
+        assert release_launch.wait(5.0), "test did not release launch"
+
+    def _preflight(_harness: str) -> bool:
+        if stage == "preflight":
+            _pause()
+        return True
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        if stage == "spawn":
+            _pause()
+        return proc, tmp_path / "runner.log"
+
+    real_status = host._handle_runner_status
+
+    async def _status(frame: HostRunnerStatusFrame) -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await real_status(frame)
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _preflight)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    monkeypatch.setattr(host, "_handle_runner_status", _status)
+    frame = HostLaunchRunnerFrame(
+        request_id="launch",
+        binding_token="pending-token",
+        workspace=str(tmp_path),
+        harness="claude-native",
+    )
+    runner_id = token_bound_runner_id(frame.binding_token)
+    if stage == "queued":
+        await host._runner_lifecycle_lock.acquire()
+    launch = asyncio.create_task(host._dispatch_host_frame(ws, frame))  # type: ignore[arg-type]
+    queries: list[asyncio.Task[None]] = []
+    try:
+        if stage != "queued":
+            await asyncio.wait_for(launch_started.wait(), 5.0)
+        query = asyncio.create_task(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="status", runner_id=runner_id)
+            )
+        )
+        queries.append(query)
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not query.done(), f"pending launch reported a premature status: {ws.sent}"
+
+        unrelated = await asyncio.wait_for(
+            real_status(HostRunnerStatusFrame(request_id="unrelated", runner_id="runner_absent")),
+            1.0,
+        )
+        assert unrelated.status == "unknown"
+
+        query.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query
+        status_started.clear()
+        second = asyncio.create_task(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="second", runner_id=runner_id)
+            )
+        )
+        queries.append(second)
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not second.done(), "cancelling one query must not settle the pending launch"
+    finally:
+        release_launch.set()
+        if stage == "queued":
+            host._runner_lifecycle_lock.release()
+        await asyncio.wait_for(asyncio.gather(launch, *queries, return_exceptions=True), 5.0)
+        await asyncio.gather(*host._watcher_tasks)
+
+    results = [decode_host_frame(raw) for raw in ws.sent]
+    statuses = [result for result in results if isinstance(result, HostRunnerStatusResultFrame)]
+    assert [(result.request_id, result.status) for result in statuses] == [("second", "alive")]
+    assert host._runners[runner_id].proc is proc
+
+
+@pytest.mark.parametrize("outcome", ["refused", "error"])
+async def test_runner_status_settles_after_unsuccessful_launch(
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusal and handler failure must release status waiters."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    status_started = asyncio.Event()
+    frame = HostLaunchRunnerFrame(
+        request_id="launch", binding_token="failed-token", workspace="/w"
+    )
+
+    async def _launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        entered.set()
+        await release.wait()
+        if outcome == "error":
+            raise RuntimeError("launch handler failed")
+        return HostLaunchRunnerResultFrame(request_id=frame.request_id, status="failed")
+
+    async def _query() -> HostRunnerStatusResultFrame:
+        status_started.set()
+        return await host._handle_runner_status(
+            HostRunnerStatusFrame(
+                request_id="status",
+                runner_id=token_bound_runner_id(frame.binding_token),
+            )
+        )
+
+    monkeypatch.setattr(host, "_handle_launch", _launch)
+    launch = asyncio.create_task(host._dispatch_host_frame(ws, frame))  # type: ignore[arg-type]
+    query: asyncio.Task[HostRunnerStatusResultFrame] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5.0)
+        query = asyncio.create_task(_query())
+        await asyncio.wait_for(status_started.wait(), 5.0)
+        assert not query.done()
+        release.set()
+        result = await asyncio.wait_for(query, 5.0)
+        assert result.status == "unknown"
+        assert not host._pending_runner_launches
+    finally:
+        release.set()
+        await asyncio.gather(launch, return_exceptions=True)
+        if query is not None:
+            query.cancel()
+            await asyncio.gather(query, return_exceptions=True)
 
 
 async def test_stop_frame_never_overtakes_launch(

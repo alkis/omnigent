@@ -709,7 +709,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-role="user"
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
-      className={cn("max-w-[640px]", flashing && "animate-message-highlight")}
+      className="max-w-[640px]"
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
@@ -736,6 +736,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             </Tooltip>
           )}
           <MessageContent
+            className={flashing ? "animate-message-highlight" : undefined}
             // Another contributor's bubble takes their avatar color at low
             // alpha instead of the default bg-muted.
             style={
@@ -747,7 +748,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 non-wrapping strip would sit off-screen in the overflow and
                 look like it never rendered. */}
             {images.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-2">
+              <div className="mb-1.5 flex flex-wrap items-start gap-2">
                 {keyedAttachments(
                   images,
                   (img) => img.file_id ?? img.image_url ?? img.filename,
@@ -763,8 +764,6 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                             : undefined
                         }
                         alt={preview.alt}
-                        // Sizing lives in SessionImage, which reserves a matching
-                        // box so the bubble's height is settled before bytes land.
                         className="rounded-md object-contain"
                       />
                     );
@@ -984,14 +983,18 @@ function AssistantBubble({
         data-role="assistant"
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={cn(
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]",
-          flashing && "animate-message-highlight",
-        )}
+        className={
+          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
+        }
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
             than shrink-wrapping to the summary row's ~110px. */}
-        <MessageContent className={spansFullColumn || foldOnly ? "w-full" : undefined}>
+        <MessageContent
+          className={cn(
+            (spansFullColumn || foldOnly) && "w-full",
+            flashing && "animate-message-highlight rounded-lg",
+          )}
+        >
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}

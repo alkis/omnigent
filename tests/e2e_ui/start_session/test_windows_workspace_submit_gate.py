@@ -1,21 +1,6 @@
-"""E2E: the landing submit gate must accept a Windows drive-letter workspace.
+"""A Windows workspace picked through the host tunnel must enable Start session.
 
-Regression guard: on a native Windows host, picking a working directory
-such as ``C:\\Users\\alice\\work`` filled the folder chip, but the
-composer's Start session control stayed disabled with the tooltip
-"Please choose a host and working directory". The landing submit gate
-(``isValidWorkspace`` in ``NewChatDialog.tsx``) accepted only paths
-starting with ``/``, so ``workspaceValid`` stayed false even though the
-picker, the browse API, and session create all accept the same path.
-
-Test shape: same fake-Windows-host-over-the-real-tunnel geometry as
-``test_windows_workspace_picker`` — the real server routes and the real
-SPA run the exact production path a Windows machine exercises. The test
-picks ``C:\\Users\\alice\\work`` through the picker, confirms the chip
-shows that path, types a message, and asserts the Start session control
-enables and dispatches a create carrying the drive-letter workspace.
-Only ``POST /v1/sessions`` is stubbed (captured), so the fake host never
-needs a runner.
+The host is simulated; agent discovery and session creation are stubbed.
 """
 
 from __future__ import annotations
@@ -39,13 +24,7 @@ _PICKED_DIR = "C:\\Users\\alice\\work"
 
 
 def test_windows_workspace_enables_start_session(live_server: str) -> None:
-    """Picking ``C:\\Users\\alice\\work`` must enable Start session.
-
-    The failure mode this catches: the workspace chip shows the picked
-    drive-letter directory, the host is online, an agent is selected and
-    the composer has text, yet the submit stays disabled because the
-    submit gate rejects any workspace not starting with ``/``.
-    """
+    """Picking a drive-letter directory must enable Start session."""
     _run_in_fresh_loop(_drive_windows_submit(live_server))
 
 
@@ -103,16 +82,12 @@ async def _drive_windows_submit(base_url: str) -> None:
 
             await _open_picker_at_windows_home(page, base_url, host_id)
 
-            # Browse into the picked directory and commit it back to the chip.
             await page.get_by_test_id("workspace-picker-entry-work").dispatch_event("click")
             await expect(page.get_by_test_id("workspace-picker-entry-omnigent-app")).to_be_visible(
                 timeout=10_000
             )
             await commit_landing_workspace_picker(page)
 
-            # The picker part works: the chip shows the drive-letter path,
-            # not "Not selected". A failure here is a picker regression, not
-            # the submit gate under test.
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_attribute(
                 "aria-label",
                 re.compile(r"Working directory: C:[\\/]Users[\\/]alice[\\/]work$"),

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
+import click
 import httpx
 import psutil
 import websockets.asyncio.client
@@ -41,6 +42,7 @@ from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
     debug_event,
+    runner_log_scope,
 )
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
@@ -635,6 +637,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
         # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
         "OMNIGENT_TELEMETRY_ENABLED",
+        # Preserve the harness stderr opt-in through daemon and runner hops.
+        "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -653,6 +657,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Executable selection must survive CLI -> daemon -> runner. The
+        # passthrough list is only applied at the second boundary.
+        "OMNIGENT_CODEX_PATH",
         # Credential-env denylists must survive both daemon and runner hops.
         # This carries variable names only; their values still follow normal forwarding.
         "OMNIGENT_PI_ENV_UNSET",
@@ -1182,6 +1189,9 @@ class HostProcess:
         # this lock: a session DELETE racing a slow create must not have its
         # stop overtake the launch it targets.
         self._runner_lifecycle_lock = asyncio.Lock()
+        # Status queries wait for this runner's queued launch before deciding
+        # that an unregistered runner is unknown.
+        self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -1601,6 +1611,18 @@ class HostProcess:
             session_id,
             frame.workspace,
             diagnostic,
+            extra=debug_event(
+                "runner_launch_failed",
+                session_id=frame.session_id,
+                runner_id=(
+                    token_bound_runner_id(frame.binding_token)
+                    if frame.binding_token.strip()
+                    else None
+                ),
+                host_request_id=frame.request_id,
+                stage="runner_launch",
+                error_code=error_code or "runner_spawn_failed",
+            ),
         )
         print(
             "  ! Runner launch failed\n"
@@ -1677,7 +1699,24 @@ class HostProcess:
             "URL and that the server is up to date, then retry."
         )
 
-    async def _handle_launch(
+    async def _handle_launch(self, frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        # Attribution must not move token validation ahead of the launch preflight.
+        log_runner_id = (
+            token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
+        )
+        with runner_log_scope(frame.session_id, log_runner_id):
+            _logger.info(
+                "Runner launch requested",
+                extra=debug_event(
+                    "runner_launch_started",
+                    stage="runner_launch",
+                    host_request_id=frame.request_id,
+                    harness=frame.harness,
+                ),
+            )
+            return await self._handle_launch_impl(frame)
+
+    async def _handle_launch_impl(
         self,
         frame: HostLaunchRunnerFrame,
     ) -> HostLaunchRunnerResultFrame:
@@ -1859,6 +1898,13 @@ class HostProcess:
             runner_id,
             workspace,
             proc.pid,
+            extra=debug_event(
+                "runner_spawned",
+                session_id=frame.session_id,
+                runner_id=runner_id,
+                stage="runner_launch",
+                host_request_id=frame.request_id,
+            ),
         )
         # Print the exact runner log file (not just the dir): a foreground
         # host's own terminal shows lifecycle lines, but the runner's real
@@ -2149,25 +2195,42 @@ class HostProcess:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5.0)
 
+    def _track_pending_runner_launch(
+        self, runner_id: str, completion: asyncio.Future[None]
+    ) -> None:
+        """Keep queued and active launches visible to this runner's status queries."""
+        pending = self._pending_runner_launches.setdefault(runner_id, set())
+        pending.add(completion)
+
+        def _finished(done: asyncio.Future[None]) -> None:
+            pending.discard(done)
+            if not pending:
+                self._pending_runner_launches.pop(runner_id, None)
+
+        completion.add_done_callback(_finished)
+
     async def _handle_runner_status(
         self,
         frame: HostRunnerStatusFrame,
     ) -> HostRunnerStatusResultFrame:
         """Answer whether a runner's process is alive, dead, or unknown.
 
-        The host is the authoritative owner of runner liveness: it holds
-        the runner's :class:`subprocess.Popen`. A runner tracked with a
-        still-running process is ``alive`` (covers a runner that is still
-        booting — it is inserted at ``Popen`` time, before its tunnel
-        connects — so the server waits for it). A tracked-but-exited
-        process is ``dead``. A runner this host has no record of is
-        ``unknown`` — it was stopped (``_handle_stop`` popped it) or a
-        fresh post-restart host never spawned it; either way it will never
-        connect, so the server relaunches without waiting.
+        Wait for this runner's queued launch and spawn before checking its
+        process. An unregistered runner can still be starting; reporting it
+        as unknown would cause the server to replace it. Unrelated runners'
+        status queries remain independent.
+
+        A tracked running process is ``alive`` (booting or serving), an
+        exited process is ``dead``, and an untracked runner with no pending
+        launch is ``unknown``. The server can recover promptly in the latter
+        two cases.
 
         :param frame: The status query frame.
         :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
         """
+        while pending := self._pending_runner_launches.get(frame.runner_id):
+            # Shield shared completions from a status request's cancellation.
+            await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
         if handle is None:
             status = "unknown"
@@ -2235,6 +2298,8 @@ class HostProcess:
             error,
             extra=debug_event(
                 "runner_died",
+                session_id=handle.session_id,
+                stage="runner_process",
                 runner_id=runner_id,
                 error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
@@ -3104,6 +3169,14 @@ class HostProcess:
                 from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
 
                 devin_models = await asyncio.to_thread(list_devin_cli_model_options)
+            except click.ClickException as exc:
+                # A missing optional CLI is an expected picker result, even when
+                # an older client keeps requesting its catalog.
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=str(exc),
+                )
             except Exception:  # noqa: BLE001 — no catalog, never a crash
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
@@ -3417,7 +3490,7 @@ class HostProcess:
         loop keeps servicing pings.
 
         :param frame: The list-worktrees request frame.
-        :returns: Result frame with the worktrees on success, or
+        :returns: Result frame with worktrees on success, or
             ``status: "failed"`` with an error message.
         """
         try:
@@ -3443,6 +3516,7 @@ class HostProcess:
                     "branch": wt.branch,
                     "is_main": wt.is_main,
                     "detached": wt.detached,
+                    "updated_at": wt.updated_at,
                 }
                 for wt in worktrees
             ],
@@ -4392,13 +4466,18 @@ class HostProcess:
             # _serve_frames so detached request tasks cannot swallow it.
             self._raise_connection_error(frame)
         if isinstance(frame, HostLaunchRunnerFrame):
-            # Frames run on concurrent tasks, but launch/stop must keep their
-            # arrival order relative to each other (a stop for a session must
-            # not overtake the launch it targets). The lock is this task's
-            # first await, and tasks start in frame-arrival order, so waiters
-            # queue FIFO in that same order — keep it first.
-            async with self._runner_lifecycle_lock:
-                launch_result = await self._handle_launch(frame)
+            completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            if frame.binding_token.strip():
+                self._track_pending_runner_launch(
+                    token_bound_runner_id(frame.binding_token), completion
+                )
+            # Register before queuing; keep the lifecycle lock as the first
+            # await so launch/stop frames still acquire it in arrival order.
+            try:
+                async with self._runner_lifecycle_lock:
+                    launch_result = await self._handle_launch(frame)
+            finally:
+                completion.set_result(None)
             await ws.send(encode_host_frame(launch_result))
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:

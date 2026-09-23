@@ -466,6 +466,22 @@
     var(--background);
 }
 
+/* Preserve the translucent dark tray while matching the mock's single warm
+   surface across queued rows and workspace metadata in light themes. */
+.composer-queued-surface {
+  background-color: color-mix(in oklab, var(--tray) 40%, transparent);
+}
+
+:root:not(.dark) .composer-workspace-surface,
+:root:not(.dark) .composer-queued-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--muted) 85%, transparent),
+      color-mix(in oklch, var(--muted) 85%, transparent)
+    ),
+    var(--background);
+}
+
 .composer-subagent-surface {
   background:
     linear-gradient(
@@ -658,6 +674,11 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * opaque background so the chat underneath doesn't bleed through. */
 aside[aria-label="Workspace"][data-maximized] {
   background: var(--card-solid) !important;
+}
+
+/* Label-only tooltips must not block controls beneath their portal wrapper. */
+[data-radix-popper-content-wrapper]:has([data-noninteractive-tooltip]) {
+  pointer-events: none !important;
 }
 
 /* Popovers/menus — same glass treatment */
@@ -1350,21 +1371,18 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Message highlights must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts.
+   Omit the final keyframe to fade back to the bubble's own background. */
 @keyframes message-highlight {
   0%,
   40% {
     background-color: var(--message-highlight);
-  }
-  100% {
-    background-color: transparent;
   }
 }
 
 .animate-message-highlight {
   --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
   animation: message-highlight 1500ms ease-out;
-  border-radius: var(--radius-lg);
 }
 
 .dark .animate-message-highlight {
@@ -1393,7 +1411,8 @@ aside[aria-label="Workspace"][data-maximized] {
 @media (prefers-reduced-motion: reduce) {
   .animate-message-highlight {
     animation: none;
-    background-color: var(--message-highlight);
+    /* Override inline contributor tints while the static highlight is active. */
+    background-color: var(--message-highlight) !important;
   }
 
   .animate-user-msg-flash {
