@@ -1,46 +1,9 @@
-"""Pi terminal ensure fails -- ``tmux launch failed (rc=1): `` (empty reason).
+"""A failed Pi terminal launch must preserve tmux's stdout diagnostic.
 
-The journey
------------
-A user launches a pi-native session (``omnigent pi``) on a host whose ``tmux``
-passes the version preflight (``tmux -V`` answers a supported version) but
-fails when the runner launches the Pi terminal (``new-session`` exits 1). The
-Pi terminal never starts: the CLI dies with ``Pi terminal ensure failed
-(500): Native Pi terminal failed to start; see the runner log ...`` and the
-runner log records the tracked telemetry signature::
-
-    ERROR ... runner.app ... | Pi terminal ensure failed for session=<id>
-    ...
-    RuntimeError: tmux launch failed (rc=1):
-
-Note the EMPTY reason after ``rc=1):``. ``TerminalInstance.launch``
-(``omnigent/inner/terminal.py``) pipes tmux stdout to ``DEVNULL`` and surfaces
-only stderr in the raised ``RuntimeError``, so a tmux that fails while writing
-its diagnostic to stdout -- or that fails silently -- leaves the operator (and
-the KPI pipeline ingesting the runner log) with no way to tell WHY tmux
-failed. The durable contract is exactly this: preserve a useful structured
-error reason.
-
-The fail -> pass contract
--------------------------
-This test drives the REAL CLI journey (``omnigent pi --server ""`` under a
-PTY: auto-spawned server + host daemon + runner) with a ``tmux`` first on
-``PATH`` that answers ``-V`` normally and fails everything else with rc=1,
-emitting a distinctive diagnostic on stdout. It waits for the reported
-user-visible failure (the CLI's ``Pi terminal ensure failed`` error -- the
-reproduction gate), then asserts the durable contract: the runner log's
-surfaced failure must PRESERVE the diagnostic the failing tmux emitted.
-
-On the current build the diagnostic is discarded (stdout -> DEVNULL) and the
-log shows the unactionable ``tmux launch failed (rc=1): `` -- the assertion
-FAILS, reproducing the reported behavior. It passes once the launch captures the
-failing tmux's output (or otherwise preserves a useful reason) in the error it
-raises.
-
-Usage::
-
-    python -m pytest tests/e2e/test_pi_terminal_ensure_tmux_launch_failure_e2e.py -v
-"""
+The real CLI starts a server, host daemon and runner under a PTY. A tmux
+shim passes the version check, then fails launch with a stdout-only message.
+The test requires the CLI ensure failure and that message in the runner log;
+no Pi model turn is executed."""
 
 from __future__ import annotations
 
@@ -113,17 +76,10 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 
 
 def _make_failing_tmux(bin_dir: Path) -> Path:
-    """Write a ``tmux`` that passes the version preflight but fails to launch.
+    """Write a tmux shim that passes -V and fails other commands on stdout.
 
-    ``-V`` (anywhere in argv) answers a supported version, so both the CLI's
-    dependency preflight and the runner's ``_require_supported_tmux`` accept
-    it. Every other invocation -- the runner's ``new-session`` launch -- exits
-    1 after printing its diagnostic to STDOUT, modelling the observed failure
-    mode where ``tmux launch failed (rc=1): `` carries no stderr text.
-
-    :param bin_dir: Directory to create the shim in (prepended to ``PATH``).
-    :returns: The shim path.
-    """
+    :param bin_dir: Directory prepended to PATH.
+    :returns: Executable shim path."""
     shim = bin_dir / "tmux"
     shim.write_text(
         "#!/bin/sh\n"
@@ -180,27 +136,25 @@ def _runner_log_text(data_dir: Path) -> str:
 )
 @pytest.mark.timeout(_JOURNEY_TIMEOUT_S + 120)
 def test_pi_terminal_ensure_tmux_launch_failure_preserves_diagnostic() -> None:
-    """A failing-tmux Pi launch must surface WHY tmux failed, not an empty reason.
-
-    Journey: ``omnigent pi`` on a host whose tmux fails at launch
-    -> the Pi terminal ensure fails (CLI errors, runner logs ``Pi terminal
-    ensure failed for session=...`` with ``RuntimeError: tmux launch failed
-    (rc=1): ``). Durable contract: the runner log must preserve the failing
-    tmux's own diagnostic. Fails on the current build (stdout is piped to
-    DEVNULL, the reason is empty); passes once the launch error carries the
-    captured output.
-    """
+    """The real Pi launch path must retain the failing tmux shim's diagnostic."""
     work = Path(tempfile.mkdtemp(prefix="pi-tmux-launch-"))
     shim_dir = work / "bin"
     shim_dir.mkdir()
     _make_failing_tmux(shim_dir)
     config_home = work / "config"
     config_home.mkdir()
+    # Pass the host credential gate without contacting a provider.
+    (config_home / "config.yaml").write_text(
+        "providers:\n  mock:\n    kind: key\n    default: pi\n"
+        "    openai:\n      base_url: http://127.0.0.1:9/v1\n"
+        "      api_key_ref: env:PI_TEST_API_KEY\n"
+    )
     data_dir = work / "data"
     home_dir = work / "home"
     home_dir.mkdir()
 
     env = _journey_env(shim_dir, config_home, data_dir, home_dir)
+    env["PI_TEST_API_KEY"] = "mock-key"
     omnigent = Path(sys.executable).parent / "omnigent"
     assert omnigent.is_file(), f"omnigent console script not found at {omnigent}"
 
@@ -271,10 +225,7 @@ def test_pi_terminal_ensure_tmux_launch_failure_preserves_diagnostic() -> None:
             f"Runner log never recorded the tmux launch failure. Log tail:\n{log_text[-2500:]}"
         )
 
-        # THE regression contract: the surfaced failure must
-        # preserve the diagnostic the failing tmux emitted. On the buggy
-        # build the log shows only 'RuntimeError: tmux launch failed (rc=1): '
-        # (empty reason -- tmux stdout is piped to DEVNULL), so this FAILS.
+        # Require the shim diagnostic, not just a generic launch error.
         failure_lines = [line for line in log_text.splitlines() if "tmux launch failed" in line]
         assert _TMUX_DIAG_MARKER in log_text, (
             "The Pi terminal ensure failure dropped the failing tmux's own "
