@@ -8799,12 +8799,14 @@ def _registration_target_display(record: _HostDaemonRecord) -> str:
     display = display_server_url(base_url)
     try:
         parts = urlsplit(display)
-        host, port = parts.hostname, parts.port
+        host = parts.hostname
     except ValueError:
         return "the configured server"
     if not parts.scheme or not host:
         return "the configured server"
-    netloc = host if port is None else f"{host}:{port}"
+    # Drop only the userinfo, keeping the rest of the authority verbatim so
+    # an IPv6 literal retains its brackets (``http://[::1]:6767``).
+    netloc = parts.netloc.rpartition("@")[2]
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
 
 

@@ -1038,6 +1038,18 @@ def test_registration_diagnostics_never_expose_url_credentials(
     assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
 
 
+def test_registration_target_display_preserves_ipv6_brackets() -> None:
+    """Userinfo redaction keeps an IPv6 literal's brackets intact.
+
+    Rebuilding the URL from ``hostname``/``port`` would render ``[::1]``
+    as ``::1`` and produce a malformed diagnostic URL; only the userinfo
+    may be dropped from the authority.
+    """
+    record = _server_record("http://synthetic-user:synthetic-secret@[::1]:59999")
+
+    assert cli._registration_target_display(record) == "http://[::1]:59999"
+
+
 def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

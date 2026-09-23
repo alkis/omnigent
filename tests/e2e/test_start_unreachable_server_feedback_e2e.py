@@ -145,17 +145,29 @@ def unreachable_start_run(tmp_path_factory: pytest.TempPathFactory) -> _StartRun
 def test_start_gives_feedback_before_registration_timeout(
     unreachable_start_run: _StartRun,
 ) -> None:
-    """The CLI must say something well before the 30s registration timeout."""
+    """The server-naming line must appear well before the 30s timeout.
+
+    The timing check is pinned to output that names the configured server:
+    an unrelated warning printing early must not mask the useful waiting
+    message staying delayed until the registration timeout.
+    """
     run = unreachable_start_run
     assert run.first_output_s is not None, (
         f"`omnigent start` produced no output at all (exit {run.returncode} "
         f"after {run.elapsed_s:.1f}s) with an unreachable configured server"
     )
-    assert run.first_output_s <= _FEEDBACK_DEADLINE_S, (
-        f"first output only after {run.first_output_s:.1f}s (exit "
-        f"{run.returncode} at {run.elapsed_s:.1f}s): the CLI sat silent past "
-        f"{_FEEDBACK_DEADLINE_S:.0f}s instead of reporting the unreachable "
-        f"server http://127.0.0.1:{run.port} or failing fast"
+    server_specific = [elapsed for elapsed, text in run.lines if f"127.0.0.1:{run.port}" in text]
+    assert server_specific, (
+        f"`omnigent start` never named the unreachable configured server "
+        f"http://127.0.0.1:{run.port} (exit {run.returncode} after "
+        f"{run.elapsed_s:.1f}s); output:\n{run.output}"
+    )
+    assert server_specific[0] <= _FEEDBACK_DEADLINE_S, (
+        f"the server was first named only after {server_specific[0]:.1f}s "
+        f"(exit {run.returncode} at {run.elapsed_s:.1f}s): the CLI sat "
+        f"without naming http://127.0.0.1:{run.port} past "
+        f"{_FEEDBACK_DEADLINE_S:.0f}s instead of reporting what it is "
+        "waiting for"
     )
 
 
