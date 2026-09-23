@@ -1,13 +1,8 @@
-"""Live journey: the runner idle watchdog reaps an idle runner.
+"""A real idle runner must be reaped and reported offline.
 
-The runner's inactivity watchdog shuts the process down after
-``runner.idle_timeout_s`` of no agent work. This drives the full journey with
-a compressed window: a real server + real runner boot, the runner goes
-online, sits idle with no client attached, and its own watchdog reaps it --
-after which the server reports the runner offline (the dead session a user
-would find). The regression guard on the *default* idle window living long
-enough to survive overnight is tests/runner/test_runner_idle_default_overnight.py.
-"""
+Use a compressed timeout with real server and runner processes. This is
+not an overnight soak; test_runner_idle_default_overnight.py checks the
+24-hour default and explicit configuration overrides."""
 
 from __future__ import annotations
 
@@ -56,13 +51,7 @@ def _free_port() -> int:
 
 
 def _ambient_env() -> dict[str, str]:
-    """The caller's env minus ambient OMNIGENT_* / RUNNER_* wiring.
-
-    When this test itself runs inside an omnigent session, the inherited
-    runner wiring (process-log path, runner identity, server URL) would
-    redirect or crash the spawned server/runner; only the explicitly-set
-    variables below may configure them.
-    """
+    """Remove ambient OMNIGENT_* and RUNNER_* wiring before spawning the test stack."""
     return {
         key: value
         for key, value in os.environ.items()

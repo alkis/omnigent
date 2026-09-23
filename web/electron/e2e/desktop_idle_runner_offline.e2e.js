@@ -1,18 +1,6 @@
-// A session whose runner was reaped by the idle watchdog must surface as
-// offline with a reconnect affordance when the user returns.
-//
-// Journey: connect the desktop app to a server with a live runner-bound
-// conversation -> leave it idle past the runner idle timeout (compressed here
-// to a few seconds to stand in for the real window) so the runner's own
-// watchdog reaps it -> open the app the "next morning" and view the
-// conversation -> the session is offline ("Agent disconnected - click to
-// reconnect"). The regression guard that the *default* window is long enough
-// to survive overnight lives in
-// tests/runner/test_runner_idle_default_overnight.py; the live reap journey
-// in tests/e2e/test_runner_idle_reaping.py.
-//
-// Run from web/electron (after building the SPA):
-//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_idle_runner_offline.e2e.js
+// After the real runner idle watchdog fires, desktop shows the session offline.
+// The timeout is compressed to seconds; this does not validate an overnight idle period.
+// Run after building the SPA: node --test e2e/desktop_idle_runner_offline.e2e.js
 
 "use strict";
 

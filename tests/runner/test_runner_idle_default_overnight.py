@@ -1,21 +1,6 @@
-"""Runner idle-timeout default must let a session survive overnight.
+"""Check the 24-hour runner idle default and explicit timeout overrides.
 
-The runner process runs an inactivity watchdog that shuts the runner
-down after ``runner.idle_timeout_s`` seconds without activity. When the
-global config file does not set that key, the runner falls back to a
-built-in default. A default shorter than an overnight gap means a
-session left idle in the evening loses its runner, and the next-day
-visit finds a dead session that needs an awkward respawn — the exact
-next-day-experience failure this test guards against.
-
-These tests pin the product expectation that the built-in default is at
-least 24 hours, while an explicit ``runner.idle_timeout_s`` keeps
-winning over the default.
-
-Usage::
-
-    python -m pytest tests/runner/test_runner_idle_default_overnight.py -v
-"""
+These configuration checks do not wait for an overnight idle period."""
 
 from __future__ import annotations
 
@@ -33,15 +18,7 @@ def test_default_runner_idle_timeout_survives_overnight(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """With no config file, the runner idle default is at least 24 hours.
-
-    This is the value the real runner resolves at boot when the user never
-    touched ``~/.omnigent/config.yaml`` — the overwhelmingly common case.
-
-    :param monkeypatch: Pytest environment patch fixture.
-    :param tmp_path: Isolated config home with no config file.
-    :returns: None.
-    """
+    """Missing configuration selects the 24-hour default."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
 
     timeout_s = _load_runner_idle_timeout_s_from_config()
@@ -57,12 +34,7 @@ def test_default_runner_idle_timeout_survives_overnight_with_empty_runner_config
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A config file without ``runner.idle_timeout_s`` gets the same default.
-
-    :param monkeypatch: Pytest environment patch fixture.
-    :param tmp_path: Isolated config home.
-    :returns: None.
-    """
+    """An empty runner section selects the same 24-hour default."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text("runner: {}\n", encoding="utf-8")
 
@@ -79,15 +51,7 @@ def test_explicit_idle_timeout_still_wins_over_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """An explicit ``runner.idle_timeout_s`` overrides the built-in default.
-
-    Guards the fix from hardcoding the new default: a user who tuned the
-    idle window must keep their value.
-
-    :param monkeypatch: Pytest environment patch fixture.
-    :param tmp_path: Isolated config home.
-    :returns: None.
-    """
+    """An explicitly configured timeout overrides the default."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         "runner:\n  idle_timeout_s: 900\n",

@@ -1,15 +1,6 @@
-// Relaunching the desktop app must return to the conversation the user left
-// open, not kick them to the home page.
-//
-// Journey: connect the desktop app to a server -> open a conversation and view
-// it -> quit the app -> relaunch it (the "next morning") with the same profile
-// -> the window must restore that conversation. Without last-route
-// persistence the shell reloads the saved server URL's root, so the SPA
-// renders the new-chat home page and the user is dropped away from where
-// they left off.
-//
-// Run from web/electron (after building the SPA):
-//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_next_day_restore.e2e.js
+// Relaunch the real desktop shell with the same profile and restore its last conversation.
+// This checks route persistence across an immediate restart, not an overnight soak.
+// Run after building the SPA: node --test e2e/desktop_next_day_restore.e2e.js
 
 "use strict";
 
