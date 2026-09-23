@@ -85,7 +85,14 @@ def _response_id() -> str:
     return f"resp_{_uuid_mod.uuid4().hex[:12]}"
 
 
-def sse_text_response(text: str, model: str = "mock-model") -> str:
+def _response_usage(output_tokens: int, overrides: dict | None = None) -> dict:
+    """Merge scripted token counts and derive the total when it is omitted."""
+    usage = {"input_tokens": 10, "output_tokens": output_tokens, **(overrides or {})}
+    usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    return usage
+
+
+def sse_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build a complete SSE stream for a simple text response.
 
@@ -96,6 +103,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
 
     :param text: The assistant response text.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -119,11 +127,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -164,7 +168,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
     return "".join(events)
 
 
-def json_text_response(text: str, model: str = "mock-model") -> dict:
+def json_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> dict:
     """
     Build a non-streaming Responses API JSON body for a text response.
 
@@ -174,6 +178,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
 
     :param text: The assistant response text.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: Responses API response dict.
     """
     resp_id = _response_id()
@@ -197,11 +202,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -210,6 +211,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
 def sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """
     Build a complete SSE stream for a function call response.
@@ -217,6 +219,7 @@ def sse_tool_call_response(
     :param tool_calls: List of tool call dicts, each with
         ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -242,11 +245,7 @@ def sse_tool_call_response(
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "total_tokens": 15,
-        },
+        "usage": _response_usage(5, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -296,12 +295,7 @@ def truncate_sse(body: str, keep_events: int) -> str:
 
 
 async def paced_sse(sse_body: str, chunk_delay: float) -> AsyncIterator[str]:
-    """Yield *sse_body*, one event at a time when *chunk_delay* paces it.
-
-    ``0`` keeps the historical single-chunk body; a positive value yields each
-    ``\\n\\n``-delimited event separately and sleeps between events, so live
-    surfaces render intermediate deltas instead of one instant repaint.
-    """
+    """Yield SSE events with real delays, or the entire body when delay is zero."""
     if chunk_delay > 0:
         for event in sse_body.split("\n\n"):
             if not event:
@@ -312,19 +306,20 @@ async def paced_sse(sse_body: str, chunk_delay: float) -> AsyncIterator[str]:
         yield sse_body
 
 
-def sse_streaming_text(text: str, model: str = "mock-model") -> str:
+def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build SSE with text deltas followed by a completed event.
 
     :param text: The assistant response text.
     :param model: Model name.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string with delta events.
     """
     events = []
     for word in text.split():
         delta = {"delta": word + " "}
         events.append(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n")
-    events.append(sse_text_response(text, model))
+    events.append(sse_text_response(text, model, usage))
     return "".join(events)
 
 
@@ -332,6 +327,7 @@ def sse_text_with_native_items(
     text: str,
     native_items: list[dict],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """Build SSE with text + native tool output items (e.g. web_search_call).
 
@@ -360,11 +356,7 @@ def sse_text_with_native_items(
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -757,7 +749,8 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
-    # Usage overrides. On ``/v1/messages`` merged into the Anthropic
+    # Usage overrides. On ``/v1/responses`` merged into the response usage.
+    # On ``/v1/messages`` merged into the Anthropic
     # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
     # script the context size a claude harness observes mid-turn. On
     # ``/v1/chat/completions`` returned verbatim as the OpenAI ``usage``
@@ -773,10 +766,7 @@ class QueuedResponse:
     # this text before the ``text`` block — scripts a turn where the model
     # visibly thinks before answering.
     thinking: str | None = None
-    # Seconds to sleep between SSE events on ``/v1/messages`` and
-    # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
-    # value paces the stream so live surfaces (the web SPA, a native TUI)
-    # visibly render intermediate deltas.
+    # Delay between /v1/messages and /v1/responses events; zero sends one chunk.
     chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1041,17 +1031,19 @@ async def create_response(
         model_name = (
             parsed.get("model", "mock-model") if isinstance(parsed, dict) else "mock-model"
         )
-        return JSONResponse(content=json_text_response(qr.text or "", model=model_name))
+        return JSONResponse(
+            content=json_text_response(qr.text or "", model=model_name, usage=qr.usage)
+        )
 
     # Build SSE body
     if qr.tool_calls:
-        sse_body = sse_tool_call_response(qr.tool_calls)
+        sse_body = sse_tool_call_response(qr.tool_calls, usage=qr.usage)
     elif qr.stream:
-        sse_body = sse_streaming_text(qr.text)
+        sse_body = sse_streaming_text(qr.text, usage=qr.usage)
     elif qr.native_items:
-        sse_body = sse_text_with_native_items(qr.text, qr.native_items)
+        sse_body = sse_text_with_native_items(qr.text, qr.native_items, usage=qr.usage)
     else:
-        sse_body = sse_text_response(qr.text)
+        sse_body = sse_text_response(qr.text, usage=qr.usage)
 
     # Mid-stream fault: emit only a prefix and end, dropping the completion.
     if qr.truncate_after is not None:
@@ -1069,9 +1061,8 @@ async def create_message(
 ) -> StreamingResponse | JSONResponse:
     """Anthropic Messages API endpoint for claude-sdk harness.
 
-    Same keyed-queue routing as ``/v1/responses`` but returns
-    Anthropic SSE format (``message_start``, ``content_block_*``,
-    ``message_delta``, ``message_stop``).
+    Uses the same keyed queues as ``/v1/responses`` and honors ``stream``.
+    Native Claude's model validation requests a nonstream JSON message.
     """
     body = await request.body()
     try:
@@ -1105,6 +1096,47 @@ async def create_message(
 
     req_model = parsed.get("model") if isinstance(parsed, dict) else None
     echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
+    if isinstance(parsed, dict) and not parsed.get("stream", False):
+        content: list[dict] = []
+        stop_reason = "end_turn"
+        extra: dict = {}
+        output_tokens = max(5, len(qr.text.split()) + len((qr.thinking or "").split()))
+        if qr.refusal_category is not None:
+            content.append({"type": "text", "text": "I can't help with that."})
+            stop_reason = "refusal"
+            extra["stop_details"] = {"type": "refusal", "category": qr.refusal_category}
+            output_tokens = 5
+        elif qr.tool_calls:
+            content.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}"),
+                    "name": call["name"],
+                    "input": json.loads(call.get("arguments", "{}")),
+                }
+                for call in qr.tool_calls
+            )
+            stop_reason = "tool_use"
+            output_tokens = 5
+        else:
+            if qr.thinking:
+                content.append(
+                    {"type": "thinking", "thinking": qr.thinking, "signature": "mock-signature"}
+                )
+            content.append({"type": "text", "text": qr.text})
+        return JSONResponse(
+            {
+                "id": f"msg_{_uuid_mod.uuid4().hex[:12]}",
+                "type": "message",
+                "role": "assistant",
+                "content": content,
+                "model": echo_model,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, **(qr.usage or {}), "output_tokens": output_tokens},
+                **extra,
+            }
+        )
     if qr.refusal_category is not None:
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
     elif qr.tool_calls:
