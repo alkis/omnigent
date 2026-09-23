@@ -1657,7 +1657,8 @@ def _persist_native_cumulative_usage(
         if "total_cost_usd" in current
         else 0.0
     )
-    if cost_growth > 0.0:
+    # A known zero cost must remain distinct from an unpriced model.
+    if "total_cost_usd" in current:
         # Split the growth across the reported per-model weights when present
         # (a claude-native turn that ran Task sub-agents on other models);
         # otherwise the whole growth belongs to the single active model. The
