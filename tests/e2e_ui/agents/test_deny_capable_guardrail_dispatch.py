@@ -1,27 +1,4 @@
-"""UI journey: a deny-capable guardrails policy must not break sub-agent dispatch.
-
-The session's agent bundle declares a ``guardrails`` CEL policy whose
-expression is an allowlist of tool names with a terminal ``DENY`` branch.
-The allowlist explicitly permits ``sys_session_send``, so when the user
-asks the orchestrator to dispatch its ``worker`` sub-agent, the dispatch
-must return a launching sub-agent handle and the Agents rail must list
-the worker row — exactly as it does for an agent whose policy has no
-``DENY`` branch (or no guardrails at all).
-
-The defect this guards against: session init probes the spec's policy
-gate with a synthetic ``sys_agent_start`` tool call. Any allowlist whose
-terminal branch is ``DENY`` denies that probe (``sys_agent_start`` is not
-in the allowlist), init aborts before the parent's session inbox is
-created, and the session still opens and answers through the lazy-spawn
-path — so the first ``sys_session_send`` fails with ``Error:
-sys_session_send requires parent session inbox`` and no child ever
-spawns. On the buggy build this test FAILS quoting that output; after a
-fix the same journey dispatches the worker.
-
-Registration and mock scripting mirror
-``tests/e2e_ui/agents/test_spawn_bounds_fanout_cap.py`` (strict
-``config.yaml`` bundle parser — the one that honors ``guardrails``).
-"""
+"""Verify deny-capable guardrails still allow a listed sub-agent dispatch."""
 
 from __future__ import annotations
 
@@ -52,17 +29,11 @@ _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 
-# Sentinel ending the parent's dispatch turn so the test can wait on it.
 _PARENT_TURN_DONE = "PARENT_DISPATCH_TURN_DONE"
 _WORKER_DONE = "WORKER_PING_DONE"
 
-# The dispatch turn runs a spawn round plus the child turn and a parent
-# auto-wake over the mock LLM, so give the bubble a generous budget.
 _TURN_TIMEOUT_MS = 240_000
 
-# Allowlist-by-name with a terminal DENY: allows the dispatch tools the
-# journey uses, denies everything else. The deny-capable terminal branch
-# is the trigger under test — flipping it to ALLOW masks the bug.
 _ALLOWLIST_THEN_DENY = (
     'event.type != "tool_call"'
     ' ? {"result": "ALLOW"}'
@@ -75,12 +46,7 @@ _ALLOWLIST_THEN_DENY = (
 
 
 def _parent_config(name: str, model: str) -> dict[str, Any]:
-    """Parent orchestrator spec with the deny-capable CEL guardrail.
-
-    :param name: Unique agent name for this registration.
-    :param model: Mock model key routing the parent's LLM calls.
-    :returns: ``config.yaml`` contents as a dict.
-    """
+    """Build the guarded parent spec."""
     return {
         "spec_version": 1,
         "name": name,
@@ -107,11 +73,7 @@ def _parent_config(name: str, model: str) -> dict[str, Any]:
 
 
 def _worker_config(model: str) -> dict[str, Any]:
-    """Trivial worker child spec.
-
-    :param model: Mock model key routing the worker's LLM calls.
-    :returns: ``agents/worker/config.yaml`` contents as a dict.
-    """
+    """Build the worker spec."""
     return {
         "spec_version": 1,
         "name": "worker",
@@ -123,11 +85,7 @@ def _worker_config(model: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class DenyCapablePolicySession:
-    """Handle for the deny-capable-guardrail orchestrator session fixture.
-
-    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
-    :param session_id: The runner-bound parent session id.
-    """
+    """A runner-bound guarded session."""
 
     base_url: str
     session_id: str
@@ -139,17 +97,7 @@ def deny_capable_policy_session(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[DenyCapablePolicySession]:
-    """Create a runner-bound session for the guarded orchestrator.
-
-    Scripts the parent queue to dispatch the worker once via
-    ``sys_session_send``, then end the turn; the worker draws a canned
-    acknowledgement. Unique per-run model keys isolate the queues.
-
-    :param live_server: Spawned server fixture from the parent conftest.
-    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
-    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
-    :returns: A :class:`DenyCapablePolicySession` handle.
-    """
+    """Create a guarded parent session with scripted parent and worker replies."""
     uid = uuid.uuid4().hex[:8]
     agent_name = f"deny_capable_probe_{uid}"
     parent_model = f"denycapable-parent-{uid}"
@@ -223,13 +171,7 @@ def deny_capable_policy_session(
 
 
 def _dispatch_outputs(base_url: str, session_id: str) -> list[str]:
-    """Return the parent's ``sys_session_send`` tool outputs, in order.
-
-    :param base_url: Spawned server base URL.
-    :param session_id: The parent session id.
-    :returns: Output payloads of ``function_call_output`` items whose
-        call_id matches a ``sys_session_send`` function_call.
-    """
+    """Return the parent's sub-agent dispatch outputs."""
     snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     snap.raise_for_status()
     flattened = [
@@ -249,16 +191,7 @@ def _dispatch_outputs(base_url: str, session_id: str) -> list[str]:
 
 
 def _show_failed_dispatch(page: Page) -> bool:
-    """Best-effort: surface the failed dispatch on screen before failing.
-
-    Expands the transcript's ``sys_session_send`` tool call (directly or
-    inside a collapsed fold) so its error output is visible, then opens
-    the Agents rail to show no worker spawned. Purely for the journey
-    recording — the assertions carry the verdict.
-
-    :param page: The Playwright page, on the parent session.
-    :returns: Whether the inbox error text became visible on screen.
-    """
+    """Best-effort: expose the failed call before the assertion."""
     shown = False
     try:
         worked = page.get_by_test_id("turn-worked-fold")
@@ -324,15 +257,12 @@ def test_deny_capable_guardrail_does_not_break_dispatch(
             f"(error surfaced in the transcript: {shown})"
         )
 
-    # The user-visible outcome: the dispatched worker appears in the
-    # Agents rail. Lookups are scoped to the desktop "Workspace" rail so
-    # they don't match the hidden mobile drawer mirroring the testids.
+    # Scope lookups to the desktop rail to avoid hidden mobile duplicates.
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Agents")).click()
     rows = rail.locator(_SUBAGENT_ROW)
     expect(rows.first).to_be_visible(timeout=60_000)
-    # The row is labeled by the dispatch title, not the agent name.
     expect(rows.first).to_contain_text("ping")
     assert rows.first.get_attribute("data-child-session-id"), (
         "subagent row is missing data-child-session-id"
