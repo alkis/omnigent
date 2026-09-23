@@ -185,7 +185,7 @@ _NATIVE_ERROR_HTTP_STATUS = re.compile(
     r"\s*[:=(]?\s*(\d{3})\b",
     re.IGNORECASE,
 )
-# AI-gateway budget/quota exhaustion markers. The gateway returns HTTP 403 +
+# AI-gateway budget / usage-limit markers. The gateway returns HTTP 403 +
 # PERMISSION_DENIED for these; they are not auth failures.
 _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
@@ -196,15 +196,19 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
 def classify_native_turn_error(code: str, message: str) -> str:
     """Refine a native turn's generic code when its text identifies a rate limit.
 
+    Also corrects ``codex_reauth_required`` when the message reveals that the
+    real cause is a budget/usage-limit exhaustion (older runners misclassify
+    the gateway's 403 as auth; the server fixes it on deploy).
+
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
     :returns: The semantic error code, or the existing code if unrecognized.
     """
-    if code not in {"native_turn_error", "codex_turn_error"}:
-        return code
     lowered = message.lower()
     if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
-        return "codex_budget_exhausted"
+        return "budget_exhausted"
+    if code not in {"native_turn_error", "codex_turn_error"}:
+        return code
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
     if status in {"401", "403"}:
@@ -240,9 +244,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "codex_turn_error": "Codex ran into an error during this turn.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
-    "codex_budget_exhausted": (
-        "The AI gateway budget for this workspace has been exhausted. "
-        "Contact an admin to increase the budget or use a different one."
+    "budget_exhausted": (
+        "The AI gateway refused this turn because a spending budget or usage limit is "
+        "exhausted. Contact an admin to raise it, or use a different budget."
     ),
 }
 
