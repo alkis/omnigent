@@ -152,6 +152,19 @@ export type RenderItem =
       codexPersistModes?: CodexPersistMode[];
     };
 
+/**
+ * Delivery state of an optimistic user bubble whose POST has not settled.
+ * Rendered as the small footer under the bubble; absent once accepted.
+ */
+export interface PendingDelivery {
+  /** The server accepted the POST; the bubble now waits for its consumed event. */
+  posted: boolean;
+  /** The send's own short retries all threw; the background loop owns it now. */
+  stalled: boolean;
+  /** The server refused the send (a 4xx, or the runner-unavailable 503). */
+  error?: { message: string; code: string };
+}
+
 /** A bubble cluster. The page maps over these. */
 export type Bubble =
   | {
@@ -159,6 +172,8 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Delivery footer state for a pending bubble sent from this client. */
+      delivery?: PendingDelivery;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;

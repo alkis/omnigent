@@ -61,6 +61,12 @@ keystrokes) is never persisted, so :func:`resolve_oldest` never
 drains its entry. :data:`_TTL_S` bounds that ghost: stale entries are
 evicted lazily on the next :func:`record` / :func:`snapshot_for` /
 :func:`resolve_oldest` for the same conversation.
+
+A web client that loses the POST response re-sends the same submission
+with the same ``stable_id``. :func:`pending_id_for` answers such a retry
+while the entry is still live, and :func:`remember_committed` /
+:func:`committed_item_id` answer it after the forwarder has drained the
+entry, so neither case pastes the prompt into the terminal a second time.
 """
 
 from __future__ import annotations
@@ -172,6 +178,17 @@ class _Entry:
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
+# How long a drained web submission's committed item id stays resolvable for
+# a client retry of the same ``stable_id``. Retries happen while the tab that
+# sent the message is still open, so an hour covers them with margin.
+_COMMITTED_TTL_S: float = 3600.0
+# Per-conversation cap on remembered submissions; the oldest is dropped first.
+_COMMITTED_MAX_PER_CONVERSATION = 256
+
+# Per-conversation mapping conversation_id → {stable_id: (item_id, remembered_at)}.
+# Insertion-ordered so the cap above evicts the oldest submission.
+_committed: WorkspaceScopedCache[str, dict[str, tuple[str, float]]] = WorkspaceScopedCache()
+
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
     """
@@ -268,6 +285,89 @@ def resolve(conversation_id: str, pending_id: str) -> None:
         entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
+
+
+def pending_id_for(conversation_id: str, stable_id: str) -> str | None:
+    """
+    Return the live pending id recorded for ``stable_id``, or ``None``.
+
+    A web client that lost the POST response re-sends with the same
+    ``stable_id``. While the first delivery's entry is still un-consumed,
+    the route answers the retry with that entry instead of forwarding the
+    prompt to the terminal again.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :returns: The matching entry's pending id, or ``None`` when no live
+        entry carries ``stable_id``.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.stable_id == stable_id:
+                return entry.pending_id
+    return None
+
+
+def remember_committed(conversation_id: str, stable_id: str, item_id: str) -> None:
+    """
+    Remember that web submission ``stable_id`` was persisted as ``item_id``.
+
+    Called when the transcript forwarder's mirror of a web message drains its
+    pending entry. A later client retry of the same submission (its POST
+    response was lost) then resolves to the committed item instead of
+    dispatching the prompt a second time. Entries expire after
+    :data:`_COMMITTED_TTL_S`.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :param item_id: Store-assigned id of the persisted user message.
+    """
+    now = _now()
+    with _lock:
+        entries = _committed.setdefault(conversation_id, {})
+        entries.pop(stable_id, None)
+        entries[stable_id] = (item_id, now)
+        _evict_stale_committed_locked(conversation_id, now)
+
+
+def committed_item_id(conversation_id: str, stable_id: str) -> str | None:
+    """
+    Return the committed item id remembered for ``stable_id``, or ``None``.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :returns: The persisted item id recorded by :func:`remember_committed`,
+        or ``None`` when the submission is unknown or has expired.
+    """
+    with _lock:
+        _evict_stale_committed_locked(conversation_id, _now())
+        entries = _committed.get(conversation_id)
+        if entries is None:
+            return None
+        found = entries.get(stable_id)
+        return None if found is None else found[0]
+
+
+def _evict_stale_committed_locked(conversation_id: str, now: float) -> None:
+    """
+    Drop remembered submissions past the TTL or the per-conversation cap.
+
+    Caller must hold :data:`_lock`.
+
+    :param conversation_id: Conversation/session id to sweep.
+    :param now: Current ``time.monotonic()`` value to compare against.
+    """
+    entries = _committed.get(conversation_id)
+    if entries is None:
+        return
+    stale = [sid for sid, (_, at) in entries.items() if now - at > _COMMITTED_TTL_S]
+    for sid in stale:
+        entries.pop(sid, None)
+    while len(entries) > _COMMITTED_MAX_PER_CONVERSATION:
+        entries.pop(next(iter(entries)))
+    if not entries:
+        _committed.pop(conversation_id, None)
 
 
 def resolve_oldest(conversation_id: str) -> DrainedInput | None:
@@ -484,3 +584,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _committed.clear()

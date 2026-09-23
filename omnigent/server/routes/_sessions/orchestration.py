@@ -2563,11 +2563,17 @@ async def _persist_external_conversation_item(
             if entry is not None:
                 pending_inputs.restore(session_id, entry)
         return persisted.id
-    # Not a duplicate: publish side effects for each skipped Kiro pair.
+    # Not a duplicate: a drained web submission is now committed, so a client
+    # retry of its stable_id resolves to this item instead of a second paste.
+    if drained is not None and drained.stable_id is not None:
+        pending_inputs.remember_committed(session_id, drained.stable_id, persisted.id)
+    # Publish side effects for each skipped Kiro pair.
     # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
     for i, skipped in enumerate(skipped_kiro_pending):
         persisted_user = persisted_items[i * 2]
         persisted_error = persisted_items[i * 2 + 1]
+        if skipped.stable_id is not None:
+            pending_inputs.remember_committed(session_id, skipped.stable_id, persisted_user.id)
         if not persisted_user.deduplicated:
             _publish_input_consumed(
                 session_id, persisted_user, cleared_pending_id=skipped.pending_id
@@ -5391,11 +5397,27 @@ async def _forward_event_to_runner(
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id, created_by=created_by)
+    web_stable_id = _web_stable_id(body)
+    if web_stable_id is not None:
+        # The store appends idempotently on ``stable_id``: a client re-send of
+        # a submission whose POST response was lost comes back flagged
+        # ``deduplicated`` instead of inserting a second copy.
+        item = item.model_copy(update={"stable_id": web_stable_id})
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
         [item],
     )
+    if persisted_items[0].deduplicated:
+        # The first delivery already forwarded this message; forwarding again
+        # would run the turn twice. Hand back the committed item instead.
+        _logger.info(
+            "Duplicate message POST for session=%s stable_id=%s; not re-dispatching",
+            session_id,
+            web_stable_id,
+            extra={"session_id": session_id},
+        )
+        return persisted_items[0].id
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -6112,6 +6134,26 @@ def _list_status_with_starting(
     return status
 
 
+def _web_stable_id(body: SessionEventInput) -> str | None:
+    """
+    Return the web client's ``stable_id`` for a user message POST, or ``None``.
+
+    The client stamps each submit with a 32-char hex id and reuses it when it
+    re-sends after a lost POST response, so both dispatch paths can recognise
+    the retry. Absent, malformed, or attached to a non-user message reads as
+    ``None`` and the event dispatches normally.
+
+    :param body: The validated event input from the client.
+    :returns: The stable id, e.g. ``"b77f356eed6d41758cc029f3c9b0663d"``.
+    """
+    if body.type != "message" or body.data.get("role") != "user":
+        return None
+    raw = body.data.get("stable_id")
+    if isinstance(raw, str) and re.fullmatch(r"[0-9a-f]{32}", raw):
+        return raw
+    return None
+
+
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
@@ -6270,6 +6312,17 @@ async def _dispatch_session_event_to_runner_impl(
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
         _build_native_terminal_message_event(conv, body)
+        # A re-send of a submission the server already took (the client lost
+        # the POST response) must not paste the prompt into the terminal
+        # again. Answer with what the first delivery produced instead.
+        web_stable_id = _web_stable_id(body)
+        if web_stable_id is not None:
+            committed_id = pending_inputs.committed_item_id(session_id, web_stable_id)
+            if committed_id is not None:
+                return _SessionEventDispatchResult(item_id=committed_id, pending_id=None)
+            live_pending_id = pending_inputs.pending_id_for(session_id, web_stable_id)
+            if live_pending_id is not None:
+                return _SessionEventDispatchResult(item_id=None, pending_id=live_pending_id)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)
             if native_terminal_ready
@@ -6304,12 +6357,6 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
-        raw_stable_id = body.data.get("stable_id")
-        web_stable_id = (
-            raw_stable_id
-            if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
-            else None
-        )
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
         # it back and this bubble would sit in the parent chat forever.

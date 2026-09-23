@@ -15,6 +15,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  CircleAlertIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -60,7 +61,12 @@ import {
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
-import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import {
+  type Bubble,
+  type RenderItem,
+  bubblesEqual,
+  type PendingDelivery,
+} from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
@@ -202,6 +208,17 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      // A local first draft awaiting model selection is not in flight yet, so
+      // it gets no delivery footer.
+      ...(p.initialDraft === undefined
+        ? {
+            delivery: {
+              posted: p.posted === true,
+              stalled: p.stalled === true,
+              ...(p.sendError !== undefined ? { error: p.sendError } : {}),
+            },
+          }
+        : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -666,6 +683,81 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+/** Retry and Cancel appear once a send has been pending this long without an answer. */
+const SEND_CONTROLS_DELAY_MS = 4_000;
+
+/**
+ * Delivery footer under an optimistic user bubble. While sending it shows a
+ * spinner only; Retry and Cancel appear after a few seconds, when the send
+ * stalls, or when the server refused it. A thrown fetch is never shown as a
+ * failure — it says nothing about whether the server took the message, and
+ * the store keeps re-sending the same stable id until it gets an answer.
+ */
+function PendingDeliveryFooter({
+  tempId,
+  delivery,
+}: {
+  tempId: string;
+  delivery: PendingDelivery;
+}) {
+  const accepted = delivery.posted && delivery.error === undefined;
+  const [waitedLong, setWaitedLong] = useState(false);
+  useEffect(() => {
+    if (accepted) return;
+    const timer = setTimeout(() => setWaitedLong(true), SEND_CONTROLS_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [accepted]);
+  if (accepted) return null;
+  const refused = delivery.error !== undefined;
+  const showControls = refused || delivery.stalled || waitedLong;
+  const actionClass =
+    "rounded-sm font-medium text-foreground underline decoration-foreground/30 underline-offset-[3px] hover:decoration-foreground focus-visible:outline-2 focus-visible:outline-ring";
+  return (
+    <div
+      className="flex flex-col items-end gap-0.5 pt-1 pr-1"
+      data-testid="send-delivery"
+      data-state={refused ? "refused" : delivery.stalled ? "stalled" : "sending"}
+    >
+      <div
+        className={cn(
+          "flex items-center gap-2 text-xs leading-none",
+          refused ? "text-destructive" : "text-muted-foreground",
+        )}
+      >
+        {refused ? (
+          <CircleAlertIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        ) : (
+          <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+        )}
+        <span>{refused ? "Couldn't send" : "Sending"}</span>
+        {showControls && (
+          <>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              className={actionClass}
+              onClick={() => void useChatStore.getState().retryPendingSend(tempId)}
+            >
+              Retry
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              className={actionClass}
+              onClick={() => useChatStore.getState().cancelPendingSend(tempId)}
+            >
+              Cancel
+            </button>
+          </>
+        )}
+      </div>
+      {delivery.error !== undefined && (
+        <span className="text-xs text-muted-foreground">{delivery.error.message}</span>
+      )}
+    </div>
+  );
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
@@ -832,6 +924,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {bubble.pending && bubble.delivery !== undefined && (
+          <PendingDeliveryFooter tempId={bubble.itemId} delivery={bubble.delivery} />
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (

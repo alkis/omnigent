@@ -421,3 +421,46 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     id_a = pending_inputs.record("conv_scope_a", [_text_block("x")], stable_id=stable)
     id_b = pending_inputs.record("conv_scope_b", [_text_block("x")], stable_id=stable)
     assert id_a != id_b
+
+
+def test_pending_id_for_finds_only_a_live_entry_with_that_stable_id() -> None:
+    """
+    A client re-send resolves to the live entry recorded under its stable id.
+
+    The route answers a duplicate POST with the first delivery's pending id
+    instead of forwarding again, so the lookup must match the stable id
+    exactly and return nothing for an unknown or already-drained one.
+    """
+    stable = "a" * 32
+    pid = pending_inputs.record("conv_a", [_text_block("hi")], stable_id=stable)
+
+    assert pending_inputs.pending_id_for("conv_a", stable) == pid
+    assert pending_inputs.pending_id_for("conv_a", "b" * 32) is None
+    assert pending_inputs.pending_id_for("conv_other", stable) is None
+
+    pending_inputs.resolve_oldest("conv_a")
+    assert pending_inputs.pending_id_for("conv_a", stable) is None
+
+
+def test_committed_submission_is_remembered_until_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A drained submission resolves to its committed item until the TTL passes.
+
+    After the forwarder drains the entry, a client retry of the same stable
+    id must find the persisted item (so the prompt is not pasted twice) for
+    as long as a still-open tab could plausibly retry, and no longer.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    stable = "c" * 32
+
+    assert pending_inputs.committed_item_id("conv_a", stable) is None
+    pending_inputs.remember_committed("conv_a", stable, "item_1")
+    assert pending_inputs.committed_item_id("conv_a", stable) == "item_1"
+    assert pending_inputs.committed_item_id("conv_other", stable) is None
+
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S - 0.1
+    assert pending_inputs.committed_item_id("conv_a", stable) == "item_1"
+
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 0.1
+    assert pending_inputs.committed_item_id("conv_a", stable) is None

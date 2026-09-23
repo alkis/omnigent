@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bubble } from "@/lib/renderItems";
+import type { Bubble, PendingDelivery } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { BubbleView } from "./chatBubbleParts";
 
@@ -274,5 +274,82 @@ describe("AssistantBubble error retry", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
+  });
+});
+
+describe("UserBubble delivery footer", () => {
+  const pendingBubble = (delivery: PendingDelivery): Bubble => ({
+    kind: "user",
+    itemId: "pend_7",
+    pending: true,
+    delivery,
+    content: [{ type: "input_text", text: "Can you add jitter and re-run just that test?" }],
+  });
+
+  it("shows only the spinner while a fresh send is in flight", () => {
+    render(
+      <BubbleView
+        bubble={pendingBubble({ posted: false, stalled: false })}
+        isLastAssistant={false}
+      />,
+    );
+
+    const footer = screen.getByTestId("send-delivery");
+    expect(footer).toHaveAttribute("data-state", "sending");
+    expect(footer).toHaveTextContent("Sending");
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("offers Retry and Cancel for a stalled send and wires them to the store", () => {
+    const retryPendingSend = vi.fn(async () => {});
+    const cancelPendingSend = vi.fn();
+    useChatStore.setState({ retryPendingSend, cancelPendingSend });
+    render(
+      <BubbleView
+        bubble={pendingBubble({ posted: false, stalled: true })}
+        isLastAssistant={false}
+      />,
+    );
+
+    const footer = screen.getByTestId("send-delivery");
+    expect(footer).toHaveAttribute("data-state", "stalled");
+    // Still "Sending": a stall is not a failure, the server may have it.
+    expect(footer).toHaveTextContent("Sending");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retryPendingSend).toHaveBeenCalledWith("pend_7");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(cancelPendingSend).toHaveBeenCalledWith("pend_7");
+  });
+
+  it("shows the server's reason when the send was refused", () => {
+    render(
+      <BubbleView
+        bubble={pendingBubble({
+          posted: false,
+          stalled: false,
+          error: { message: "The runner didn't come online in time. Please try again.", code: "" },
+        })}
+        isLastAssistant={false}
+      />,
+    );
+
+    const footer = screen.getByTestId("send-delivery");
+    expect(footer).toHaveAttribute("data-state", "refused");
+    expect(footer).toHaveTextContent("Couldn't send");
+    expect(footer).toHaveTextContent("The runner didn't come online in time. Please try again.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("renders no footer once the server accepted the send", () => {
+    render(
+      <BubbleView
+        bubble={pendingBubble({ posted: true, stalled: false })}
+        isLastAssistant={false}
+      />,
+    );
+
+    expect(screen.queryByTestId("send-delivery")).not.toBeInTheDocument();
   });
 });
