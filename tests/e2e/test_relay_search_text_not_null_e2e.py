@@ -1,44 +1,8 @@
-"""E2E: relay/store persistence must survive a search_text-less store.
+"""Store and relay persistence must support items without searchable plaintext.
 
-Reported journey: a session runs turns on a deployed
-build whose conversation store stores item ``data`` opaquely and therefore
-cannot index a plaintext ``search_text``. As the relay persists conversation
-items (a user message, a ``session.resource.deleted`` terminal teardown
-event), the INSERT aborts with::
-
-    (sqlite3.IntegrityError) NOT NULL constraint failed: conversation_items.search_text
-    [SQL: INSERT INTO conversation_items (workspace_id, conversation_id, id,
-     response_id, created_at, status, position, type, data) VALUES (...)]
-
-The user never sees this -- the item silently fails to persist and the failure
-is logged server-side (``Relay persist failed for session=...`` /
-``_handle_statement_error`` ``Database error: ...``).
-
-Root cause exercised here: ``SqlAlchemyConversationStore`` documents an
-overridable ``_item_search_text`` seam -- "A subclass whose schema omits
-``search_text`` (e.g. because ``data`` is stored opaquely and cannot be
-searched in SQL) returns ``None`` to skip persisting the column and its FTS
-row entirely." ``append()`` honors that by dropping the ``search_text`` key
-from the batch INSERT. But the mainline schema declares
-``conversation_items.search_text`` as ``NOT NULL`` (``db_models.py``:
-``search_text: Mapped[str] = mapped_column(Text)``), so a store that uses the
-documented seam has the whole INSERT aborted by the constraint -- exactly the
-error observed on the deployed opaque-store build.
-
-The default store never returns ``None`` from ``_item_search_text`` (it always
-extracts a -- possibly empty -- string), so this reproduction stands the
-deployed opaque/encrypted store in with a minimal subclass that returns
-``None`` from that documented seam, run against the mainline schema.
-
-The test asserts the *desired* behavior (the items persist), so it FAILS while
-the NOT NULL bug is live and passes once the seam and schema are reconciled
-(e.g. the column is made nullable, or ``append`` writes ``""`` when the seam
-returns ``None``).
-
-Usage::
-
-    pytest tests/e2e/test_relay_search_text_not_null_e2e.py -v
-"""
+An opaque-data store subclass returns None from _item_search_text against
+the real SQLite schema. Direct append and resource-teardown relay events
+must persist without NOT NULL errors; no live model is involved."""
 
 from __future__ import annotations
 
@@ -63,14 +27,7 @@ _RELAY_LOGGER = "omnigent.server.routes.sessions"
 
 
 class _SearchTextlessStore(SqlAlchemyConversationStore):
-    """Stand-in for a deployed opaque/encrypted conversation store.
-
-    Exercises the documented ``_item_search_text`` seam: "A subclass whose
-    schema omits ``search_text`` (e.g. because ``data`` is stored opaquely and
-    cannot be searched in SQL) returns ``None`` to skip persisting the column
-    and its FTS row entirely." It runs against the mainline schema, where
-    ``conversation_items.search_text`` is ``NOT NULL``.
-    """
+    """Model an opaque-data store by omitting searchable plaintext."""
 
     def _item_search_text(self, item: NewConversationItem) -> str | None:
         """Return ``None`` -- opaque storage cannot index a plaintext body."""
@@ -92,15 +49,7 @@ def _make_opaque_store(tmp_path: Path) -> _SearchTextlessStore:
 
 @contextmanager
 def _capture_relay_errors() -> Iterator[list[logging.LogRecord]]:
-    """
-    Capture ERROR records emitted by the relay-persist logger.
-
-    Attaches a handler directly to ``omnigent.server.routes.sessions`` (the
-    logger that emits the relay-persist failure) so the capture is independent
-    of pytest's caplog propagation, then restores the logger on exit.
-
-    :returns: A live list of the captured :class:`logging.LogRecord`.
-    """
+    """Capture relay-persistence errors directly, restoring the logger afterward."""
     records: list[logging.LogRecord] = []
 
     class _Collector(logging.Handler):
@@ -120,15 +69,7 @@ def _capture_relay_errors() -> Iterator[list[logging.LogRecord]]:
 
 
 def test_append_persists_when_store_omits_search_text(tmp_path: Path) -> None:
-    """
-    First reported symptom: a direct ``append`` of a user message.
-
-    While the bug is live, the batch INSERT drops the ``search_text`` column
-    (the store's ``_item_search_text`` returns ``None``) and the mainline
-    schema declares it ``NOT NULL``, so the whole INSERT aborts with the exact
-    ``NOT NULL constraint failed: conversation_items.search_text`` the ticket
-    quotes. Post-fix, the item persists.
-    """
+    """Persist a user message when the store omits search_text."""
     store = _make_opaque_store(tmp_path)
     conv = store.create_conversation(title="repro search_text NOT NULL")
     item = NewConversationItem(
@@ -157,16 +98,7 @@ def test_append_persists_when_store_omits_search_text(tmp_path: Path) -> None:
 
 
 def test_relay_persist_survives_search_textless_store(tmp_path: Path) -> None:
-    """
-    Second reported symptom: the relay persists a resource-teardown event.
-
-    Drives the real ``_relay_persist`` (the function named in the ticket) with
-    a ``session.resource.deleted`` terminal event. While the bug is live,
-    ``append`` raises the NOT NULL ``search_text`` ``IntegrityError``,
-    ``_relay_persist`` swallows it and logs ``Relay persist failed for
-    session=...``, and nothing persists. Post-fix, the event is durable and no
-    failure is logged.
-    """
+    """Persist resource teardown through the relay without swallowing an INSERT error."""
     store = _make_opaque_store(tmp_path)
     conv = store.create_conversation(title="repro search_text NOT NULL")
     item = NewConversationItem(

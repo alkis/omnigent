@@ -1,14 +1,7 @@
-"""Tests for the ``conversation_items.search_text`` nullable migration
-(``gh1b2c3d4e5f``).
+"""Verify nullable search_text upgrade and downgrade on SQLite.
 
-A store whose ``_item_search_text`` returns ``None`` (its item ``data`` is
-opaque, so no plaintext body exists to index) omits ``search_text`` from the
-batch INSERT. Against the prior NOT NULL constraint that aborted the whole
-INSERT — relay persistence silently lost every item on such a store — so the
-upgrade must accept column-less inserts (stored NULL) while keeping existing
-plaintext rows intact, and the downgrade must backfill NULL to ``''`` before
-restoring NOT NULL.
-"""
+Upgrade preserves plaintext rows and accepts inserts omitting search_text;
+downgrade backfills NULL to an empty string before restoring NOT NULL."""
 
 from __future__ import annotations
 
@@ -22,8 +15,8 @@ from sqlalchemy.engine import Engine
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache
 
 # Revision ids bounding the migration under test.
-_PRIOR = "gg1b2c3d4e5f"
-_THIS = "gh1b2c3d4e5f"
+_PRIOR = "jj1a2b3c4d5e"
+_THIS = "jk1b2c3d4e5f"
 
 
 def _engine_at(uri: str, revision: str) -> Engine:
