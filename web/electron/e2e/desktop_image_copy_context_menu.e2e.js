@@ -1,25 +1,6 @@
-// Right-clicking a PNG in the file preview must offer a way to copy the image
-// on the desktop shell (Electron owns the menu there — no browser fallback).
-//
-// Journey (real desktop shell, real server + runner, real PNG on disk):
-//   1. a session's working directory contains a PNG
-//   2. open the session's Files (explore) view and click the PNG
-//   3. the preview renders the image
-//   4. right-click the image to copy it
-//   5. EXPECTED: a context menu with a "Copy Image" item pops
-//      BUG:      the shell's context-menu handler (attachContextMenu in
-//                src/main.js) builds no items for image hit-tests, so no menu
-//                appears at all — the user is left with only the zoom cursor.
-//
-// A native Electron menu is OS chrome that no page-level driver can see, so
-// the test observes the app/native boundary instead: it records what
-// Menu.buildFromTemplate is asked to pop while the REAL right-click flows
-// through Chromium's hit test (params.mediaType === "image") into the real
-// context-menu handler. Today nothing pops; after a fix the popped template
-// must contain a copy-image item.
-//
-// Run from web/electron after building the SPA (see e2e/README.md):
-//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_image_copy_context_menu.e2e.js
+// Open a PNG through the real desktop/server/runner stack and right-click it.
+// Observe Menu.buildFromTemplate at the native boundary; page drivers cannot inspect OS menus.
+// Run after building the SPA: node --test e2e/desktop_image_copy_context_menu.e2e.js
 
 "use strict";
 
@@ -264,6 +245,13 @@ describe(
           await window.evaluate((u) => {
             window.location.href = u;
           }, `${server.serverUrl}/c/${sessionId}?view=explore`);
+          const railToggle = window.getByRole("button", {
+            name: /^(Expand|Collapse) right panel$/,
+          });
+          await railToggle.waitFor({ state: "visible", timeout: 30_000 });
+          if ((await railToggle.getAttribute("aria-label")) === "Expand right panel") {
+            await railToggle.click();
+          }
           const fileButton = window.getByRole("button", { name: /^preview-image\.png\b/ });
           await fileButton.waitFor({ state: "visible", timeout: 30_000 });
           await fileButton.click();

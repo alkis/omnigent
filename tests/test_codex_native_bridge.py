@@ -17,12 +17,16 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_bridge_state,
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
+    codex_terminal_interactive,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
     read_bridge_startup_error,
+    read_bridge_startup_timeout,
     read_bridge_state,
+    read_codex_config_effort,
     read_codex_config_model,
+    read_codex_home_config_effort,
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
@@ -30,10 +34,36 @@ from omnigent.harnesses.codex_native.bridge import (
     update_active_turn_id,
     update_mcp_server_startup,
     write_bridge_startup_error,
+    write_bridge_startup_timeout,
     write_bridge_state,
+    write_codex_config_effort,
     write_codex_config_model,
     write_policy_hook_config,
 )
+
+
+def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
+    bridge_dir: Path, tmp_path: Path
+) -> None:
+    """The KPI endpoint excludes pre-thread and disabled-composer frames."""
+    ready_pane = "Codex\n\n› Ask Codex to do anything\n  ? for shortcuts"
+
+    assert codex_terminal_interactive(bridge_dir, ready_pane) is False
+
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_interactive",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_interactive",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+
+    assert codex_terminal_interactive(bridge_dir, ready_pane) is True
+    assert codex_terminal_interactive(bridge_dir, "› Input disabled.") is False
+    assert codex_terminal_interactive(bridge_dir, "› Shutting down...") is False
+    assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
 def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
@@ -164,6 +194,43 @@ def test_read_codex_config_model_none_when_unparsable(bridge_dir: Path) -> None:
     assert read_codex_config_model(bridge_dir) is None
 
 
+def test_read_codex_config_effort_returns_top_level_effort(bridge_dir: Path) -> None:
+    """The top-level ``model_reasoning_effort`` key (what /model writes) is returned.
+
+    This is the forwarder's source of truth for the effort the terminal runs
+    at; if it returned the wrong key or ``None``, an in-TUI effort change
+    would never mirror to the chat composer.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\n')
+
+    assert read_codex_config_effort(bridge_dir) == "high"
+
+
+def test_read_codex_home_config_effort_reads_a_codex_home_directly(bridge_dir: Path) -> None:
+    """A ``CODEX_HOME`` path yields the same effort as the bridge-dir reader."""
+    _write_config(bridge_dir, 'model_reasoning_effort = "low"\n')
+
+    assert read_codex_home_config_effort(codex_home_for_bridge_dir(bridge_dir)) == "low"
+
+
+def test_read_codex_config_effort_none_when_missing_or_absent(bridge_dir: Path) -> None:
+    """No file, no key, or a non-string value → ``None`` (no invented effort)."""
+    assert read_codex_config_effort(bridge_dir) is None
+
+    _write_config(bridge_dir, 'model = "gpt-5.4"\n')
+    assert read_codex_config_effort(bridge_dir) is None
+
+    _write_config(bridge_dir, "model_reasoning_effort = 3\n")
+    assert read_codex_config_effort(bridge_dir) is None
+
+
+def test_read_codex_config_effort_none_when_unparsable(bridge_dir: Path) -> None:
+    """Malformed TOML → ``None``, not a crash (guards a partial write)."""
+    _write_config(bridge_dir, 'model_reasoning_effort = "high\n[broken')
+
+    assert read_codex_config_effort(bridge_dir) is None
+
+
 def test_write_codex_config_model_replaces_top_level_key(bridge_dir: Path) -> None:
     """The existing top-level ``model`` line is replaced, sections untouched.
 
@@ -198,6 +265,145 @@ def test_write_codex_config_model_creates_missing_file(bridge_dir: Path) -> None
     """No codex-home/config.toml yet → the writer creates it (best-effort)."""
     assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
     assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+
+
+def test_write_codex_config_effort_replaces_top_level_key(bridge_dir: Path) -> None:
+    """The existing top-level ``model_reasoning_effort`` line is replaced.
+
+    An Omnigent-initiated effort change (web composer gear) must land on the
+    same key an in-TUI ``/model`` writes, or a fresh forwarder state (thread
+    resume / reconnect) re-reads the stale launch effort and mirrors it back,
+    silently reverting the composer's pick.
+    """
+    _write_config(
+        bridge_dir,
+        'model = "gpt-5.5"\n'
+        'model_reasoning_effort = "medium"\n'
+        "[model_providers.databricks]\n"
+        'model_reasoning_effort = "section-effort-not-touched"\n',
+    )
+
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert 'model_reasoning_effort = "section-effort-not-touched"' in body
+    assert 'model = "gpt-5.5"' in body
+
+
+def test_write_codex_config_effort_inserts_when_absent(bridge_dir: Path) -> None:
+    """A config with no top-level effort key gains one at the top."""
+    _write_config(bridge_dir, 'model = "gpt-5.5"\n')
+
+    assert write_codex_config_effort(bridge_dir, "low") is True
+    assert read_codex_config_effort(bridge_dir) == "low"
+    assert read_codex_config_model(bridge_dir) == "gpt-5.5"
+
+
+def test_write_codex_config_effort_creates_missing_file(bridge_dir: Path) -> None:
+    """No codex-home/config.toml yet → the writer creates it (best-effort)."""
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+
+
+def test_write_codex_config_effort_replaces_key_after_multiline_array(bridge_dir: Path) -> None:
+    """A top-level multiline array must not end the top-level scan early.
+
+    Its continuation lines can begin with ``[`` (nested arrays); mistaking one
+    for a table header would miss the existing effort key below the array and
+    insert a duplicate at the top — invalid TOML that ``tomllib`` (and codex
+    itself) reject, corrupting the mirror rather than just staling it.
+    """
+    # The continuation line sits at column 0 — valid TOML, and the shape a
+    # naive ``startswith("[")`` break mistakes for a table header.
+    _write_config(
+        bridge_dir,
+        "notify = [\n"
+        '["notify-send", "Codex"],\n'
+        "]\n"
+        'model = "gpt-5.5"\n'
+        'model_reasoning_effort = "medium"\n',
+    )
+
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert body.count("model_reasoning_effort") == 1
+
+
+def test_write_codex_config_model_replaces_key_after_multiline_array(bridge_dir: Path) -> None:
+    """The model writer shares the array-aware scan (same duplicate-key hazard)."""
+    _write_config(
+        bridge_dir,
+        'notify = [\n["notify-send", "Codex"],\n]\nmodel = "databricks-gpt-5-5"\n',
+    )
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert len([line for line in body.splitlines() if line.startswith("model =")]) == 1
+
+
+def test_write_codex_config_effort_replaces_key_after_bracket_in_string(bridge_dir: Path) -> None:
+    """Brackets inside string values/comments must not derail the upsert.
+
+    A line-scanning heuristic that counts brackets sees the lone ``[`` in
+    ``notify = ["["]`` as an unclosed array and skips every following key,
+    inserting a duplicate — invalid TOML. The tomlkit-based upsert parses the
+    document, so string/comment content cannot be mistaken for structure.
+    """
+    _write_config(
+        bridge_dir,
+        'notify = ["["]\n'
+        'model = "gpt-5.5"  # experimental [beta\n'
+        'model_reasoning_effort = "medium"\n',
+    )
+
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert body.count("model_reasoning_effort") == 1
+    # The style-preserving rewrite keeps unrelated lines (and comments) intact.
+    assert 'notify = ["["]' in body
+    assert "# experimental [beta" in body
+
+
+def test_write_codex_config_model_clamps_stale_effort_for_capped_model(bridge_dir: Path) -> None:
+    """Switching onto a capped model clamps a too-high stale effort line.
+
+    The switched-to thread inherits config.toml's effort; one above the new
+    model's ladder would 400 the next turn, so the model write clamps it.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n')
+
+    assert write_codex_config_model(bridge_dir, "databricks-glm-5-2") is True
+    assert read_codex_config_model(bridge_dir) == "databricks-glm-5-2"
+    assert read_codex_config_effort(bridge_dir) == "medium"
+
+
+def test_write_codex_config_model_replaces_quoted_key(bridge_dir: Path) -> None:
+    """A quoted top-level ``"model"`` key is the same key — replaced, not duplicated."""
+    _write_config(bridge_dir, '"model" = "databricks-gpt-5-5"\n')
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+
+
+def test_write_codex_config_effort_false_on_undecodable_or_malformed_file(
+    bridge_dir: Path,
+) -> None:
+    """Undecodable or malformed files → ``False`` (best-effort), never made worse."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_bytes(b"\xff\xfe\x00broken")
+
+    assert write_codex_config_effort(bridge_dir, "high") is False
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is False
+
+    # Malformed TOML (e.g. a torn partial write) is refused rather than
+    # rewritten into something even a lenient reader cannot recover.
+    (home / "config.toml").write_text('model_reasoning_effort = "high\n[broken')
+    assert write_codex_config_effort(bridge_dir, "high") is False
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is False
 
 
 def test_policy_hook_config_round_trips(bridge_dir: Path) -> None:
@@ -369,6 +575,72 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_round_trips_and_is_cleared(bridge_dir: Path) -> None:
+    """The configured-command marker is bounded and cleared before a new launch."""
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+    write_bridge_startup_timeout(bridge_dir, 120.0)
+    assert read_bridge_startup_timeout(bridge_dir) == 120.0
+
+    clear_bridge_state(bridge_dir)
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, 120.1, float("inf"), float("nan")])
+def test_bridge_startup_timeout_rejects_unbounded_values(
+    bridge_dir: Path,
+    timeout: float,
+) -> None:
+    """Invalid marker values cannot weaken the executor's bounded wait."""
+    with pytest.raises(ValueError, match="finite, positive"):
+        write_bridge_startup_timeout(bridge_dir, timeout)
+
+
+@pytest.mark.parametrize("value", [True, "120", 120.1, 10**1000, None])
+def test_bridge_startup_timeout_ignores_malformed_file_values(
+    bridge_dir: Path,
+    value: object,
+) -> None:
+    """Executor-visible marker parsing fails closed to the legacy wait."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_text(
+        json.dumps({"timeout_seconds": value}),
+        encoding="utf-8",
+    )
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_ignores_invalid_utf8(bridge_dir: Path) -> None:
+    """A marker that is not UTF-8 fails closed to the legacy wait."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_bytes(b"\xff")
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_ignores_overlong_integer(bridge_dir: Path) -> None:
+    """A marker larger than the payload cap fails closed."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_text(
+        '{"timeout_seconds": ' + "1" * 5000 + "}",
+        encoding="utf-8",
+    )
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
+
+
+def test_bridge_startup_timeout_ignores_deeply_nested_json(bridge_dir: Path) -> None:
+    """A recursively nested marker cannot escape the fail-closed boundary."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "startup_timeout.json").write_text(
+        "[" * 10_000 + "0" + "]" * 10_000,
+        encoding="utf-8",
+    )
+
+    assert read_bridge_startup_timeout(bridge_dir) is None
 
 
 def test_mcp_startup_updates_round_trip(bridge_dir: Path) -> None:

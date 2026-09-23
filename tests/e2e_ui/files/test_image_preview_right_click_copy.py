@@ -1,24 +1,10 @@
-"""E2E: right-clicking a previewed image must keep the native copy affordance.
+"""Right-clicking a previewed image must preserve the browser copy affordance.
 
-Users copy a previewed PNG by right-clicking it. On the desktop shell that
-menu is Electron-owned (covered by
-``web/electron/e2e/desktop_image_copy_context_menu.e2e.js``). On the plain
-browser surface the "Copy image" item lives in the browser's native context
-menu, which no page-level driver can inspect; Chrome offers it iff
-
-* the topmost element at the right-click point is the ``<img>`` itself (an
-  overlay would swallow the image hit-test), and
-* no page handler default-prevents the ``contextmenu`` event.
-
-This test right-clicks the previewed image for real and asserts exactly those
-two user-visible preconditions, so it fails if the SPA ever suppresses or
-covers the file preview's native right-click menu (e.g. a zoom overlay that
-eats the hit-test).
-
-Seeded via the filesystem PUT endpoint, which can only carry text — hence an
-SVG image fixture (see test_image_rendering.py); the ``<ImageViewer>`` under
-test renders every image type through the same bare blob-backed ``<img>``.
-"""
+Assert that the image is the hit-test target and the contextmenu event is
+not prevented. Browser-native menu contents cannot be inspected by this
+driver. The Electron journey tests the app-owned menu separately. Seed an
+SVG through the text-only filesystem endpoint; ImageViewer uses the same
+blob-backed img element for raster and vector images."""
 
 from __future__ import annotations
 
