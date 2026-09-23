@@ -10599,6 +10599,95 @@ def test_a_surface_reopened_after_a_draft_wait_is_dismissed_before_typing(
     )
 
 
+def test_a_flapping_repaint_cannot_keep_the_reclaim_settling_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The reclaim is capped as a whole.
+
+    Four free frames then one composer-less repaint, repeated, never reach
+    the settle count and never expire a per-wait bound (each is reset when
+    the composer returns). The overall cap hands the box back so the
+    injection lock is not held forever.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    cycle = [*[_IDLE_PANE] * 4, "● Working on it"]
+    events = _events_tmux(monkeypatch, cycle * 60)
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert "send:send-keys:C-u" in events, "The reclaim never handed the box back"
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    cap_polls = int(claude_native_bridge._RECLAIM_TIMEOUT_S / poll)
+    assert _captures_before_first_send(events) <= cap_polls + 3, (
+        f"The reclaim ran past its overall cap; events: {len(events)}"
+    )
+
+
+def test_a_draft_after_an_observed_release_gets_its_own_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A draft that appears after the box was seen free is a new draft.
+
+    Draft A sits for 4.8 s, the box is seen empty, and draft B appears at
+    5.1 s. Judged against A's budget, B would read as already stale and the
+    C-u would clear it; B was explicitly observed and must get its own wait.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    draft_a = int(4.8 / poll)
+    draft_b = int(3.0 / poll)
+    settle = [_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1)
+    events = _events_tmux(
+        monkeypatch,
+        [
+            *[_composer_pane("first message")] * draft_a,
+            _IDLE_PANE,
+            *[_composer_pane("second message")] * draft_b,
+            *settle,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    first_cu = events.index("send:send-keys:C-u")
+    captures_before = sum(1 for event in events[:first_cu] if event == "capture")
+    assert captures_before >= draft_a + 1 + draft_b, (
+        f"C-u fired on the second draft as if it were the stale first one; events: {events[:60]}"
+    )
+
+
+def test_the_readiness_gate_holds_for_a_draft_that_appears_after_reclaim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The gate's own hold covers a draft that lands after the reclaim returned.
+
+    The reclaim sees a free box and hands it back; another writer's command
+    then appears before the paste. The paste's clear must wait until that
+    command has submitted and the box is empty again.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    foreign = [_composer_pane("/effort high")] * 3
+    events = _events_tmux(monkeypatch, [_IDLE_PANE, *foreign, _IDLE_PANE])
+
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert _captures_before_first_send(events) > 1 + len(foreign), (
+        f"The paste's clear fired while the slash command was in the box; events: {events}"
+    )
+    keystrokes = [event for event in events if event.startswith("send:send-keys:")]
+    assert keystrokes[:2] == ["send:send-keys:C-a", "send:send-keys:C-k"], (
+        f"Unexpected keystrokes: {keystrokes}"
+    )
+
+
 def test_a_slash_command_draft_that_never_renders_submits_blind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

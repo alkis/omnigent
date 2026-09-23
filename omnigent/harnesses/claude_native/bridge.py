@@ -385,6 +385,12 @@ _FOREIGN_DRAFT_WAIT_TIMEOUT_S = 5.0
 # slash command yields so a paste already in flight lands first, then it
 # queues behind that draft instead of clearing it.
 _SLASH_COMMAND_SETTLE_POLLS = 5
+# Hard cap on one reclaim. Every wait inside it is bounded on its own, but a
+# pane that flaps between states (a repaint every few frames, a draft that
+# comes and goes) could chain those bounds without end; past this the box is
+# handed back as it is. Sized for a surface dismissal, a draft wait, a second
+# draft after a release, and the settle, back to back.
+_RECLAIM_TIMEOUT_S = 15.0
 # Dim hints Claude Code renders in an EMPTY input box: the startup suggestion
 # (``Try "fix lint errors"``) and the queued-input hint while a turn runs.
 # Chrome, not a draft — the first keystroke replaces it — so a box showing
@@ -5384,7 +5390,9 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param settle_polls: Consecutive free-composer polls to see before
         returning, e.g. ``5`` for a slash command; ``1`` returns on the
-        first free frame.
+        first free frame. A draft seen after the box was seen free is a new
+        one and gets its own wait; the whole reclaim is capped at
+        :data:`_RECLAIM_TIMEOUT_S` so a flapping pane cannot chain waits.
     :returns: The draft this writer stopped waiting on, e.g. ``"fix the"``,
         so the caller can treat it as a person's leftover instead of waiting
         for it again; ``None`` when the box was handed back free (or the
@@ -5396,6 +5404,7 @@ def _restore_occupied_input(
     # without one Escape attempt. A run of torn (blank) frames is bounded
     # from the last frame that showed the composer, so it can neither end an
     # active draft wait nor a settle early, nor spin forever.
+    overall_deadline = time.monotonic() + _RECLAIM_TIMEOUT_S
     deadline: float | None = None
     draft_deadline: float | None = None
     torn_deadline: float | None = None
@@ -5416,6 +5425,12 @@ def _restore_occupied_input(
             return None
         surface = _occupying_surface(pane)
         now = time.monotonic()
+        if now >= overall_deadline:
+            _logger.warning(
+                "claude-native: input box did not settle within %.1fs; proceeding",
+                _RECLAIM_TIMEOUT_S,
+            )
+            return None
         if surface is None:
             if not pane.strip():
                 # A torn capture says nothing. Before any composer frame it is
@@ -5447,6 +5462,9 @@ def _restore_occupied_input(
                     return _composer_draft_text(pane)
                 time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
                 continue
+            # Seen free: a draft that shows up later is a new one, not the tail
+            # of the one already waited out, so it gets its own budget.
+            draft_deadline = None
             free_polls += 1
             if free_polls >= settle_polls:
                 return None
