@@ -1,25 +1,7 @@
-"""File edits must render as a diff, not a full-file replacement.
+"""File edits must display the removed and added lines in the transcript.
 
-User journey: the agent is asked to change ONE line of an existing workspace
-file. It performs the edit with ``sys_os_write`` (a full-content replacement,
-the shape the generic ``ToolCard`` renders for every harness's file edits).
-The user expands the edit tool call in the transcript to see what changed.
-
-Expected: the change renders as a **diff** — the removed line and the added
-line are both visible, so the reader can tell what actually changed.
-
-Broken behavior guarded against: the expanded panel dumps the tool call's
-raw Parameters JSON — the ENTIRE new file content as one escaped string —
-and the replaced (old) line appears nowhere on the page. The edit is
-unreadable as a change.
-
-The discriminating assertion is the last one: after expanding the edit tool
-call, the line that was REPLACED must be visible somewhere in the assistant
-transcript (any reasonable diff rendering shows removed lines). Without a
-diff surface in ``web/src/components/blocks/ToolCard.tsx`` it fails. The
-added-line assertion just before it is fix-safe (a diff shows added lines
-too) and doubles as a sanity check that the edit rendered at all.
-"""
+Seed a file, drive an edit through the browser, and check that the old line is
+visible only as part of the diff."""
 
 from __future__ import annotations
 
@@ -49,10 +31,7 @@ _TURN_TIMEOUT_MS = 90_000
 
 _FILE = "config.py"
 
-# The single line the edit changes. The OLD line is the discriminator: it
-# exists only in the pre-edit file, so it can only appear on screen if the
-# UI renders the change as a diff (removed side). It is deliberately absent
-# from the user prompt and the assistant reply.
+# The old line is absent from both prompt and reply, so only a diff can show it.
 _OLD_LINE = "REQUEST_TIMEOUT_SECONDS = 30"
 _NEW_LINE = "REQUEST_TIMEOUT_SECONDS = 60"
 
@@ -115,12 +94,7 @@ def edit_probe_session(
     runner_id: str,
     mock_llm_server_url: str,
 ) -> Iterator[tuple[str, str, str]]:
-    """Runner-bound session whose workspace holds the pre-edit file.
-
-    Seeds ``config.py`` with the original content BEFORE the turn so the
-    journey is a genuine edit of an existing file (the diff's "before"
-    side exists on disk for a fix to use).
-    """
+    """Create a runner-bound session with the pre-edit file in its workspace."""
     ws = Path(tempfile.mkdtemp(prefix="omnigent-e2e-edit-diff-"))
     (ws / _FILE).write_text(_ORIGINAL_CONTENT, encoding="utf-8")
     name = f"edit_probe_{uuid.uuid4().hex[:8]}"

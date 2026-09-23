@@ -1,12 +1,4 @@
-// Derive a line diff for file-editing tool calls so the transcript shows
-// what changed instead of a raw full-content Parameters dump.
-//
-// Two sources, matching where each tool's "before" side exists:
-// - exact-replacement edit tools (sys_os_edit, Claude Code's Edit/MultiEdit,
-//   Pi/OpenCode's edit) carry old/new text pairs in their arguments;
-// - full-file write tools (sys_os_write) can't know the replaced content
-//   client-side, so the OS environment reports a unified `diff` in the
-//   tool's JSON result when it overwrites an existing text file.
+// Edit tools supply old/new pairs; full-file writes supply a server-computed diff.
 
 /** Unchanged context lines kept around a replacement hunk. */
 const CONTEXT_LINES = 2;
@@ -55,11 +47,7 @@ function splitLines(text: string): string[] {
   return lines;
 }
 
-/**
- * Render one replacement pair as a diff hunk: trim the lines common to
- * both sides, keep a couple of them back as context, and mark the rest
- * removed/added.
- */
+/** Render a replacement hunk with unchanged context around it. */
 function pairHunk(pair: EditPair): string {
   const oldLines = splitLines(pair.oldText);
   const newLines = splitLines(pair.newText);
@@ -100,11 +88,7 @@ function writeResultDiff(output: string | null): string | null {
   return typeof diff === "string" && diff.length > 0 ? diff : null;
 }
 
-/**
- * Diff text for a file-editing tool call, or `null` when the call isn't a
- * file edit / has no derivable "before" side (e.g. a write that created a
- * new file).
- */
+/** Return the edit diff, or null when no before/after pair is available. */
 export function getFileEditDiff(
   name: string,
   args: Record<string, unknown>,

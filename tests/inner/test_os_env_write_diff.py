@@ -1,10 +1,4 @@
-"""Unit tests for the overwrite diff carried by ``_write_impl`` results.
-
-A full-file write replaces content the caller never restates, so the write
-result is the only place the "what changed" story can be told. ``_write_impl``
-captures the pre-write content and reports a unified ``diff`` field that
-frontends render instead of a raw full-content dump.
-"""
+"""Overwrites must return the before/after diff needed by the transcript UI."""
 
 from __future__ import annotations
 
