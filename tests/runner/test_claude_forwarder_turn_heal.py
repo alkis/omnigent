@@ -1,13 +1,4 @@
-"""Tests for the claude-native transcript-forwarder heal on a live pane.
-
-The web Chat renders from the server conversation store, which only the
-runner-owned transcript forwarder fills; the Terminal tab reads the tmux pane
-directly. Pane (re)creation is the only launch path that starts a forwarder, so
-a forwarder that dies while the pane stays alive leaves every later web turn's
-assistant reply visible in the terminal but missing from Chat. These tests
-cover the orchestration helpers that restart the forwarder from the per-turn
-self-heal seam.
-"""
+"""A web turn must restart a dead Claude transcript forwarder on an existing pane."""
 
 from __future__ import annotations
 

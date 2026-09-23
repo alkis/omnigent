@@ -1,68 +1,8 @@
-"""E2E regression: with the native Claude
-harness, assistant turns never reach the web Chat view when the transcript
-forwarder has died but the tmux pane is still alive.
+"""A live Claude pane must recover its dead transcript forwarder on the next turn.
 
-Guarded bug
------------
-A daemon-owned ``omnigent claude`` (``claude-native``) session defers transcript
-forwarding to the RUNNER process: a background forwarder task tails Claude's
-JSONL transcript and mirrors every user/assistant record into the server's
-conversation store via ``external_conversation_item`` POSTs. The web **Chat**
-view renders from that store; the web **Terminal** tab reads the live tmux pane
-directly.
-
-If the runner-owned forwarder task dies (crash, transport error, token expiry)
-while the tmux pane keeps running, the two surfaces desync exactly as reported:
-the Terminal tab still shows Claude's replies (it reads the pane), but the Chat
-tab stays empty of assistant content (the store never receives it) even though
-the user's own messages show. On ``main`` the forwarder is (re)started only when
-the terminal pane is (re)created -- a **live pane + dead forwarder** is never
-healed, so every subsequent web turn's assistant reply is lost from Chat.
-
-The seam
---------
-A web message turn for a native session flows through the runner's
-``POST /v1/sessions/{id}/events`` (non-streaming) -> ``_run_turn_bg`` ->
-``_run_turn_bg_setup_and_stream``, which calls ``_ensure_native_terminal_for_turn``
-before delivering the turn. That self-heal probes the registered pane: on a LIVE
-pane it returns early ("pane is registered and alive -- nothing to heal") and, on
-``main``, does NOTHING to the forwarder. So a session whose pane is alive but
-whose forwarder task is gone keeps taking turns while its assistant replies never
-reach the conversation store the web Chat renders.
-
-The fix must restart the transcript forwarder from that
-live-pane branch (and register it in ``_AUTO_FORWARDER_TASKS`` for teardown), so a
-web turn re-establishes the store mirror and the assistant reply reaches Chat.
-
-What this drives
-----------------
-The REAL runner app (``create_runner_app``) over ASGI, with a REAL
-``TerminalRegistry`` holding a LIVE claude pane, a REAL claude-native session, and
-the REAL turn path (``POST /v1/sessions/{id}/events`` -> ``_run_turn_bg`` ->
-``_ensure_native_terminal_for_turn``). ``_auto_create_claude_terminal`` is stubbed
-at session create so NO forwarder is started there -- reproducing the dead-forwarder
-state -- and a live pane is planted directly. ``RUNNER_SERVER_URL`` points at a
-recording HTTP server standing in for the Omnigent server's conversation store;
-the assistant reply is appended to Claude's transcript AFTER the turn (as a real
-Claude reply would arrive), and the test asserts that reply reaches the store the
-web Chat renders from.
-
-Expected (fixed): the assistant reply reaches the conversation store. Buggy
-(``main``): the live-pane turn never restarts the dead forwarder, so the assistant
-reply is never mirrored -- the web Chat stays empty while the terminal has it. This
-test then FAILS with the assistant marker absent from every conversation-store POST.
-
-Environment fidelity
---------------------
-The reported symptom (web Chat empty for a native Claude session) is
-environment-independent runner/forwarder product behavior; it is driven here at
-its exact production seam. No LLM and no real Claude CLI are invoked.
-
-Run::
-
-    .venv/bin/python -m pytest \\
-        tests/e2e/test_claude_native_dead_forwarder_web_chat_empty_e2e.py -v
-"""
+The real runner app runs over ASGI against a recording HTTP store. Session
+creation and prompt delivery are stubbed to isolate forwarder recovery;
+no live Claude process or provider is involved."""
 
 from __future__ import annotations
 
@@ -196,13 +136,7 @@ def _assistant_record(uuid: str, text: str) -> dict[str, Any]:
 
 
 def _seed_prior_transcript(bridge_dir: Path, transcript_path: Path) -> None:
-    """Write the pre-turn transcript (the user's message) + point hooks at it.
-
-    Represents the state right after the user sent a message and it appeared in
-    Chat: the transcript holds the user record, and a recorded ``Stop`` hook
-    reports the transcript path (+ pins the claude session id) so the forwarder
-    resolves the file to tail on its first poll.
-    """
+    """Seed the prior user turn and point bridge hooks at its transcript."""
     transcript_path.write_text(
         json.dumps(_user_record("seeded-user-uuid", _USER_MARKER)) + "\n",
         encoding="utf-8",
@@ -248,13 +182,7 @@ async def _live_forwarder_task(conv_id: str) -> asyncio.Task[object] | None:
 
 
 def _install_auto_create_stub(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
-    """Stub claude-native auto-create so session create starts NO forwarder.
-
-    This reproduces the dead-forwarder state: the session is a real claude-native
-    conversation, but the forwarder that would mirror its transcript into the
-    store was never started (or died) -- and nothing has recreated the pane to
-    restart it. The test plants the live pane itself.
-    """
+    """Prevent session creation from starting a forwarder."""
 
     async def _stub_auto_create(
         session_id: str,
@@ -295,22 +223,7 @@ async def test_live_pane_dead_forwarder_loses_assistant_reply_from_web_chat(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A web turn on a live-pane / dead-forwarder claude-native session must
-    re-establish the transcript mirror so the assistant reply reaches Chat.
-
-    Journey (the reporter's): run ``omnigent claude``; open the web UI; from the
-    Chat tab send a prompt. The terminal shows Claude's reply, but the Chat tab
-    stays empty of assistant content (the user's own message shows). Only the
-    transcript forwarder mirrors assistant replies into the conversation store
-    the Chat renders from, and when that forwarder has died while the tmux pane
-    is still alive, no web turn restarts it.
-
-    Expected: the assistant reply reaches the conversation store. Buggy
-    (``main``): the live-pane self-heal returns early without touching the
-    forwarder, so the reply is never mirrored -- this test FAILS with the
-    assistant marker absent from every store POST while it is present in the
-    transcript (the terminal's source).
-    """
+    """Restart the dead forwarder and mirror the next assistant reply into web history."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
@@ -435,10 +348,7 @@ async def test_live_pane_dead_forwarder_loses_assistant_reply_from_web_chat(
             "(the terminal's source)"
         )
 
-        # The bug: a live-pane web turn never restarted the dead forwarder, so
-        # the assistant reply the user is waiting for is never mirrored into the
-        # conversation store the web Chat renders from -- the reported "terminal
-        # fine, Chat empty of assistant turns" desync.
+        # The recovered forwarder must mirror the reply into conversation history.
         store_summary = [
             b.get("type") for b in recorded if isinstance(b, dict)
         ] or "no conversation-store POSTs received"
