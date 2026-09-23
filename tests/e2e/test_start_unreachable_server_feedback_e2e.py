@@ -42,8 +42,6 @@ _FEEDBACK_DEADLINE_S = 15.0
 # build fails much sooner or prints progress; a hang past this is killed.
 _JOURNEY_DEADLINE_S = 120.0
 
-_LOG_TAIL_MARKER = "--- host log tail ---"
-
 
 @dataclass
 class _StartRun:
@@ -181,11 +179,20 @@ def test_start_failure_names_unreachable_server_and_omits_401_hint(
         f"configured server http://127.0.0.1:{run.port} is unreachable; "
         f"output:\n{run.output}"
     )
-    error_text = run.output.split(_LOG_TAIL_MARKER)[0]
-    assert f"127.0.0.1:{run.port}" in error_text, (
-        "the error never names the unreachable server it tried "
+    # Scope the assertions to the final error itself: the earlier waiting
+    # message also names the server, so checking combined output would keep
+    # passing even if the error lost the URL or the refusal reason.
+    error_lines = [text for _, text in run.lines if text.startswith("Error:")]
+    assert error_lines, f"no final `Error:` line in output:\n{run.output}"
+    final_error = error_lines[-1]
+    assert f"127.0.0.1:{run.port}" in final_error, (
+        "the final error never names the unreachable server it tried "
         f"(http://127.0.0.1:{run.port}); a user cannot tell what `start` was "
-        f"waiting for. Error text:\n{error_text}"
+        f"waiting for. Error line:\n{final_error}"
+    )
+    assert "Connection refused" in final_error, (
+        "the final error does not carry the transport reason (connection "
+        f"refused) for the unreachable server. Error line:\n{final_error}"
     )
     assert "HTTP 401" not in run.output, (
         "the stale-host HTTP 401 hint was printed for a connection-refused "
