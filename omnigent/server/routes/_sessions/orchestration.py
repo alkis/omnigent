@@ -190,6 +190,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
+    _session_finished_at_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -918,6 +919,7 @@ def _build_session_list_item(
         ),
         viewer_last_seen=viewer_last_seen,
         viewer_unread=viewer_unread,
+        last_finished_at=_session_finished_at_cache.get(conv.id),
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,

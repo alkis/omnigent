@@ -9,11 +9,12 @@ it and actively watched it complete on another device.
 Each client decides notifications locally: ``useIdleNotifications`` diffs
 the conversations cache for ``running`` -> ``idle`` edges and suppresses
 the conversation *this* window is focused on. The cross-device signal is
-the per-viewer read state: the watching device keeps raising the session's
-``viewer_last_seen`` past ``updated_at`` (``useMarkConversationSeen`` ->
-``PUT /read-state``), and the server redistributes it to the user's other
-clients over the list and ``WS /v1/sessions/updates``, which must keep the
-phone quiet.
+the watched-finish acknowledgement: the server stamps the turn's finish
+time (``last_finished_at``), the watching device raises the session's
+``viewer_last_seen`` past that stamp the moment it lands
+(``useMarkConversationSeen`` -> ``PUT /read-state``), and the server
+redistributes the baseline to the user's other clients over the list and
+``WS /v1/sessions/updates``, which must keep the phone quiet.
 
 This test reproduces that journey with two real browser clients against the
 live server:
@@ -39,13 +40,18 @@ What the test controls (same probe pattern as
   ``window.__hidden`` so the phone can be put into the backgrounded state;
 - the session statuses each client observed are recorded off the app's own
   traffic: ``/v1/sessions`` list responses, the active session's
-  ``/stream`` SSE events, and ``WS /v1/sessions/updates`` frames.
+  ``/stream`` SSE events, and ``WS /v1/sessions/updates`` frames; the
+  read-state fields (``viewer_last_seen`` / ``last_finished_at``) are
+  recorded off the same list/WS rows.
 
 EXPECTED (asserted) BEHAVIOR: the phone records no notification for the
-session. A failure means the phone fired the session's turn-end
-notification (tag ``omnigent:session:<id>``) about 10 s (the client's
-idle-settle window) after the turn the user sent and watched on the laptop
-completed — the cross-device suppression regressed.
+session, AND it observed the watched-finish signal (a row whose
+``viewer_last_seen`` caught up with ``last_finished_at``) — so the quiet
+is attributable to the suppression, not to a missed transition. A failure
+means the phone fired the session's turn-end notification (tag
+``omnigent:session:<id>``) about 10 s (the client's idle-settle window)
+after the turn the user sent and watched on the laptop completed — the
+cross-device suppression regressed.
 """
 
 from __future__ import annotations
@@ -72,6 +78,7 @@ _PROBE_INIT_SCRIPT = """
 window.__notifs = [];
 window.__hidden = false;
 window.__sessionStatuses = [];
+window.__readState = [];
 const __origFetch = window.fetch.bind(window);
 function __recordStatuses(statuses, source) {
   window.__sessionStatuses.push({
@@ -79,6 +86,17 @@ function __recordStatuses(statuses, source) {
     statuses,
     time: Date.now(),
   });
+}
+function __recordReadState(rows) {
+  for (const row of rows) {
+    if (!row || typeof row.id !== "string") continue;
+    window.__readState.push({
+      id: row.id,
+      viewer_last_seen: row.viewer_last_seen,
+      last_finished_at: row.last_finished_at,
+      time: Date.now(),
+    });
+  }
 }
 function __recordStreamStatuses(response, sessionId) {
   if (!response.body || !sessionId) return;
@@ -128,6 +146,7 @@ window.fetch = async function(input, init) {
         const statuses = {};
         for (const row of rows) statuses[row.id] = row.status;
         __recordStatuses(statuses, url.search || "list");
+        __recordReadState(rows);
       }).catch(() => {});
     } else {
       const match = url.pathname.match(/^\\/v1\\/sessions\\/([^/]+)\\/stream$/);
@@ -163,6 +182,7 @@ function __ProbeWebSocket(url, protocols) {
               }
             }
             if (any) __recordStatuses(statuses, "ws");
+            __recordReadState(frame.items);
           }
         } catch (_) {}
       });
@@ -369,8 +389,7 @@ def test_phone_not_notified_for_turn_sent_and_watched_on_laptop(
         fired: object | None = None
         with contextlib.suppress(PlaywrightTimeoutError):
             phone.wait_for_function(
-                "(tag) => (window.__notifs || []).some("
-                "(n) => n.options && n.options.tag === tag)",
+                "(tag) => (window.__notifs || []).some((n) => n.options && n.options.tag === tag)",
                 arg=tag,
                 timeout=_IDLE_SETTLE_GRACE_MS,
             )
@@ -379,6 +398,27 @@ def test_phone_not_notified_for_turn_sent_and_watched_on_laptop(
             "phone client must not raise an OS notification for a turn the "
             "user sent and actively watched on the laptop; "
             f"phone recorded: {fired}"
+        )
+
+        # Attribute the quiet to the watched-finish signal: the phone must
+        # have observed a row where the laptop's finish-ack caught the
+        # baseline up with the server's finish stamp. Without this, a missed
+        # transition would pass as a false negative.
+        observed_ack = phone.evaluate(
+            """(sid) => (window.__readState || []).some((entry) => {
+              return (
+                entry.id === sid &&
+                typeof entry.viewer_last_seen === "number" &&
+                typeof entry.last_finished_at === "number" &&
+                entry.viewer_last_seen >= entry.last_finished_at
+              );
+            })""",
+            session_id,
+        )
+        assert observed_ack, (
+            "phone never observed viewer_last_seen >= last_finished_at for "
+            "the session; the quiet above cannot be attributed to the "
+            f"watched-finish suppression. observed: {phone.evaluate('window.__readState')}"
         )
     finally:
         # Never leave the shared runner blocked on the gate, and clear this

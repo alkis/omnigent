@@ -493,6 +493,16 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: dict[str, str] = {}
 
 
+# Epoch seconds a session's turn last reached a terminal status (a
+# ``running``/``waiting`` -> ``idle``/``failed`` edge seen by ``_publish_status``,
+# or a child's terminal edge mirrored onto its parent row). Serves
+# ``SessionListItem.last_finished_at`` so clients can tell "the viewer saw the
+# latest content" apart from "the viewer watched this turn end". In-memory on
+# the replica that observed the edge — the same best-effort consistency domain
+# as ``_read_last_seen``, which the comparison's other side lives in.
+_session_finished_at_cache: dict[str, int] = {}
+
+
 _session_active_response_cache: dict[str, str] = {}
 
 
@@ -1025,6 +1035,7 @@ __all__ = [
     "_session_active_response_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
+    "_session_finished_at_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

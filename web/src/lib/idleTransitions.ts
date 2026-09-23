@@ -49,17 +49,24 @@ export function detectIdleTransitions(
 }
 
 /**
- * True when the viewer has already seen this conversation's latest
- * activity on some device: the server-side per-viewer read baseline
- * (`viewer_last_seen`, raised by whichever client is actively viewing
- * the session and redistributed through the list/updates stream) has
- * caught up with `updated_at`. Absent read state reads as not-seen, so
- * the caller falls back to notifying.
+ * True when the viewer already watched this conversation's turn finish on
+ * some device: the per-viewer read baseline (`viewer_last_seen`) has caught
+ * up with the server's turn-finish stamp (`last_finished_at`). A device
+ * actively viewing the session raises the baseline past the stamp the
+ * moment the stamp lands (`useMarkConversationSeen`), and the server
+ * redistributes it through the list/updates stream.
+ *
+ * Deliberately NOT a comparison against `updated_at`: that only says the
+ * viewer saw the latest *content*, which also holds when they left the
+ * session mid-turn after the last message rendered — a finish they did NOT
+ * watch and must still be notified about. Either field absent reads as
+ * not-watched, so the caller falls back to notifying.
  */
-export function viewerHasSeenLatestActivity(conversation: Conversation): boolean {
+export function viewerHasSeenTurnEnd(conversation: Conversation): boolean {
   return (
     typeof conversation.viewer_last_seen === "number" &&
-    conversation.viewer_last_seen >= conversation.updated_at
+    typeof conversation.last_finished_at === "number" &&
+    conversation.viewer_last_seen >= conversation.last_finished_at
   );
 }
 
