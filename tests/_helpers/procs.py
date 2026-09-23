@@ -1,13 +1,4 @@
-"""Identity-verified process helpers for tests.
-
-Tests must never observe or signal a NON-CHILD pid through raw
-primitives: on a busy host the pid can be recycled mid-test, making a
-liveness poll watch a stranger forever and a cleanup ``os.kill`` shoot
-one. These wrappers speak the same identity vocabulary as production
-(:mod:`omnigent.inner._proc`). A test's own unreaped ``Popen`` child is
-exempt — holding the handle pins the pid — and should keep using
-``poll()``/``kill()``/``wait()``.
-"""
+"""Identity-verified process helpers for tests."""
 
 from __future__ import annotations
 
@@ -22,27 +13,14 @@ _KILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def capture_identity(pid: int) -> str:
-    """Record *pid*'s incarnation identity; fails the test if unreadable.
-
-    :param pid: A live process the test just learned about.
-    :returns: The identity string for later verified waits/kills.
-    """
+    """Record *pid*'s incarnation identity; fails the test if unreadable."""
     identity = _proc.process_start_identity(pid)
     assert identity is not None, f"could not capture identity of pid {pid}"
     return identity
 
 
 def settled(pid: int, identity: str) -> bool:
-    """Whether the recorded incarnation is DEFINITIVELY dead.
-
-    Death is proven only by identity ``"gone"`` or by the same incarnation
-    (``"match"``) being an unreaped zombie. ``"unverifiable"`` (exists but
-    unreadable — a foreign/racing process) is NOT death: it keeps waiting.
-
-    :param pid: The recorded pid.
-    :param identity: Its captured identity.
-    :returns: ``True`` only on positive proof of death.
-    """
+    """Whether the recorded incarnation is DEFINITIVELY dead."""
     state = _proc.process_identity_state(pid, identity)
     if state == "gone":
         return True
@@ -52,27 +30,12 @@ def settled(pid: int, identity: str) -> bool:
 
 
 def alive(pid: int, identity: str) -> bool:
-    """Whether the recorded incarnation is NOT yet definitively dead.
-
-    The inverse of :func:`settled`: an ``"unverifiable"`` process counts as
-    still-alive so waiters keep waiting rather than declaring a possibly
-    live process gone.
-
-    :param pid: The recorded pid.
-    :param identity: Its captured identity.
-    :returns: ``True`` until death is proven.
-    """
+    """Whether the recorded incarnation is NOT yet definitively dead."""
     return not settled(pid, identity)
 
 
 def wait_gone(pid: int, identity: str, deadline_s: float = 10.0) -> bool:
-    """Poll until the recorded incarnation is provably dead.
-
-    :param pid: The recorded pid.
-    :param identity: Its captured identity.
-    :param deadline_s: Wall-clock budget.
-    :returns: ``True`` only on proof of death within the budget.
-    """
+    """Poll until the recorded incarnation is provably dead."""
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
         if settled(pid, identity):
@@ -82,28 +45,11 @@ def wait_gone(pid: int, identity: str, deadline_s: float = 10.0) -> bool:
 
 
 def reap_adopted(pid: int) -> None:
-    """Collect *pid*'s zombie if this process adopted it as a subreaper.
-
-    A test that installs the child-subreaper flag (directly, or via an
-    earlier test in the same pytest process — the flag is process-wide and
-    irreversible) becomes the parent of every orphan its subprocess trees
-    leave behind. Nothing else will ever ``wait()`` such a zombie, and an
-    unreaped group leader keeps its pgid kernel-present forever. Scoped to
-    exactly *pid*, so no other ``Popen``'s exit status can be stolen.
-
-    :param pid: The orphaned child to reap; a no-op when it was never
-        adopted by this process (or is still running).
-    """
+    """Collect *pid*'s zombie if this process adopted it as a subreaper."""
     with contextlib.suppress(ChildProcessError, OSError):
         os.waitpid(pid, os.WNOHANG)
 
 
 def safe_kill(pid: int, identity: str) -> None:
-    """SIGKILL exactly the recorded incarnation (pidfd-pinned on Linux).
-
-    A no-op when the incarnation is already gone or the pid was recycled.
-
-    :param pid: The recorded pid.
-    :param identity: Its captured identity.
-    """
+    """SIGKILL exactly the recorded incarnation (pidfd-pinned on Linux)."""
     _proc.kill_verified(pid, identity, _KILL)

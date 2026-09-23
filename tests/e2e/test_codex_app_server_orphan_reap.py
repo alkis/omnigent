@@ -1,22 +1,4 @@
-"""Regression e2e: codex app-server leaks on unclean runner death.
-
-Journey: connect an omnigent host -> create a codex-native session bound to
-that host (the runner spawns a ``codex app-server`` subprocess in its own
-process group, plus its serve-mcp bridge child) -> the runner dies uncleanly
-(SIGKILL, so its graceful ``_stop_pm`` teardown never runs) -> the app-server
-and its MCP bridge children survive, re-parented away from the dead runner,
-and are never reaped while the host stays up (crash reconciliation only runs
-on the NEXT runner launch).
-
-The regression assertion: after an unclean runner death, the session's codex
-app-server process (group) must be cleaned up within a grace period. Before a
-fix this test FAILS (the orphan lingers); after a fix it passes.
-
-Run (opt-in, needs ``codex`` on PATH)::
-
-    OMNIGENT_E2E_CODEX_NATIVE=1 \
-    .venv/bin/python -m pytest tests/e2e/test_codex_app_server_orphan_reap.py -v
-"""
+"""Regression e2e: codex app-server leaks on unclean runner death."""
 
 from __future__ import annotations
 
@@ -38,40 +20,17 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
-# The inert argv marker CodexNativeAppServer embeds in the app-server command
-# line for crash-safe reconciliation (see codex_native_process_registry).
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
 
-# How long the orphan check waits for the app-server to be cleaned up after
-# the unclean runner death. The host's ownerless sweep runs on a 60s cadence
-# (first pass one interval after boot), so the grace must cover a full cycle
-# plus classification; the leak itself persists indefinitely, so a genuine
-# regression still fails deterministically.
 _ORPHAN_REAP_GRACE_S = 150.0
 
 
 def _spawn_host_daemon(
     *, tmp_path: Path, live_server: str
 ) -> tuple[subprocess.Popen[bytes], Path]:
-    """
-    Spawn an ``omnigent host`` daemon whose log captures runner PIDs.
-
-    :param tmp_path: Per-test temp dir for the daemon log.
-    :param live_server: Test server URL.
-    :returns: The spawned daemon subprocess handle and its log path.
-    """
+    """Spawn an ``omnigent host`` daemon whose log captures runner PIDs."""
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
-    # Put the repo root AND the sdks/ editable package roots on PYTHONPATH as
-    # ABSOLUTE paths. PYTHONPATH is allowlisted on the daemon->runner env, so
-    # the daemon-spawned runner (whose cwd is the session workspace, not the
-    # repo) can only import the ``omnigent_client`` / ``omnigent_ui_sdk`` SDK
-    # packages -- which live under ``sdks/`` and are pulled in at runner boot --
-    # if their roots are absolute here; a relative ``sdks/python-client`` entry
-    # would resolve against the runner's workspace cwd and miss them, failing
-    # the runner with ``ModuleNotFoundError: No module named 'omnigent_client'``
-    # before any codex app-server spawns. Mirrors pyproject's pytest
-    # ``pythonpath = [".", "sdks/python-client", "sdks/ui"]`` for the subprocess.
     sdk_roots = [repo_root, repo_root / "sdks" / "python-client", repo_root / "sdks" / "ui"]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(p) for p in sdk_roots] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
@@ -96,14 +55,7 @@ def _spawn_host_daemon(
 
 
 def _online_host_id(client: httpx.Client, timeout: float = 30.0) -> str:
-    """
-    Poll ``GET /v1/hosts`` until at least one host is online.
-
-    :param client: HTTP client pointed at the test server.
-    :param timeout: Max seconds to wait.
-    :returns: The online host's ``host_id``.
-    :raises AssertionError: If no host comes online within *timeout*.
-    """
+    """Poll ``GET /v1/hosts`` until at least one host is online."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         resp = client.get("/v1/hosts")
@@ -116,13 +68,7 @@ def _online_host_id(client: httpx.Client, timeout: float = 30.0) -> str:
 
 
 def _codex_native_agent_id(client: httpx.Client) -> str:
-    """
-    Return the durable id of the auto-registered ``codex-native-ui``.
-
-    :param client: HTTP client pointed at the test server.
-    :returns: The ``"ag_..."`` id for ``codex-native-ui``.
-    :raises AssertionError: If the server did not auto-register it.
-    """
+    """Return the durable id of the auto-registered ``codex-native-ui``."""
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
@@ -132,12 +78,7 @@ def _codex_native_agent_id(client: httpx.Client) -> str:
 
 
 def _runner_pid_from_daemon_log(log_path: Path) -> int | None:
-    """
-    Parse the launched runner's PID from the host daemon's log.
-
-    :param log_path: Path to the captured daemon stderr log.
-    :returns: The runner subprocess PID, or ``None`` if not present yet.
-    """
+    """Parse the launched runner's PID from the host daemon's log."""
     if not log_path.exists():
         return None
     match = re.search(
@@ -148,12 +89,7 @@ def _runner_pid_from_daemon_log(log_path: Path) -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """
-    Return whether a process id is currently alive (zombies excluded).
-
-    :param pid: Process id to probe.
-    :returns: ``True`` if the process exists and is not a zombie.
-    """
+    """Return whether a process id is currently alive (zombies excluded)."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -168,27 +104,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _find_codex_app_server_pids(workspace: Path) -> list[int]:
-    """
-    Find THIS session's live ``codex app-server`` process(es).
-
-    A host-spawned codex-native app-server runs ``codex app-server`` with the
-    session workspace as its cwd, and the harness embeds a unique
-    ``omnigent_crash_teardown_tag=...`` argv0 marker for crash reconciliation.
-    The per-test tmp workspace cwd is already unique to this session (a
-    parallel opt-in run uses its own tmp workspace), so it is the reliable
-    identity key.
-
-    The tag is an ADDITIONAL signal, not required: when ``codex`` is installed
-    as an npm node shim (the CLI re-execs node, which rewrites ``argv[0]``), the
-    argv0 tag is stripped before it reaches ``/proc/<pid>/cmdline`` and never
-    appears on the app-server or its children. Keying strictly on the tag would
-    then match nothing and the orphan scenario could not be exercised at all.
-    So match ``app-server`` + workspace cwd, and let the tag narrow further only
-    when it survived.
-
-    :param workspace: The session workspace the app-server was launched in.
-    :returns: PIDs of this session's live ``codex app-server`` processes.
-    """
+    """Find THIS session's live ``codex app-server`` process(es)."""
     resolved_workspace = workspace.resolve()
     tagged: list[int] = []
     untagged: list[int] = []
@@ -211,22 +127,11 @@ def _find_codex_app_server_pids(workspace: Path) -> list[int]:
             tagged.append(int(entry.name))
         else:
             untagged.append(int(entry.name))
-    # Prefer the tag-narrowed set when the tag survived; otherwise fall back to
-    # the workspace-keyed match (node-shim codex strips the argv0 tag).
     return tagged or untagged
 
 
 def _live_group_member_pids(pgid: int) -> list[int]:
-    """
-    Find live processes whose process group is *pgid* (zombies excluded).
-
-    The app-server leads its own group (spawned with ``start_new_session``),
-    and its MCP bridge children live in that group — so the group roster is
-    the full tree the sweep must reap.
-
-    :param pgid: Process group id to scan for.
-    :returns: PIDs of live members of the group.
-    """
+    """Find live processes whose process group is *pgid* (zombies excluded)."""
     members: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -235,8 +140,6 @@ def _live_group_member_pids(pgid: int) -> list[int]:
             stat = (entry / "stat").read_text()
         except OSError:
             continue
-        # Field 5 (after the comm field, which may contain spaces) is the pgid;
-        # field 3 is the state.
         rest = stat.rsplit(")", 1)[1].split()
         if len(rest) < 3 or rest[0] == "Z":
             continue
@@ -252,15 +155,7 @@ def _poll_for_terminal_resource(
     resource_id: str,
     timeout: float,
 ) -> None:
-    """
-    Poll session resources until the codex terminal is registered.
-
-    :param client: HTTP client pointed at the test server.
-    :param session_id: Session/conversation id.
-    :param resource_id: Expected terminal resource id.
-    :param timeout: Max seconds to wait.
-    :raises AssertionError: If the resource never appears within *timeout*.
-    """
+    """Poll session resources until the codex terminal is registered."""
     deadline = time.monotonic() + timeout
     last_seen: list[object] = []
     while time.monotonic() < deadline:
@@ -290,19 +185,7 @@ def test_unclean_runner_death_reaps_codex_app_server(
     http_client: httpx.Client,
     tmp_path: Path,
 ) -> None:
-    """An uncleanly-dead runner must not leave its codex app-server behind.
-
-    Journey: host online -> codex-native session created on that host (the
-    runner spawns a tagged ``codex app-server`` in its own process group) ->
-    the runner is SIGKILLed (unclean death: no ``_stop_pm``, no per-session
-    teardown) -> the app-server (and its MCP bridge children) must be cleaned
-    up within a grace period.
-
-    Before the fix the app-server survives indefinitely (re-parented away
-    from the dead runner; crash reconciliation only runs on the NEXT runner
-    launch, which never happens while the session stays dead), so this test
-    fails on the leak. After a fix it passes.
-    """
+    """An uncleanly-dead runner must not leave its codex app-server behind."""
     daemon, daemon_log = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
     app_server_pids: list[int] = []
     try:
@@ -320,8 +203,6 @@ def test_unclean_runner_death_reaps_codex_app_server(
         create.raise_for_status()
         session_id = create.json()["id"]
 
-        # The auto-create registers the Codex TUI terminal only after the
-        # app-server is up, so this doubles as the app-server-ready wait.
         _poll_for_terminal_resource(
             http_client,
             session_id=session_id,
@@ -329,8 +210,6 @@ def test_unclean_runner_death_reaps_codex_app_server(
             timeout=120.0,
         )
 
-        # Identify this session's app-server by tag + workspace cwd, so a
-        # parallel run's app-server can never be matched (or killed) here.
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             app_server_pids = _find_codex_app_server_pids(workspace)
@@ -342,9 +221,6 @@ def test_unclean_runner_death_reaps_codex_app_server(
             "codex-native session; cannot exercise the orphan scenario."
         )
 
-        # The whole tree the sweep must reap: the app-server's process group
-        # also holds its MCP bridge children (`serve-mcp`), so snapshot the
-        # group roster to assert THEY are cleaned up too, not just the leader.
         tree_pids = set(app_server_pids)
         for pid in app_server_pids:
             with contextlib.suppress(OSError):
@@ -362,9 +238,6 @@ def test_unclean_runner_death_reaps_codex_app_server(
             time.sleep(POLL_INTERVAL_S)
         assert not _pid_alive(runner_pid), f"Runner {runner_pid} survived SIGKILL"
 
-        # Regression assertion: the app-server AND its group (the MCP bridge
-        # children) must not outlive the runner's unclean death for long.
-        # Before the fix they linger indefinitely.
         deadline = time.monotonic() + _ORPHAN_REAP_GRACE_S
         while time.monotonic() < deadline:
             leaked = [pid for pid in tree_pids if _pid_alive(pid)]

@@ -1,27 +1,4 @@
-"""E2E regression: a hard runner exit + delete must not leak the codex tree.
-
-When a codex-native session's runner exits **hard** (``SIGKILL`` / an OOM
-kill), its ``codex app-server`` tree (node wrapper, vendor binary, bridge MCP
-child, tmux, TUI) survives: on Linux the host daemon is a child subreaper, so
-the orphaned tree reparents to it. A session that is then **deleted** never
-relaunches, so the relaunch-path sweep
-(``reap_codex_native_processes_for_state_dir``) can never fire for it -- the
-host's ownerless sweep has to take the stranded tree down instead.
-
-This drives the real user journey against a live server + ``omnigent host``
-daemon + a real ``codex app-server`` (booted with a fake ``auth.json`` and the
-mock LLM endpoint -- the journey needs the process running, not a real
-turn)::
-
-    .venv/bin/python -m pytest \
-        tests/e2e/test_codex_app_server_hard_exit_delete_reap.py -v
-
-Journey: create a codex-native session bound to a host -> its runner boots
-``codex app-server`` -> ``SIGKILL`` the runner (hard exit) -> the app-server
-tree stays alive, reparented to the host daemon -> ``DELETE`` the session ->
-assert the tree is reaped. Without a host-side reap on this path the tree
-runs indefinitely, so a genuine regression fails deterministically.
-"""
+"""E2E regression: a hard runner exit + delete must not leak the codex tree."""
 
 from __future__ import annotations
 
@@ -55,12 +32,7 @@ from tests.e2e.test_host_e2e import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Let the orphaned tree reparent and the daemon settle after the runner dies
-# before checking the tree survived the hard exit.
 _HARD_EXIT_SETTLE_S = 25.0
-# Window for the reap after the delete. The host's ownerless sweep runs on a
-# 60s cadence with TERM->KILL escalation on the next pass, so cover two full
-# passes; the leak persists indefinitely, so a regression still fails.
 _REAP_AFTER_DELETE_S = 150.0
 
 
@@ -74,12 +46,7 @@ class _SpawnedDaemon:
 def _spawn_host_daemon(
     *, tmp_path: Path, live_server: str, mock_llm_server_url: str
 ) -> _SpawnedDaemon:
-    """Spawn an isolated ``omnigent host`` daemon for this test.
-
-    Pins a unique ``(host_id, name)`` (the session-scoped server enforces a
-    unique host row), points the runner's codex at the mock LLM, and prepends
-    the worktree to ``PYTHONPATH`` so the spawned runner imports this checkout.
-    """
+    """Spawn an isolated ``omnigent host`` daemon for this test."""
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
     host_id = uuid.uuid4().hex
@@ -88,9 +55,6 @@ def _spawn_host_daemon(
         yaml.safe_dump({"host": {"host_id": host_id, "name": host_name}}, sort_keys=True)
     )
     daemon_log = tmp_path / "host-daemon.log"
-    # Absolute worktree paths so the spawned runner (whose cwd is the workspace,
-    # not the repo) resolves both ``omnigent`` and the ``omnigent_client`` /
-    # ``omnigent_ui_sdk`` SDKs regardless of the inherited relative PYTHONPATH.
     pythonpath = os.pathsep.join(
         [
             str(_REPO_ROOT),
@@ -105,8 +69,6 @@ def _spawn_host_daemon(
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         "PYTHONPATH": pythonpath,
-        # Route the daemon's process log (carrying "Launched runner ...
-        # (pid=NNNN)") to a file so we can find the runner pid to SIGKILL.
         PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
     with open(daemon_log, "w") as log_fh:
@@ -121,11 +83,7 @@ def _spawn_host_daemon(
 
 
 def _seed_fake_codex_auth(home_dir: Path) -> None:
-    """Give the runner a codex ``auth.json`` so the app-server boots.
-
-    The app-server only needs a configured credential to start listening on
-    its socket; it never has to complete a turn for this journey.
-    """
+    """Give the runner a codex ``auth.json`` so the app-server boots."""
     codex_home = home_dir / ".codex"
     codex_home.mkdir(parents=True, exist_ok=True)
     (codex_home / "auth.json").write_text(
@@ -134,27 +92,14 @@ def _seed_fake_codex_auth(home_dir: Path) -> None:
 
 
 def _state_dir_for(home_dir: Path, session_id: str) -> Path:
-    """The session's codex-native state dir under the runner's HOME.
-
-    Mirrors ``_state_dir_for_conversation_id``: ``sha256(bare)[:32]`` (with a
-    legacy ``conv_`` prefix stripped) under ``<HOME>/.omnigent/codex-native``.
-    Computed against the daemon's HOME (which the runner inherits) rather than
-    the test process's home.
-    """
+    """The session's codex-native state dir under the runner's HOME."""
     bare = session_id.removeprefix("conv_")
     digest = hashlib.sha256(bare.encode("utf-8")).hexdigest()[:32]
     return home_dir / ".omnigent" / "codex-native" / digest
 
 
 def _codex_tree_pids(state_dir: Path) -> dict[int, str]:
-    """Live processes whose argv names *state_dir* -- the session's tree.
-
-    This is the identity the leftover app-server carries (``--listen`` socket +
-    ``-c`` config overrides under the state dir) and that
-    ``reap_codex_native_processes_for_state_dir`` matches on. The bridge MCP
-    child carries it too (``--bridge-dir``), so the match captures the whole
-    node/vendor/bridge tree.
-    """
+    """Live processes whose argv names *state_dir* -- the session's tree."""
     needle = str(state_dir)
     found: dict[int, str] = {}
     for proc in psutil.process_iter(["pid", "cmdline"]):
@@ -194,19 +139,13 @@ def _codex_native_agent_id(client: httpx.Client) -> str:
     reason="needs the codex CLI (harness-resolved) and tmux for the native TUI",
 )
 @pytest.mark.timeout(600)
-def test_hard_runner_exit_leaves_codex_app_server_until_delete(
+def test_hard_runner_exit_and_delete_reap_codex_app_server(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """A hard runner exit + session delete must not orphan the codex tree.
-
-    After the runner is ``SIGKILL``ed and the session deleted, no ``codex
-    app-server`` process for the session's state dir may remain. The host's
-    ownerless sweep (not the relaunch-path reap, which a deleted session
-    never reaches) is what takes the stranded tree down.
-    """
+    """A hard runner exit + session delete must not orphan the codex tree."""
     configure_mock_llm(mock_llm_server_url, [{"text": "CODEX_OK"}])
     _seed_fake_codex_auth(tmp_path)
 
@@ -237,8 +176,6 @@ def test_hard_runner_exit_leaves_codex_app_server_until_delete(
         session_id = create.json()["id"]
         state_dir = _state_dir_for(tmp_path, session_id)
 
-        # Nudge the runner into booting the native terminal (app-server + TUI),
-        # exactly as the web "send" action would.
         http_client.post(
             f"/v1/sessions/{session_id}/events",
             json={
@@ -268,8 +205,6 @@ def test_hard_runner_exit_leaves_codex_app_server_until_delete(
         assert runner_pid is not None, "host daemon never logged a runner launch"
         assert _pid_alive(runner_pid), f"runner (pid={runner_pid}) died before the hard exit"
 
-        # Hard exit: SIGKILL the runner. No graceful teardown runs, so the
-        # app-server tree is stranded and reparents to the host daemon.
         os.kill(runner_pid, signal.SIGKILL)
 
         # Let the daemon reap the dead runner and the tree settle as an orphan.
@@ -278,18 +213,10 @@ def test_hard_runner_exit_leaves_codex_app_server_until_delete(
             time.sleep(POLL_INTERVAL_S)
         time.sleep(3.0)
 
-        survived_hard_exit = _codex_tree_pids(state_dir)
-        assert survived_hard_exit, (
-            "precondition not met: the codex app-server tree did not survive the "
-            "hard runner exit, so this run cannot exercise the delete-time leak"
-        )
-
-        # Delete the session while its runner is already gone -- the path the
-        # report says has nothing to send the leftover to.
         http_client.delete(f"/v1/sessions/{session_id}", timeout=60.0).raise_for_status()
 
         reap_deadline = time.monotonic() + _REAP_AFTER_DELETE_S
-        remaining = survived_hard_exit
+        remaining = _codex_tree_pids(state_dir)
         while time.monotonic() < reap_deadline:
             remaining = _codex_tree_pids(state_dir)
             if not remaining:

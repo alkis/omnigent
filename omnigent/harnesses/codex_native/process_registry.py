@@ -27,42 +27,19 @@ _logger = logging.getLogger(__name__)
 _REGISTRY_FILE = "process-registry.json"
 _OWNER_LOCK_DIR = "process-owners"
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
-# Grace between the reconciliation pass that SIGTERMs an ownerless process
-# group and a later pass escalating to SIGKILL. Long enough for codex to
-# flush rollout state; short enough that a TERM-ignoring child dies on the
-# next periodic sweep rather than surviving indefinitely.
+# Delay escalation long enough for Codex to flush rollout state.
 _SIGKILL_GRACE_S = 10.0
 
 
 @dataclass(frozen=True)
 class CodexNativeProcessEntry:
-    """
-    One crash-reapable native Codex subprocess registry entry.
-
-    :param pid: Child process id.
-    :param pgid: Child process group id.
-    :param tmux_session_name: Optional tmux session name owned by the child.
-    :param session_tag: Unique tag also embedded in the child command line.
-    :param owner_lock_path: Lock file held by the parent while it owns
-        the child. If the lock is still held during reconciliation, the
-        child is a live sibling and must not be reaped.
-    :param sigterm_at: Wall-clock time a reconciliation pass SIGTERMed
-        this entry's process group, or ``None`` if never signaled. A
-        later pass escalates to SIGKILL once the grace has elapsed.
-    :param members: ``(pid, start-time)`` identities of every group
-        member, snapshotted while the tagged leader was still alive (the
-        moment group ownership is provable). Escalation kills exactly
-        these identity-verified processes, so it can neither hit a
-        recycled pgid nor lose a child that outlives its leader.
-    :param leader_identity: The leader's own start identity, recorded at
-        registration so a subreaper host can attribute the leader's
-        adopted zombie (whose argv is gone) back to this entry.
-    """
+    """One crash-reapable native Codex subprocess registry entry."""
 
     pid: int
     pgid: int
     tmux_session_name: str | None
     session_tag: str
+    process_start_identity: str | None = None
     owner_lock_path: str | None = None
     sigterm_at: float | None = None
     members: tuple[tuple[int, str], ...] | None = None
@@ -176,6 +153,7 @@ def register_codex_native_process(
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        process_start_identity=_process_start_identity(pid),
         owner_lock_path=str(owner_lock_path) if owner_lock_path is not None else None,
         leader_identity=_proc.process_start_identity(pid),
     )
@@ -209,35 +187,7 @@ def unregister_codex_native_process(
 
 
 def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> int:
-    """
-    Reap crash-leftover native Codex children recorded by prior runs.
-
-    An entry is reapable only when its launcher's owner lock is no longer
-    held (the kernel releases the flock on any launcher death) and the
-    live process still matches the leader start identity recorded at
-    registration (guards against PID reuse; legacy entries without an
-    identity fall back to the command-line session tag). A reapable
-    process group is
-    SIGTERMed first and its entry kept; a later pass escalates to SIGKILL
-    once :data:`_SIGKILL_GRACE_S` has elapsed, so a child that ignores or
-    wedges on SIGTERM cannot outlive reconciliation.
-
-    Member identities (pid plus start time) are snapshotted while the
-    tagged leader is alive — the moment group ownership is provable — and
-    **persisted before the SIGTERM is delivered** (write-ahead), so a
-    crash mid-reap can never strand survivors without a record; a failed
-    registry write defers the signal to a later pass. Escalation SIGKILLs
-    exactly the identity-verified recorded members. On subreaper hosts
-    this path is the fallback tier — the host's adopted-orphan reaper
-    owns whole-tree draining the moment the runner dies. Without a
-    subreaper (e.g. macOS) a child forked AFTER the member snapshot has
-    no provable owner once the recorded members exit, so it is retained
-    and logged rather than guessed at — killing an unverifiable pgid
-    could hit a recycled group's strangers.
-
-    :param registry_path: Test override for the registry file path.
-    :returns: Number of process groups signaled this pass.
-    """
+    """Reap crash-leftover native Codex children recorded by prior runs."""
     path = registry_path or codex_native_process_registry_path()
     signaled = 0
     with _registry_lock(path):
@@ -247,6 +197,19 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
         for entry in _read_registry(path):
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
+                continue
+            if entry.leader_identity is None and entry.process_start_identity is not None:
+                matches_entry = _process_matches_entry(entry)
+                if matches_entry is None:
+                    survivors.append(entry)
+                    continue
+                if not matches_entry:
+                    continue
+                if not _terminate_process_group(entry):
+                    survivors.append(entry)
+                    continue
+                _reap_tmux_session(entry.tmux_session_name)
+                signaled += 1
                 continue
             if entry.sigterm_at is not None:
                 if now - entry.sigterm_at < _SIGKILL_GRACE_S:
@@ -264,23 +227,16 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 continue
             leader = _entry_leader_state(entry)
             if leader == "unverifiable":
-                # Something occupies the pid but its identity cannot be
-                # read — never a safe signal target, but possibly still
-                # ours: keep the entry and re-verify on a later pass.
+                # Retain a possibly matching process whose identity is temporarily unreadable.
                 survivors.append(entry)
                 continue
             if leader == "gone":
-                # Never signaled and the recorded leader incarnation is
-                # gone (or its pid was reused): without the leader there
-                # is no safe way to verify group ownership, so drop the
-                # entry and sweep any leftover tmux session.
+                # Drop an unsignaled entry once its leader identity is gone.
                 _reap_tmux_session(entry.tmux_session_name)
                 continue
             members = _group_member_identities(entry.pgid)
             if members is None:
-                # Without a member snapshot, escalation could not verify
-                # survivors once the leader exits — don't signal anything
-                # yet; retry with the leader (and its lock gate) intact.
+                # Defer signaling until escalation targets can be recorded.
                 _logger.warning(
                     "cannot snapshot members of codex-native group %d; "
                     "deferring its reap to a later pass",
@@ -291,16 +247,11 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
             entry = replace(entry, sigterm_at=now, members=members)
             survivors.append(entry)
             pending_terms.append(entry)
-        # Write-ahead: the recorded members must be durable before the
-        # first signal. A failed write defers every pending SIGTERM — the
-        # entries on disk are unchanged, so a later pass simply retries.
+        # Persist member identities before delivering the first signal.
         if not _write_registry(path, survivors):
             return signaled
         for entry in pending_terms:
-            # Per-member verified delivery: an unpinned numeric pgid could
-            # have been recycled during persistence, and killpg targets
-            # whoever occupies it now — this tier never signals a name it
-            # has not re-verified.
+            # Recheck each member identity after persisting the snapshot.
             delivered = [
                 pid
                 for pid, start in entry.members or ()
@@ -322,29 +273,10 @@ _EscalationOutcome = Literal["killed", "retry", "gone", "unverifiable"]
 def _escalate_sigkill(
     entry: CodexNativeProcessEntry,
 ) -> tuple[_EscalationOutcome, CodexNativeProcessEntry]:
-    """
-    SIGKILL the identity-verified recorded members of a SIGTERMed entry.
-
-    Fallback-tier escalation: strictly per-pid, gated on each recorded
-    member's kernel start identity (see
-    :func:`omnigent.inner._proc.kill_verified`) — never a group signal, so
-    no pgid-continuity assumption is needed. A member that exists but
-    cannot be identified retains the entry; the entry is dropped only when
-    every recorded member is verifiably gone. On subreaper hosts the
-    adopted-orphan reaper drains whole trees; this path covers everything
-    it cannot adopt (macOS, orphans predating a host restart).
-
-    :param entry: The SIGTERMed registry entry past its grace.
-    :returns: ``(outcome, entry)`` — ``"killed"`` (SIGKILL delivered),
-        ``"retry"`` (keep and retry), ``"gone"`` (every member verifiably
-        absent), or ``"unverifiable"`` (legacy entry with no safe target)
-        — the last two mean the entry can be dropped.
-    """
+    """SIGKILL the identity-verified recorded members of a SIGTERMed entry."""
     kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     if entry.members is None:
-        # Legacy entry written before member snapshots existed: only the
-        # tag-verified leader pid itself is a safe target (a numeric pgid
-        # could be recycled; killpg would hit its current occupants).
+        # Legacy entries can safely target only their tag-verified leader.
         if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
             try:
                 os.kill(entry.pid, kill_sig)
@@ -381,12 +313,7 @@ def _escalate_sigkill(
         # ours; keep the entry rather than declaring the group gone.
         return "retry", entry
     if _proc.group_kernel_present(entry.pgid) is not False:
-        # This tier signals only recorded members, so no userspace scan
-        # can prove the group empty against a fork relay. The kernel group
-        # check (killpg ESRCH) is the only sound basis for dropping the
-        # entry; until then retain and log. A recorded member's zombie
-        # keeps the group present until a foreign reaper collects it; a
-        # subreaper host drains live survivors through its adopted reaper.
+        # Keep evidence until the kernel reports the recorded group absent.
         _logger.warning(
             "codex-native group %d has unverifiable occupant(s) after all "
             "recorded members exited; retaining its entry",
@@ -397,18 +324,7 @@ def _escalate_sigkill(
 
 
 def ownerless_entry_matches_leader(pid: int, identity: str | None) -> bool:
-    """
-    Whether an adopted zombie leader corresponds to an ownerless entry.
-
-    Used by the subreaper host to attribute a dead leader (whose argv is
-    gone) back to a codex-native session whose launcher no longer holds
-    its owner lock. Identity must match the value recorded at
-    registration — a recycled pid never does.
-
-    :param pid: The adopted zombie leader's pid.
-    :param identity: Its start identity, or ``None`` when unreadable.
-    :returns: ``True`` when an ownerless entry recorded this leader.
-    """
+    """Whether an adopted zombie leader corresponds to an ownerless entry."""
     if identity is None:
         return False
     try:
@@ -416,7 +332,10 @@ def ownerless_entry_matches_leader(pid: int, identity: str | None) -> bool:
     except Exception:  # noqa: BLE001 — attribution is best-effort
         return False
     for entry in entries:
-        if entry.pid != pid or entry.leader_identity != identity:
+        if entry.pid != pid or identity not in (
+            entry.leader_identity,
+            entry.process_start_identity,
+        ):
             continue
         return not _owner_lock_held(entry.owner_lock_path)
     return False
@@ -487,7 +406,12 @@ def _read_registry(path: Path) -> list[CodexNativeProcessEntry]:
 def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> bool:
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        payload = [asdict(entry) for entry in entries]
+        payload = []
+        for entry in entries:
+            item = asdict(entry)
+            if entry.process_start_identity is None:
+                item.pop("process_start_identity")
+            payload.append(item)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
         os.replace(tmp, path)
@@ -503,6 +427,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     pid = item.get("pid")
     pgid = item.get("pgid")
     session_tag = item.get("session_tag")
+    process_start_identity = item.get("process_start_identity")
     tmux_session_name = item.get("tmux_session_name")
     owner_lock_path = item.get("owner_lock_path")
     sigterm_at = item.get("sigterm_at")
@@ -516,6 +441,8 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         return None
     if not isinstance(session_tag, str) or not session_tag:
         return None
+    if process_start_identity is not None and not isinstance(process_start_identity, str):
+        process_start_identity = None
     if tmux_session_name is not None and not isinstance(tmux_session_name, str):
         tmux_session_name = None
     if owner_lock_path is not None and not isinstance(owner_lock_path, str):
@@ -527,6 +454,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        process_start_identity=process_start_identity,
         owner_lock_path=owner_lock_path,
         sigterm_at=float(sigterm_at) if sigterm_at is not None else None,
         members=members,
@@ -589,24 +517,50 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _entry_leader_state(entry: CodexNativeProcessEntry) -> str:
-    """
-    Classify an entry's recorded leader: ``match``/``gone``/``unverifiable``.
-
-    The start identity recorded at registration is the primary ownership
-    proof: it survives argv rewrites (an npm node-shim ``codex`` re-execs
-    and strips the inert session-tag marker before it ever reaches
-    ``/proc/<pid>/cmdline``) and a recycled pid can never reproduce it.
-    The cmdline tag remains the fallback for legacy entries written
-    before identities were recorded.
-
-    :param entry: The registry entry to classify.
-    :returns: A :func:`omnigent.inner._proc.process_identity_state` verdict.
-    """
+    """Classify an entry's recorded leader: ``match``/``gone``/``unverifiable``."""
     if entry.leader_identity is not None:
         return _member_identity_state(entry.pid, entry.leader_identity)
     if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
         return "match"
     return "gone"
+
+
+def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
+    if entry.process_start_identity is not None:
+        current_identity = _process_start_identity(entry.pid)
+        if current_identity is None:
+            return None if _pid_alive(entry.pid) else False
+        return current_identity == entry.process_start_identity
+    if not _pid_alive(entry.pid):
+        return False
+    cmdline = _process_cmdline(entry.pid)
+    if not cmdline:
+        return None
+    return codex_native_session_tag_cmdline_arg(entry.session_tag) in cmdline
+
+
+def _process_start_identity(pid: int) -> str | None:
+    proc_stat = Path("/proc") / str(pid) / "stat"
+    with contextlib.suppress(OSError, IndexError):
+        raw = proc_stat.read_text(encoding="utf-8")
+        fields_after_name = raw.rsplit(")", 1)[1].split()
+        start_ticks = fields_after_name[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        if boot_id:
+            return f"linux:{boot_id}:{start_ticks}"
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-ww", "-o", "lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    started_at = proc.stdout.strip()
+    return f"ps:{started_at}" if proc.returncode == 0 and started_at else None
 
 
 def _process_cmdline_has_tag(pid: int, session_tag: str) -> bool:
@@ -627,7 +581,8 @@ def _process_cmdline(pid: int) -> str:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2.0,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -636,17 +591,7 @@ def _process_cmdline(pid: int) -> str:
 
 
 def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
-    """
-    Snapshot ``(pid, identity)`` for every member of *pgid*.
-
-    Must be taken while group ownership is provable (live tagged leader).
-    Identities are kernel start times (see
-    :func:`omnigent.inner._proc.process_start_identity`), which a recycled
-    pid can never reproduce.
-
-    :param pgid: Process group to enumerate.
-    :returns: Member identities, or ``None`` when they could not be read.
-    """
+    """Snapshot ``(pid, identity)`` for every member of *pgid*."""
     members = _proc.group_member_identities(pgid)
     if not members:
         return None
@@ -654,38 +599,42 @@ def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
 
 
 def _member_identity_state(pid: int, identity: str) -> str:
-    """
-    Classify a recorded member against its live incarnation.
-
-    :param pid: Recorded group member.
-    :param identity: Its snapshotted identity.
-    :returns: ``"match"``, ``"gone"``, or ``"unverifiable"`` — see
-        :func:`omnigent.inner._proc.process_identity_state`.
-    """
+    """Classify a recorded member against its live incarnation."""
     return _proc.process_identity_state(pid, identity)
 
 
 def _signal_member_verified(pid: int, identity: str, sig: signal.Signals) -> bool:
-    """
-    Deliver *sig* to *pid* only if it is still the recorded incarnation.
-
-    :param pid: Recorded group member.
-    :param identity: Its snapshotted identity.
-    :param sig: The signal to deliver.
-    :returns: ``True`` if the signal reached the verified target.
-    """
+    """Deliver *sig* to *pid* only if it is still the recorded incarnation."""
     return _proc.kill_verified(pid, identity, sig)
 
 
 def _kill_member_verified(pid: int, identity: str) -> bool:
-    """
-    SIGKILL *pid* only if it is still the recorded incarnation.
-
-    :param pid: Recorded group member.
-    :param identity: Its snapshotted identity.
-    :returns: ``True`` if the kill was delivered to the verified target.
-    """
+    """SIGKILL *pid* only if it is still the recorded incarnation."""
     return _signal_member_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def _terminate_process_group(entry: CodexNativeProcessEntry) -> bool:
+    if not _process_group_matches_entry(entry):
+        return False
+    try:
+        os.killpg(entry.pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return True
+
+
+def _process_group_matches_entry(entry: CodexNativeProcessEntry) -> bool:
+    if os.name != "posix" or entry.pgid <= 1:
+        return False
+    try:
+        current_pgid = os.getpgid(entry.pid)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return False
+    return current_pgid == entry.pgid and current_pgid != os.getpgrp()
 
 
 def _reap_tmux_session(tmux_session_name: str | None) -> None:
@@ -749,11 +698,14 @@ def reap_codex_native_processes_for_state_dir(
         return 0
     needle = str(state_dir)
     try:
+        # macOS ps passes raw argv bytes through, so decode leniently: one
+        # foreign process with non-UTF-8 argv must not crash the reaper.
         listing = subprocess.run(
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             check=False,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5.0,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):

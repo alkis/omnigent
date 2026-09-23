@@ -1,11 +1,4 @@
-"""Tests for the background daemon entrypoint's host-process handoff.
-
-The foreground CLI path has its own forwarding tests; these cover the
-auto-launched daemon (``omnigent.host._daemon_entry``): ``--local`` must
-hand the health-verified local-server pid to ``run_host_process`` (the
-adopted-orphan exclusion binds to exactly that incarnation), and
-``--server`` must hand ``None`` (a remote host owns no local server).
-"""
+"""Tests for the background daemon entrypoint's host-process handoff."""
 
 from __future__ import annotations
 
@@ -18,12 +11,7 @@ from omnigent.host.local_server import LocalServerStartup
 
 
 def _run_main(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[tuple[str, int | None]]:
-    """Run ``_daemon_entry.main`` with stubs, capturing the handoff.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param argv: Daemon argv after the program name.
-    :returns: Captured ``(server_url, local_server_pid)`` calls.
-    """
+    """Run ``_daemon_entry.main`` with stubs, capturing the handoff."""
     calls: list[tuple[str, int | None]] = []
     monkeypatch.setattr(sys, "argv", ["_daemon_entry", *argv])
     monkeypatch.setattr(
