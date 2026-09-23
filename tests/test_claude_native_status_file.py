@@ -462,13 +462,7 @@ def test_parked_session_stays_running_indefinitely(tmp_path: Path) -> None:
 
 
 def test_poller_reports_idle_tracks_the_file_verdict(tmp_path: Path) -> None:
-    """``reports_idle`` mirrors the file: idle only when Claude says idle.
-
-    The watcher keys its tmux-poll backoff off this while the file owns the
-    session's status, so it must be False before the first read, while a
-    turn runs or a dialog parks the session, and after an unrecognized
-    status blinds the poller — and True only on a readable ``idle``.
-    """
+    """``reports_idle`` mirrors the file: idle only when Claude says idle."""
     sessions = tmp_path / "sessions"
     _write_session_file(sessions, pid=1, session_id="s", status="busy")
     poller = SessionStatusPoller(

@@ -156,15 +156,7 @@ class _CapturingResourceRegistry:
         self,
         publisher: Callable[[str, str, str | None], None],
     ) -> None:
-        """
-        Accept the session-status publisher installed by the runner app.
-
-        The stub never launches a real terminal, so it just retains the
-        callback (unused) to satisfy ``create_runner_app``'s wiring.
-
-        :param publisher: Callable ``(session_id, status, blocked_on) -> None``.
-        :returns: None.
-        """
+        """Accept the session-status publisher installed by the runner app."""
         self._session_status_publisher = publisher
 
     def set_terminal_exit_publisher(
@@ -1549,27 +1541,7 @@ class _StatusEdge:
 
 @dataclass
 class _WatcherCapture:
-    """Records the callbacks the registry wires onto a terminal's watcher.
-
-    Stands in for the real daemon thread so the test can invoke the
-    activity/idle edges synchronously instead of polling tmux.
-
-    :param started: Whether ``start_idle_watcher_thread`` was called.
-    :param on_activity: The activity-edge callback the registry passed,
-        or ``None`` if none was wired.
-    :param on_idle: The idle-edge callback the registry passed, or
-        ``None`` if none was wired.
-    :param on_exit: The exit callback the registry passed, or ``None`` if none
-        was wired.
-    :param on_tick: The per-tick callback the registry passed (drives the
-        claude-native status-file poller), or ``None`` if none was wired.
-    :param idle_poll_backoff_allowed: Dynamic backoff policy passed to the
-        watcher, or ``None`` when no caller policy was wired.
-    :param idle_threshold_s: The per-watcher idle threshold the registry
-        passed, or ``None`` for the module default.
-    :param poll_interval_s: The per-watcher poll interval the registry
-        passed, or ``None`` for the module default.
-    """
+    """Records the callbacks the registry wires onto a terminal's watcher."""
 
     started: bool = False
     on_activity: Callable[[], None] | None = None
@@ -1977,6 +1949,11 @@ async def test_concurrent_resource_reads_share_one_session_snapshot(
         """
         nonlocal snapshot_count
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             snapshot_count += 1
             snapshot_started.set()
             await release.wait()

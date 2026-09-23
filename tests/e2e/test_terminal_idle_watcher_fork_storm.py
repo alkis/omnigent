@@ -1,32 +1,4 @@
-"""End-to-end guard: idle terminals must not spawn tmux subprocesses continuously.
-
-Native/tool-terminal idle-activity detection runs one watcher thread per
-live terminal (``TerminalInstance._idle_watch_loop_threaded``). On the bug,
-every poll tick performs TWO blocking ``subprocess.run`` fork+execs of tmux
-— ``capture-pane`` (pane diff) plus ``list-panes`` (pane-dead probe) — at a
-fixed cadence with no idle backoff and no teardown, so a runner with N live
-terminals sustains ``2N`` tmux fork+execs per second **while completely
-idle**. Under sub-agent fan-out (tens of terminals) this dominates runner
-system time; ``fork()`` cost scales with the runner's RSS and thread count.
-
-This drives the real user journey: connect a real host daemon, launch a
-real runner on it, have the agent (mock LLM) launch three terminals via
-``sys_terminal_launch``, let the turn complete so everything is idle, and
-count how many tmux subprocesses the runner spawns during a fully-idle
-window. The count is observed via a transparent ``tmux`` shim prepended to
-the daemon's PATH (inherited by the runner): the shim appends a timestamped
-argv line to a log, then ``exec``s the real tmux, so behavior is unchanged
-while every spawn is recorded::
-
-    .venv/bin/python -m pytest tests/e2e/test_terminal_idle_watcher_fork_storm.py -v
-
-Measured on the bug (pre-backoff main): 3 idle terminals sustain ~2.0
-watcher-tick tmux spawns per second per terminal (~72 in the 12s window).
-The threshold allows up to 0.6/s/terminal so an adaptive-backoff or
-pipe-pane/control-mode fix passes with margin while both the fixed-rate
-two-calls-per-tick bug (~2.0/s) and a folded-but-unbacked-off poller
-(~1.0/s) fail specifically.
-"""
+"""End-to-end guard: idle terminals must not spawn tmux subprocesses continuously."""
 
 from __future__ import annotations
 
@@ -66,29 +38,17 @@ pytestmark = [
     ),
 ]
 
-# Number of terminals the agent launches. The spawn stream is per-terminal
-# (one watcher thread each), so a few terminals make the fixed-rate polling
-# unambiguous against scheduler noise without needing real fan-out scale.
+# Three watchers separate fixed polling from scheduler noise.
 _N_TERMINALS = 3
 
 # Fully-idle window sampled after the turn completes. Long enough to cover
 # ~12 watcher wakeups of the 1s poll cadence per terminal.
 _IDLE_WINDOW_S = 12.0
 
-# Post-turn settle before sampling starts. Longer than the watcher's 10s
-# idle threshold so the idle edge has fired for every terminal before the
-# window opens — the window then samples pure steady-state cadence, not the
-# pre-edge base-rate ramp. Also ages launch-time tmux calls (new-session,
-# set-option, initial reads) out of the window.
+# Settle past the idle threshold and exclude launch-time tmux calls.
 _POST_TURN_SETTLE_S = 12.0
 
-# Max watcher-probe tmux spawns per second per idle terminal. The bug
-# sustains 2.0 (capture-pane + list-panes every 1s tick, no backoff); merely
-# folding the two calls into one still measures ~1.0. A quiescence-aware
-# implementation (post-idle backoff, pipe-pane, or control mode) measures
-# well under 0.6 once the idle edge has fired, so this threshold rejects a
-# fixed-rate poller even with the probe folded. Counts only
-# capture-pane/list-panes argv lines, so unrelated tmux use cannot inflate it.
+# Reject both two-probe (~2/s) and folded fixed-rate (~1/s) watchers.
 _MAX_PROBE_SPAWNS_PER_S_PER_TERMINAL = 0.6
 
 # Worktree root (tests/e2e/<file> → parents[2]); forwarded to the runner so
@@ -97,14 +57,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _worktree_pythonpath() -> str:
-    """PYTHONPATH for the host daemon (and thus its runners).
-
-    Prepends the worktree root and absolutizes any existing entries —
-    a relative entry (e.g. ``sdks/ui``) resolves against the *runner's*
-    cwd (the session workspace), not the repo, and would silently drop.
-
-    :returns: An ``os.pathsep``-joined PYTHONPATH string.
-    """
+    """PYTHONPATH for the host daemon (and thus its runners)."""
     entries = [str(_REPO_ROOT)]
     for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
         if entry:
@@ -113,15 +66,7 @@ def _worktree_pythonpath() -> str:
 
 
 def _write_tmux_shim(shim_dir: Path, log_path: Path) -> None:
-    """Write a transparent ``tmux`` shim that logs every spawn.
-
-    The shim appends ``<epoch-seconds> <argv>`` to *log_path* and execs the
-    real tmux binary, so tmux behavior is byte-identical while every
-    fork+exec the runner performs becomes a countable log line.
-
-    :param shim_dir: Directory to place the shim in (prepended to PATH).
-    :param log_path: File the shim appends spawn records to.
-    """
+    """Write a transparent ``tmux`` shim that logs every spawn."""
     real_tmux = shutil.which("tmux")
     assert real_tmux is not None  # guarded by pytestmark
     shim = shim_dir / "tmux"
@@ -134,18 +79,7 @@ def _write_tmux_shim(shim_dir: Path, log_path: Path) -> None:
 
 
 def _probe_spawns_in_window(log_path: Path, start: float, end: float) -> list[str]:
-    """Return watcher-probe tmux spawn records inside ``[start, end]``.
-
-    Only ``capture-pane`` / ``list-panes`` invocations count — those are the
-    idle watcher's per-tick probes. Launch/teardown commands (new-session,
-    set-option, kill-server, ...) are excluded so the assertion isolates the
-    steady-state polling cost.
-
-    :param log_path: The shim's spawn log.
-    :param start: Window start (epoch seconds).
-    :param end: Window end (epoch seconds).
-    :returns: The matching raw log lines.
-    """
+    """Return watcher-probe tmux spawn records inside ``[start, end]``."""
     if not log_path.exists():
         return []
     matches: list[str] = []
@@ -168,21 +102,11 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """A runner whose terminals are all idle must not sustain tmux fork+execs.
-
-    Connect a host daemon whose PATH resolves tmux through a counting shim,
-    launch a runner on it, drive one turn in which the agent launches
-    ``_N_TERMINALS`` bash terminals, wait for the turn to complete, then
-    count tmux watcher-probe spawns over a fully-idle window. On the bug the
-    idle watchers spawn ~2 tmux subprocesses per second per terminal
-    indefinitely; the assertion fails on that fixed-rate storm.
-    """
+    """A runner whose terminals are all idle must not sustain tmux fork+execs."""
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
     spawn_log = tmp_path / "tmux_spawns.log"
     _write_tmux_shim(shim_dir, spawn_log)
-
-    # ── Host daemon with the shim on PATH (runner inherits PATH) ──
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True)
     host_id = uuid.uuid4().hex
@@ -195,21 +119,14 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
     )
     daemon_log = tmp_path / "host-daemon.log"
     daemon_base_env = os.environ.copy()
-    # The watcher's backoff kill switch must not leak in from the operator's
-    # shell or CI — an ambient =0 would pin every watcher at base rate and
-    # flip this test's verdict for reasons unrelated to the tree under test.
+    # Ignore an operator's local kill switch when measuring this revision.
     daemon_base_env.pop("OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF", None)
     env = apply_runner_env(
         {
             **daemon_base_env,
             "HOME": str(tmp_path),
             "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
-            # The daemon forwards PYTHONPATH to host-spawned runners (it is
-            # allowlisted in _RUNNER_ENV_ALLOWLIST), and those runners start
-            # with ``python -P`` from the workspace cwd — so the worktree
-            # must be on PYTHONPATH for the runner to import this checkout
-            # (mirroring the live_server fixture's server env). Existing
-            # entries are absolutized because the runner's cwd differs.
+            # The daemon forwards this checkout to runners launched from session cwd.
             "PYTHONPATH": _worktree_pythonpath(),
             PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
         }
@@ -224,8 +141,6 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
         )
     try:
         _wait_for_host_online(http_client, host_id, timeout=60.0)
-
-        # ── Agent with a plain bash terminal, wired to the mock LLM ──
         model = f"mock-fork-storm-{uuid.uuid4().hex[:6]}"
         reset_mock_llm(mock_llm_server_url)
         agent_name = register_inline_agent(
@@ -249,8 +164,6 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
                 "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
             },
         )
-
-        # ── Session bound to a runner launched ON the host ──
         agent_id = lookup_agent_id(http_client, agent_name)
         resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
         resp.raise_for_status()
@@ -280,8 +193,6 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
             f"/v1/sessions/{session_id}",
             json={"runner_id": runner_id},
         ).raise_for_status()
-
-        # ── One turn: the agent launches N terminals, then replies ──
         launch_steps = [
             {
                 "tool_calls": [
@@ -323,8 +234,6 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
             f"saw {len(launches)}. The runner did not launch its terminals via the "
             f"shimmed PATH; spawn log:\n{spawn_log.read_text()[-2000:]}"
         )
-
-        # ── Fully-idle window: nothing runs, terminals just sit there ──
         time.sleep(_POST_TURN_SETTLE_S)
         window_start = time.time()
         time.sleep(_IDLE_WINDOW_S)

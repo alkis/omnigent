@@ -84,15 +84,7 @@ class _StubResourceRegistry:
         self,
         publisher: Callable[[str, str, str | None], None],
     ) -> None:
-        """
-        Accept the session-status publisher installed by the runner app.
-
-        The stub never launches a real terminal, so it just retains the
-        callback (unused) to satisfy ``create_runner_app``'s wiring.
-
-        :param publisher: Callable ``(session_id, status, blocked_on) -> None``.
-        :returns: None.
-        """
+        """Accept the session-status publisher installed by the runner app."""
         self._session_status_publisher = publisher
 
     def set_terminal_exit_publisher(
@@ -482,7 +474,9 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
         closure so the test can assert on what was sent to the Omnigent server.
         """
 
-        async def get(self, url: str, *, timeout: float = 10.0) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float = 10.0, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             """Return a session snapshot with no labels so bridge_id falls back to session_id.
 
             :param url: Request URL (unused beyond the response).
