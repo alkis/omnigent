@@ -1,26 +1,9 @@
-"""E2E: a Task sub-agent routed to a different model must appear in the
-session cost panel's per-model breakdown.
+"""A Task sub-agent using another model appears in the session cost breakdown.
 
-The journey: a claude-native (Claude Code) orchestrator session runs on one
-model (sonnet). Its turn fans out a Task/Agent sub-agent pinned to a DIFFERENT
-model (opus). Claude Code's own cumulative cost (the statusLine
-``total_cost_usd``, "S") includes the sub-agent's spend once it returns, and
-the native forwarder posts that S tagged with the statusLine's ACTIVE model —
-the orchestrator's. The server's ``_persist_native_cumulative_usage`` then
-attributes the whole delta (sub-agent spend included) to that one model
-bucket, so the cost panel's per-model breakdown shows 100% on the
-orchestrator's model and no entry for the model the sub-agent actually ran on.
-
-This test drives the real user path: a live ``claude`` CLI in the session
-terminal against the mock LLM, a scripted fan-out turn whose API response is a
-real Task/Agent ``tool_use`` with ``model: "opus"``, and the SPA's agent-info
-popover as the surface the user reads the per-model breakdown on. The final
-assertion — an opus row in the panel's Token-usage breakdown — is the one this
-bug breaks.
-
-Runs only in mock-LLM mode (``LLM_API_KEY`` unset): the fan-out turn must be
-scripted for the journey to be deterministic.
-"""
+Drive a real Claude CLI against a mock model with a scripted Task/Agent
+call selecting opus, then inspect the SPA usage panel. The parent uses
+sonnet; its flat statusLine total must not hide the child model allocation.
+Requires mock mode (LLM_API_KEY unset)."""
 
 from __future__ import annotations
 
@@ -84,18 +67,9 @@ def _session_snapshot(base_url: str, session_id: str) -> dict:
 def _wait_for_priced_cost(
     base_url: str, session_id: str, *, above: float, timeout_s: float
 ) -> dict:
-    """Poll the snapshot until ``total_cost_usd`` exceeds *above*.
+    """Poll until the asynchronously forwarded total_cost_usd exceeds above.
 
-    The claude-native forwarder posts Claude Code's cumulative statusLine cost
-    (S) asynchronously, so the turn settling in the chat surface does not mean
-    the priced cost has landed yet.
-
-    :param base_url: Spawned server base URL.
-    :param session_id: Parent session id.
-    :param above: Strictly-below threshold the priced cost must pass.
-    :param timeout_s: Poll budget in seconds.
-    :returns: The first snapshot whose priced cost exceeds *above*.
-    """
+    A settled chat turn does not guarantee the cost snapshot has arrived."""
     deadline = time.monotonic() + timeout_s
     last: dict = {}
     while time.monotonic() < deadline:
@@ -137,17 +111,10 @@ def _spawn_tool_name(mock_llm_server_url: str) -> str:
 
 
 def _models_asked_with_user_marker(mock_llm_server_url: str, marker: str) -> list[str]:
-    """Models of captured LLM requests whose USER-role content carries *marker*.
+    """Return captured request models whose user message carries the marker.
 
-    Scoped to user-role messages so the parent's follow-up request (whose
-    assistant-role ``tool_use`` block also embeds the sub-agent prompt) does
-    not count — only the sub-agent's own request has the marker as its user
-    message.
-
-    :param mock_llm_server_url: Mock LLM server base URL.
-    :param marker: Unique substring planted in the Task prompt.
-    :returns: The ``model`` field of each matching request, in arrival order.
-    """
+    Ignore assistant tool-use blocks, which repeat the child prompt in the
+    parent history and would otherwise count the parent as a child request."""
     resp = httpx.get(f"{mock_llm_server_url}/mock/requests", timeout=10.0)
     resp.raise_for_status()
     models: list[str] = []
@@ -175,16 +142,9 @@ def test_task_subagent_on_other_model_appears_in_cost_breakdown(
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """A Task sub-agent on opus must surface as its own per-model cost bucket.
+    """A real Claude Task call selecting opus must add an opus row in the cost panel.
 
-    Journey: baseline turn on the launch model (sonnet) → fan-out turn whose
-    scripted response spawns a Task/Agent sub-agent with ``model: "opus"`` →
-    the sub-agent runs on a real opus model against the mock → the turn
-    settles and Claude's cumulative cost (sub-agent spend included) reaches
-    the server → the user opens the agent-info popover's Token-usage
-    breakdown. The buggy build shows ONLY the sonnet bucket: the opus
-    sub-agent's spend was folded into it, so no opus row ever appears.
-    """
+    Both parent and child model responses come from the mock provider."""
     if os.environ.get("LLM_API_KEY"):
         pytest.skip("deterministic scripted fan-out needs the mock LLM (unset LLM_API_KEY)")
 
