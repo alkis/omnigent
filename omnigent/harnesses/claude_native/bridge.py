@@ -5385,11 +5385,13 @@ def _restore_occupied_input(
         for it again; ``None`` when the box was handed back free (or the
         capture was torn, or a surface outlived its dismissal).
     """
-    # The surface budget starts when a surface is first seen, not at entry:
-    # time spent waiting out a draft must not use it up, or a surface that
-    # opens afterwards would be typed into without one Escape attempt.
+    # Each budget starts when its subject is first seen, not at entry: time
+    # spent dismissing a surface must not shorten the draft wait, and time
+    # spent waiting out a draft must not leave a surface that opens afterwards
+    # without one Escape attempt. Torn frames are bounded from entry.
     deadline: float | None = None
-    draft_deadline = time.monotonic() + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
+    draft_deadline: float | None = None
+    torn_deadline = time.monotonic() + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
     free_polls = 0
@@ -5413,13 +5415,15 @@ def _restore_occupied_input(
                 # A torn capture says nothing. Before any decisive frame it is
                 # handed back as before; mid-wait it is neither a free box nor a
                 # draft, so it counts for nothing and the wait goes on (bounded).
-                if not saw_composer or now >= draft_deadline:
+                if not saw_composer or now >= torn_deadline:
                     return None
                 time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
                 continue
             saw_composer = True
             if _composer_holds_draft(pane):
                 free_polls = 0
+                if draft_deadline is None:
+                    draft_deadline = now + _FOREIGN_DRAFT_WAIT_TIMEOUT_S
                 if now >= draft_deadline:
                     _logger.warning(
                         "claude-native: input box still holds another draft after "

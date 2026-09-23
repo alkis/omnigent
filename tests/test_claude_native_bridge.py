@@ -9675,11 +9675,12 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
     sends = _fake_tmux(
         monkeypatch,
-        # Idle through the reclaim's settle window, then the typed command
+        # Idle through the reclaim's settle window and the pending-prompt
+        # check, then the typed command
         # renders, the submit pops the dialog, the accept clears it —
         # one capture per delivery stage.
         [
-            *[_IDLE_PANE] * claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS,
+            *[_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1),
             _composer_pane("/model databricks-claude-sonnet-5"),
             dialog,
             dialog,
@@ -10362,6 +10363,42 @@ def test_a_surface_opened_after_a_waited_draft_still_gets_its_escape(
     assert tails[-3:] == ["C-u", "/effort high", "Enter"], f"Unexpected keystrokes: {tails}"
 
 
+def test_a_surface_before_a_draft_does_not_shorten_the_draft_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The draft-wait budget starts when a draft is first seen.
+
+    Dismissing a surface first (here ~2.7 s of the ctrl+r search) must not
+    spend the draft budget: a paste that appears afterwards and takes ~4 s to
+    submit still gets its full wait instead of being cleared by the C-u.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    poll = claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    surface_frames = int(2.7 / poll)
+    draft_frames = int(4.0 / poll)  # under the 5 s budget only if it starts at the draft
+    settle = [_IDLE_PANE] * claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS
+    events = _events_tmux(
+        monkeypatch,
+        [
+            *[_REVERSE_SEARCH_PANE] * surface_frames,
+            *[_composer_pane("fix the flaky test")] * draft_frames,
+            *settle,
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    first_cu = events.index("send:send-keys:C-u")
+    captures_before = sum(1 for event in events[:first_cu] if event == "capture")
+    assert captures_before >= surface_frames + draft_frames, (
+        f"C-u fired while the pasted draft was still in the box; events: {events[:60]}"
+    )
+
+
 def test_a_slash_command_draft_that_never_renders_submits_blind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10450,9 +10487,11 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
 ) -> None:
     """The no-dialog case: the fallback Enter lands on an empty prompt, harmlessly."""
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(
+    # Idle through the settle window plus the pending-prompt check's capture.
+    settle = [_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1)
+    events = _events_tmux(
         monkeypatch,
-        [_IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        [*settle, _composer_pane("/effort high"), _IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(
@@ -10462,7 +10501,18 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
     )
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:")]
+    assert tails == ["C-u", "/effort high", "Enter", "Enter"], f"Unexpected keystrokes: {tails}"
+    # The command frame was seen (one poll, not the blind 5 s timeout) and the
+    # submit verified against the pane before the dialog-fallback Enter.
+    typed_at = events.index("send:send-keys:/effort high")
+    enters = [i for i, event in enumerate(events) if event == "send:send-keys:Enter"]
+    assert events[typed_at + 1 : enters[0]].count("capture") <= 2, (
+        f"The typed command was never seen in the box (blind submit); events: {events}"
+    )
+    assert "capture" in events[enters[0] + 1 : enters[1]], (
+        f"The submit verifier never polled after the command's Enter; events: {events}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -10905,15 +10955,15 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     the search filter and the pane silently keeps its old model.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(
+    events = _events_tmux(
         monkeypatch,
         # Search up at the occupied-input check and again at the
-        # re-confirmation, idle after the Escape, then the typed command
-        # renders and the submit clears it.
+        # re-confirmation, idle through the settle window after the Escape,
+        # then the typed command renders and the submit clears it.
         [
             _REVERSE_SEARCH_PANE,
             _REVERSE_SEARCH_PANE,
-            _IDLE_PANE,
+            *[_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1),
             _composer_pane("/effort high"),
             _IDLE_PANE,
         ],
@@ -10921,7 +10971,18 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+    tails = [event.rsplit(":", 1)[1] for event in events if event.startswith("send:")]
+    assert tails == ["Escape", "C-u", "/effort high", "Enter"], f"Unexpected keystrokes: {tails}"
+    # The command frame was seen (one poll, not the blind 5 s timeout) and
+    # the Enter verified against the pane afterwards.
+    typed_at = events.index("send:send-keys:/effort high")
+    enter_at = events.index("send:send-keys:Enter")
+    assert events[typed_at + 1 : enter_at].count("capture") <= 2, (
+        f"The typed command was never seen in the box (blind submit); events: {events}"
+    )
+    assert "capture" in events[enter_at + 1 :], (
+        f"The submit verifier never polled after Enter; events: {events}"
+    )
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
@@ -10940,8 +11001,14 @@ def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        # One composer-less frame, then the live input box again.
-        ["● Working on it", _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        # One composer-less frame, then the live input box through the settle
+        # window, then the typed command.
+        [
+            "● Working on it",
+            *[_IDLE_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1),
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -10966,7 +11033,11 @@ def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        [_SHORTCUTS_PANEL_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        [
+            *[_SHORTCUTS_PANEL_PANE] * (claude_native_bridge._SLASH_COMMAND_SETTLE_POLLS + 1),
+            _composer_pane("/effort high"),
+            _IDLE_PANE,
+        ],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
