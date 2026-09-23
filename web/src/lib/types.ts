@@ -390,11 +390,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -414,6 +415,7 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
@@ -434,12 +436,7 @@ export interface Session {
    * for non-native sessions (their message is already in `items`).
    */
   pendingInputs?: PendingInput[];
-  /**
-   * Ids of persisted user-message items steered into a running turn
-   * that the agent loop has not consumed yet, oldest first. The chat
-   * store re-renders these as delivered (not-yet-consumed) pending
-   * bubbles instead of full-strength committed ones. Empty otherwise.
-   */
+  /** Persisted user messages still buffered by a running turn. */
   unconsumedInputIds?: string[];
   /**
    * Requesting user's numeric permission level on this session
@@ -488,6 +485,9 @@ export interface Session {
   }[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** A saved sandbox inference policy owns the model catalog. */
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced

@@ -1511,6 +1511,8 @@ class _SessionCreateRequestBase(BaseModel):
         message event instead.
     """
 
+    inference_configuration_revision: str | None = None
+
     # Declared here, in the legacy field position, so validation errors keep
     # main's ordering. Concrete public models narrow the wire type below.
     agent_id: Any
@@ -1714,6 +1716,8 @@ class SessionCreateMetadata(BaseModel):
         ``sandbox_providers``); ``None`` takes the server's first. Only
         valid with ``host_type: "managed"``.
     """
+
+    inference_configuration_revision: str | None = None
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -2061,12 +2065,20 @@ class SessionResponse(BaseModel):
         the same total the cost-budget policy gates on. Lets clients
         seed their cost indicator on resume without waiting for the
         next ``session.usage`` SSE event.
+        Also ``None`` when ``usage_included`` is ``False``.
     :param usage_by_model: Per-model breakdown of the same subtree usage,
         keyed by the raw harness model id, e.g.
         ``{"claude-sonnet-4-6": ModelUsage(input_tokens=12000, ...)}``.
         ``None`` when no per-model usage has been recorded (older sessions
         recorded before this field existed, or before the first turn). Lets
         the UI show which models a session spent its tokens / budget on.
+        Also ``None`` when ``usage_included`` is ``False``.
+    :param usage_included: ``False`` when the caller skipped usage aggregation
+        with ``include_usage=false``. Both usage fields are then unknown,
+        not zero or this session's own-only spend. Display clients can load
+        them with a separate ``GET /v1/sessions/{id}`` using
+        ``include_usage=true``, ``include_items=false``,
+        ``include_liveness=false``, and ``refresh_state=false``.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2199,6 +2211,7 @@ class SessionResponse(BaseModel):
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
+    usage_included: bool = True
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2211,18 +2224,15 @@ class SessionResponse(BaseModel):
     # message at POST time and thus already carry it in ``items``.
     # Source: :mod:`omnigent.runtime.pending_inputs`.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
-    # Ids of persisted user-message items steered into a running turn
-    # that the agent loop has not consumed yet, oldest first. A cold-
-    # loading client renders these items in the same intermediate
-    # (pending) state the live ``session.input.delivered`` event drives,
-    # instead of full-strength. Empty when nothing is awaiting the
-    # harness. Source: :mod:`omnigent.runtime.unconsumed_inputs`.
+    # Persisted user messages still buffered by a running turn, oldest first.
     unconsumed_input_ids: list[str] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)
+    inference_configured: bool = False
+    inference_error: str | None = None
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions

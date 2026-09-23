@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
-import { BubbleView } from "./ChatPage";
+import { BubbleView, buildPendingBubbles } from "./ChatPage";
 
 // UserBubble renders its text through the same markdown renderer as the
 // assistant bubble (FilePathAwareMessageResponse → Streamdown). These tests
@@ -356,6 +356,85 @@ describe("UserBubble copy button", () => {
   });
 });
 
+describe("UserBubble copy-link button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each(["pend_12", "server_pending_input_12"])(
+    "disables links for pending input %s until promotion, while keeping text copy",
+    async (tempId) => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      vi.stubGlobal("location", { href: "https://app.example/c/conv_1" });
+      const [pending] = buildPendingBubbles(
+        [{ tempId, content: [{ type: "input_text", text: "queued message" }] }],
+        null,
+      );
+      const { rerender } = renderBubble(pending);
+      const link = screen.getByRole("button", { name: "Copy link" });
+      expect(link).toBeDisabled();
+      fireEvent.click(link);
+      expect(writeText).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith("queued message"));
+
+      rerender(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BubbleView bubble={userBubble("queued message", { itemId: "item_42" })} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Copy link" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+      await waitFor(() =>
+        expect(writeText).toHaveBeenLastCalledWith("https://app.example/c/conv_1?message=item_42"),
+      );
+    },
+  );
+
+  it("copies a ?message= deep link for the bubble itemId", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("location", {
+      href: "https://app.example/c/conv_1?debug=1",
+    });
+
+    renderBubble(userBubble("link me", { itemId: "item_42" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        "https://app.example/c/conv_1?debug=1&message=item_42",
+      ),
+    );
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute("data-message-id", "item_42");
+  });
+});
+
+describe("AssistantBubble copy-link button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("stamps data-message-id with the responseId and copies that link", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("location", {
+      href: "https://app.example/c/conv_1",
+    });
+
+    renderBubble(assistantBubble("completed"));
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute(
+      "data-message-id",
+      "codex_turn_123",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("https://app.example/c/conv_1?message=codex_turn_123"),
+    );
+  });
+});
+
 describe("UserBubble @-mention attachment chips", () => {
   it("shows file and folder chips from [Attached: …] markers and hides the markers", () => {
     renderBubble(userBubble("[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these"));
@@ -427,12 +506,8 @@ describe("UserBubble @-mention attachment chips", () => {
 });
 
 describe("UserBubble pending (delivered, not yet consumed) affordance", () => {
-  // A steered message the harness hasn't consumed renders in an
-  // intermediate state: a `data-pending` hook plus a dimmed treatment.
-  // Both prongs matter — the attribute is the semantic contract tests and
-  // tooling key off, the dimming is what the user actually sees.
   it("marks a pending bubble with data-pending and dims it", () => {
-    renderBubble(userBubble("steered follow-up", { pending: true }));
+    renderBubble(userBubble("steered follow-up", { pending: true, awaitingConsumption: true }));
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble.getAttribute("data-pending")).toBe("true");
     expect(bubble.className).toContain("opacity-60");

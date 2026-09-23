@@ -1,26 +1,3 @@
-"""
-Integration tests for the steered-message intermediate state.
-
-A message steered into an already-running turn is persisted at POST time
-and parked in the runner's turn buffer — the agent loop has verifiably
-NOT consumed it. The server must not claim otherwise: the runner's 202
-body distinguishes ``accepted`` (a fresh turn started with the message —
-consumed) from ``buffered`` (parked for the active turn — merely
-delivered). These tests pin the route/relay contract that backs the
-grayed-out "awaiting the agent" bubble:
-
-* a ``buffered`` forward publishes ``session.input.delivered`` (not
-  ``session.input.consumed``) and reports the item id in the snapshot's
-  ``unconsumed_input_ids``;
-* an ``accepted`` forward keeps today's behavior: ``session.input.consumed``
-  at POST time, nothing pending in the snapshot;
-* the runner's ``session.input.drained`` relay marker upgrades the
-  delivered item to the canonical ``session.input.consumed`` (full item
-  payload) and clears it from the snapshot;
-* a terminal session status clears any still-pending ids, so a lost
-  drain marker cannot strand the intermediate state.
-"""
-
 from __future__ import annotations
 
 import json
@@ -40,20 +17,12 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 def _clean_unconsumed_inputs_index() -> Any:
-    """Reset the process-global unconsumed-inputs index between tests."""
     unconsumed_inputs.reset_for_tests()
     yield
     unconsumed_inputs.reset_for_tests()
 
 
 async def _create_session(client: httpx.AsyncClient, agent_id: str) -> dict[str, Any]:
-    """
-    Create a bare session and return the response JSON.
-
-    :param client: The test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: The ``POST /v1/sessions`` response body.
-    """
     resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
     assert resp.status_code == 201, f"session create failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -62,12 +31,6 @@ async def _create_session(client: httpx.AsyncClient, agent_id: str) -> dict[str,
 def _capture_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """
-    Capture every session-stream publish for assertion.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: The list publishes are appended to as ``(session_id, event)``.
-    """
     published: list[tuple[str, dict[str, Any]]] = []
 
     def capture_publish(session_id: str, event: dict[str, Any]) -> None:
@@ -81,13 +44,6 @@ def _capture_stream(
 
 
 def _fake_runner(status: str) -> httpx.AsyncClient:
-    """
-    A runner whose ``POST /events`` acknowledges with the given status.
-
-    :param status: The 202 acknowledgment status, ``"accepted"`` (fresh
-        turn) or ``"buffered"`` (parked for the active turn).
-    :returns: An httpx client backed by a mock transport.
-    """
     return httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda _request: httpx.Response(202, json={"status": status, "detail": "test"})
@@ -97,12 +53,6 @@ def _fake_runner(status: str) -> httpx.AsyncClient:
 
 
 def _bind_runner(monkeypatch: pytest.MonkeyPatch, fake_runner: httpx.AsyncClient) -> None:
-    """
-    Route the session's runner lookups at the fake runner.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param fake_runner: The stand-in runner client.
-    """
 
     async def get_runner_client(_session_id: str, _runner_router: object) -> httpx.AsyncClient:
         return fake_runner
@@ -114,14 +64,6 @@ def _bind_runner(monkeypatch: pytest.MonkeyPatch, fake_runner: httpx.AsyncClient
 
 
 async def _post_message(client: httpx.AsyncClient, session_id: str, text: str) -> dict[str, Any]:
-    """
-    POST a plain user message event and return the 202 body.
-
-    :param client: The test HTTP client.
-    :param session_id: Target session.
-    :param text: Message text.
-    :returns: The acknowledgment body carrying ``item_id``.
-    """
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -137,14 +79,6 @@ async def test_buffered_forward_publishes_delivered_not_consumed(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A steered (buffered) message is announced as delivered, not consumed.
-
-    Failure here is the original bug: the route published
-    ``session.input.consumed`` at POST time even though the runner only
-    parked the message for the active turn, so clients rendered the
-    steered bubble exactly like a consumed one.
-    """
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -172,7 +106,6 @@ async def test_accepted_forward_keeps_consumed_at_post_time(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fresh-turn (accepted) message still publishes consumed immediately."""
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -198,14 +131,6 @@ async def test_relay_drain_marker_upgrades_delivered_to_consumed(
     monkeypatch: pytest.MonkeyPatch,
     db_uri: str,
 ) -> None:
-    """
-    The runner's drain marker produces the canonical consumed event.
-
-    When the buffered message actually leaves the runner's buffer for a
-    turn, the relay must publish ``session.input.consumed`` carrying the
-    persisted item's full payload (clients promote the pending bubble on
-    it) and drop the id from the snapshot's ``unconsumed_input_ids``.
-    """
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -239,7 +164,6 @@ async def test_relay_drain_marker_upgrades_delivered_to_consumed(
     assert len(consumed) == 1
     assert consumed[0]["data"]["item_id"] == item_id
     assert consumed[0]["data"]["data"]["role"] == "user"
-    # The raw runner-internal marker must never reach clients.
     assert all(ev["type"] != "session.input.drained" for _sid, ev in published)
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
@@ -251,7 +175,6 @@ async def test_duplicate_drain_marker_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
     db_uri: str,
 ) -> None:
-    """A replayed drain marker publishes consumed exactly once."""
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -288,13 +211,6 @@ async def test_terminal_status_clears_unconsumed_snapshot(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    An idle/failed edge clears pending ids so a lost marker can't stick.
-
-    The runner suppresses ``idle`` while a buffered message exists, so a
-    terminal status means no live turn holds one any more — the snapshot
-    must stop reporting the intermediate state.
-    """
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     fake_runner = _fake_runner("buffered")
@@ -319,13 +235,6 @@ async def test_waiting_status_clears_unconsumed_snapshot(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A ``waiting`` edge clears pending ids like ``idle``/``failed``.
-
-    ``waiting`` is a turn-end edge (only background work outlives it) and
-    live clients promote their pending bubbles on it, so a snapshot taken
-    afterwards must not re-render the item as awaiting the harness.
-    """
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     fake_runner = _fake_runner("buffered")
@@ -350,23 +259,11 @@ async def test_drain_marker_racing_ahead_of_record_publishes_consumed(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A drain marker that beats the buffered ack still ends in consumed.
-
-    The marker rides the relay connection while the forward's 202 is in
-    flight back to the route layer, so the relay can resolve the item
-    BEFORE the route records it. If that ordering published delivered
-    with no consumed ever following, the steered bubble would stay in
-    the intermediate state until the next terminal status.
-    """
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
     def _drain_before_ack(request: httpx.Request) -> httpx.Response:
-        # Stand-in for the relay's drain handling running mid-forward:
-        # the runner drained the buffered copy and its marker was
-        # processed before the 202 below reaches the route layer.
         body = json.loads(request.content.decode())
         unconsumed_inputs.resolve(session["id"], body["persisted_item_id"])
         return httpx.Response(202, json={"status": "buffered", "detail": "test"})
@@ -395,14 +292,6 @@ async def test_non_object_forward_ack_reads_as_fresh_turn(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A valid-but-non-object JSON 202 body reads as an accepted forward.
-
-    An older/stub runner can answer with a bare JSON string; treating it
-    like the non-JSON case (fresh turn, consumed at POST time) keeps the
-    forward from failing after the item was already persisted, which
-    would invite a duplicate client retry.
-    """
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
