@@ -1,48 +1,14 @@
-"""UI journey: a Cursor TUI ``/clear`` must not strand the web session.
+"""Cursor /clear must preserve web replies and update the cold-resume target.
 
-``cursor-agent``'s TUI has ``/clear`` (aliases ``/new``, ``/new-chat``,
-``/newchat``): it starts a brand-new chat, creating a fresh
-``~/.cursor/chats/<md5(cwd)>/<chat-id>/store.db`` while the old store stays on
-disk. Rotation-capable native harnesses (claude-native, codex-native,
-antigravity-native) move Omnigent ownership onto a fresh conversation when the
-vendor TUI starts a new session; cursor-native must not leave the web session
-pinned to the cleared-away chat. When it does, three user-visible failures
-follow:
-
-1. The mirror stays on the pre-``/clear`` chat, so nothing from the new chat
-   ever reaches the web transcript.
-2. Web composer messages are injected into the TUI's *new* chat, whose replies
-   are never mirrored — from the browser the session looks dead.
-3. ``external_session_id`` (the cold-resume ``--resume <chatId>`` target) is
-   patched exactly once, so a later resume reattaches the chat the user
-   cleared away from.
-
-The journey this file drives, exactly as a user would:
-
-1. Start a cursor-native session and exchange one composer turn (the chat
-   store exists and its reply is mirrored into the web transcript).
-2. In the Terminal view, run ``/clear`` in the cursor-agent pane.
-3. Send another message from the web composer.
-4. The TUI accepts and answers it (its own chat store carries the reply), and
-   that reply must reach the transcript the browser is showing — either the
-   same session (re-discovered store) or a rotated session the SPA redirects
-   to (the claude-native behavior). The session the user ends up on must have
-   ``external_session_id`` pointing at the *new* chat so a cold resume lands
-   on it.
-
-CI has no Cursor account, so the vendor binary is a scripted fake: a tiny
-line-oriented "TUI" that renders the idle markers the injection path settles
-on, answers every prompt by writing cursor-shaped user/assistant blobs into
-the same ``~/.cursor/chats`` store layout the real CLI uses, and starts a new
-chat on ``/clear``. Everything else — server, runner, tmux pane, executor
-injection, store discovery, forwarder mirror, SPA — is the real stack: the
-runner is respawned with an isolated ``$HOME`` and the fake on ``PATH``
-(``OMNIGENT_CURSOR_PATH``), mirroring how the cursor-native list-models e2e
-stubs the binary.
-"""
+Exchange a composer turn, send /clear through the terminal, then verify
+the next reply appears in the browser and external_session_id identifies
+the new chat. A scripted Cursor CLI writes the real SQLite chat layout
+under a private HOME; server, runner, tmux, injection, forwarder and SPA
+are real. No Cursor account or live model is used."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -62,9 +28,9 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
+    _REPO_ROOT,
     _bind_session_runner,
     _ensure_runner_online,
-    _REPO_ROOT,
     _server_state,
 )
 from tests.e2e_ui.messages.test_message_render_parity import (
@@ -206,9 +172,7 @@ main()
 '''
 
 
-def _wait_until(
-    predicate: Callable[[], bool], *, timeout_s: float, message: str
-) -> None:
+def _wait_until(predicate: Callable[[], bool], *, timeout_s: float, message: str) -> None:
     """Poll *predicate* until true or raise ``AssertionError`` with *message*."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -219,23 +183,11 @@ def _wait_until(
 
 
 def _terminate_shared_runner(base_url: str, runner_id: str) -> None:
-    """SIGTERM every ``omnigent.runner._entry`` process and wait until offline.
-
-    The suite's shared runner is a sibling subprocess of the spawned server;
-    the replacement runner must reuse its token-bound id, so the old process
-    has to be fully gone (tunnel dropped, status offline) before the swap.
-    """
-    result = subprocess.run(
-        ["pgrep", "-f", "omnigent.runner._entry"], capture_output=True, text=True
-    )
-    pids = (
-        [int(line) for line in result.stdout.split()] if result.returncode == 0 else []
-    )
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    """Stop only this fixture's runner before reusing its token-bound identity."""
+    pid = _server_state.get("runner_pid")
+    assert isinstance(pid, int), "fixture does not own a runner process"
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
 
     def _offline() -> bool:
         try:
@@ -254,14 +206,10 @@ def _terminate_shared_runner(base_url: str, runner_id: str) -> None:
 def _spawn_fake_cursor_runner(
     base_url: str, home: Path, fake_bin_dir: Path, log_path: Path
 ) -> subprocess.Popen[bytes]:
-    """Respawn the suite runner with the fake ``cursor-agent`` and a private HOME.
+    """Respawn the runner with the scripted Cursor CLI and a private HOME.
 
-    Reuses the shared runner's token-bound id/binding token (the server only
-    accepts that tunnel). ``HOME`` isolation matters twice over: the runner-side
-    forwarder resolves ``~/.cursor/chats`` from its own environment, and the
-    tmux pane it spawns inherits it — so the fake TUI and the forwarder agree
-    on the same private chats root the test can inspect.
-    """
+    Reuse the token-bound runner identity. The fake TUI and forwarder must
+    resolve the same isolated ~/.cursor/chats directory."""
     runner_id = str(_server_state["runner_id"])
     binding_token = str(_server_state["binding_token"])
     mock_url = str(_server_state.get("mock_llm_url", ""))
@@ -277,9 +225,7 @@ def _spawn_fake_cursor_runner(
         "OMNIGENT_CURSOR_PATH": str(fake_binary),
         "PATH": f"{fake_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         **(
-            {"OPENAI_BASE_URL": f"{mock_url}/v1", "OPENAI_API_KEY": "mock-key"}
-            if mock_url
-            else {}
+            {"OPENAI_BASE_URL": f"{mock_url}/v1", "OPENAI_API_KEY": "mock-key"} if mock_url else {}
         ),
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — child holds its own dup
@@ -321,17 +267,8 @@ def _spawn_fake_cursor_runner(
     return proc
 
 
-def _create_cursor_native_session(
-    base_url: str, runner_id: str, workspace: Path
-) -> str:
-    """Register the ``cursor-native`` wrapper agent and bind its session.
-
-    Mirrors the suite's ``_create_native_cursor_session`` fixture helper —
-    reuses the exact terminal-first spec ``omnigent cursor`` ships and stamps
-    the same wrapper / terminal-first labels — but pins the launch cwd to a
-    per-test workspace so the ``md5(cwd)`` chat-store key is private to this
-    session.
-    """
+def _create_cursor_native_session(base_url: str, runner_id: str, workspace: Path) -> str:
+    """Register and bind a terminal-first Cursor session in a private workspace."""
     import io
     import tarfile
     import tempfile
@@ -385,16 +322,12 @@ def fake_cursor_session(
     live_server: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str, Path, Path]]:
-    """A cursor-native session whose ``cursor-agent`` is the scripted fake.
+    """Create a session on the scripted Cursor runner with a private HOME.
 
-    Swaps the suite's shared runner for one spawned with a private ``HOME``
-    and the fake TUI on ``PATH``, then creates and binds a cursor-native
-    session against it. Teardown deletes the session and the swapped runner;
-    a later test that needs the shared runner respawns it on demand via
-    ``_ensure_runner_online`` (the established post-runner-kill pattern).
+    Teardown removes the session and runner; subsequent tests can respawn
+    the shared runner through _ensure_runner_online.
 
-    :returns: ``(base_url, session_id, home, workspace)``.
-    """
+    :returns: (base_url, session_id, home, workspace)."""
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
@@ -446,9 +379,7 @@ def _list_chat_ids(home: Path, workspace: Path) -> set[str]:
     return {d.name for d in root.iterdir() if (d / "store.db").is_file()}
 
 
-def _store_has_assistant_reply(
-    home: Path, workspace: Path, chat_id: str, token: str
-) -> bool:
+def _store_has_assistant_reply(home: Path, workspace: Path, chat_id: str, token: str) -> bool:
     """True when *chat_id*'s store carries an assistant blob containing *token*."""
     store = _chats_root(home, workspace) / chat_id / "store.db"
     if not store.is_file():
@@ -510,17 +441,10 @@ def test_tui_clear_does_not_strand_web_session(
     page: Page,
     fake_cursor_session: tuple[str, str, Path, Path],
 ) -> None:
-    """After a TUI ``/clear``, composer replies must still reach the browser.
+    """After terminal /clear, verify the new store reply reaches the browser.
 
-    Fails on unfixed code at the post-``/clear`` reply wait: the TUI accepts
-    and answers the composer message in its new chat (asserted against its own
-    chat store first), but the mirror stays pinned to the cleared-away store,
-    so no reply ever reaches the transcript the browser shows and the session
-    looks dead. Passes once cursor-native handles the TUI's new-chat rotation
-    the way the other rotation-capable native harnesses do — whether by
-    rotating the Omnigent session (and redirecting the SPA, claude-native
-    style) or by re-binding the mirror and resume target to the new chat.
-    """
+    Accept either a re-bound mirror or a redirected session, provided the
+    cold-resume target points at the new chat."""
     base_url, session_id, home, workspace = fake_cursor_session
     page.goto(f"{base_url}/c/{session_id}")
 
