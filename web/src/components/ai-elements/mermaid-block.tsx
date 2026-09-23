@@ -3,29 +3,9 @@ import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import type { CustomRendererProps } from "streamdown";
 
-// Chat-side renderer for ```mermaid fences, registered through Streamdown's
-// custom-renderer seam (`plugins.renderers`), which takes precedence over
-// the built-in mermaid block.
-//
-// The built-in block gates rendering behind an IntersectionObserver and
-// renders from scratch on every mount. Both interact badly with the
-// settled-turn fold, which keeps its trace mounted but hidden while
-// collapsed: hidden content never intersects, so a folded diagram only
-// started rendering AFTER the user expanded the fold — its reserved
-// placeholder swapped to a spinner and then to the full-size diagram,
-// jolting everything below by hundreds of pixels. This renderer starts
-// rendering as soon as the fence is complete (mermaid renders in a
-// detached container, so the caller's visibility is irrelevant) and caches
-// the SVG per chart, so remounts paint the finished diagram on their first
-// frame.
-//
-// Presentation mirrors the built-in block's frame (header + bordered
-// body); the built-in pan-zoom / fullscreen / image-export extras are
-// deliberately not reproduced.
-
-// Rendered-SVG cache: a chart is immutable once its fence closes, and SVG
-// strings can be tens of kilobytes, so cap the cache and evict the oldest
-// entry (Map preserves insertion order) instead of growing unbounded.
+// Render completed charts while hidden and cache their SVG so expanding a
+// settled trace does not start asynchronous rendering or shift its layout.
+// Bound the cache because SVG strings can be tens of kilobytes each.
 const SVG_CACHE = new Map<string, string>();
 const SVG_CACHE_MAX_ENTRIES = 64;
 
@@ -44,9 +24,8 @@ function rememberSvg(chart: string, svg: string): void {
 async function renderChartUncached(chart: string): Promise<string> {
   try {
     renderSequence += 1;
-    // Render ids must be DOM-unique: mermaid renders into a temporary
-    // element keyed on the id. The plugin's instance keeps its defaults
-    // (securityLevel "strict"), matching the built-in block.
+    // Mermaid needs a DOM-unique render id. Its default strict security level
+    // matches the built-in renderer.
     const { svg } = await mermaid.getMermaid().render(`chat-mermaid-${renderSequence}`, chart);
     rememberSvg(chart, svg);
     return svg;
@@ -70,8 +49,7 @@ export function ChatMermaidBlock({ code, isIncomplete }: CustomRendererProps) {
   const [renderError, setRenderError] = useState<string | null>(null);
 
   useEffect(() => {
-    // A still-streaming fence is rarely a parseable diagram; wait for it
-    // to close instead of burning renders (and error states) on prefixes.
+    // Wait for the fence to close before parsing the chart.
     if (isIncomplete) return undefined;
     const cached = SVG_CACHE.get(code);
     if (cached !== undefined) {
@@ -111,16 +89,13 @@ export function ChatMermaidBlock({ code, isIncomplete }: CustomRendererProps) {
       <div
         aria-label="Mermaid chart"
         className="flex justify-center overflow-x-auto p-2"
-        // The markup comes from mermaid itself (securityLevel "strict"),
-        // injected exactly the way the built-in block injects it.
+        // Mermaid generated this markup with securityLevel "strict".
         dangerouslySetInnerHTML={{ __html: svg }}
         role="img"
       />
     );
   } else {
-    // Reserve the built-in placeholder's footprint so a diagram that
-    // finishes rendering while visible shifts surrounding layout as
-    // little as possible.
+    // Reserve space while rendering to limit layout shift.
     body = <div aria-hidden className="min-h-[200px]" />;
   }
 

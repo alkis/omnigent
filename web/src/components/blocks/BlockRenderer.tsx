@@ -71,10 +71,8 @@ const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
 // below the fold and glide the growing trace off the top.
 const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 
-// Backstop for hiding a folded trace when its collapse animation's
-// `animationend` never arrives (dropped event, interrupted animation).
-// Longer than the 200ms collapse; the animation's `forwards` fill keeps
-// the trace collapsed in the meantime, so the gap is invisible.
+// Backstop when a collapse animation's `animationend` never arrives.
+// The `forwards` fill keeps content collapsed during the extra 200ms.
 const FOLD_COLLAPSE_HIDE_FALLBACK_MS = 400;
 
 interface BlockRendererProps {
@@ -121,6 +119,8 @@ interface BlockRendererProps {
   lastActivityAtS?: number;
   /** Whether this final bubble is still part of a visible active turn. */
   showsWorking?: boolean;
+  /** Start a fold containing a mid-turn user interjection open. */
+  defaultExpanded?: boolean;
 }
 
 /** The subset of {@link BlockRendererProps} the fold decision reads. */
@@ -133,6 +133,7 @@ type FoldInputs = Pick<
   | "isLastAssistant"
   | "hasPendingElicitation"
   | "showsWorking"
+  | "defaultExpanded"
 >;
 
 /**
@@ -212,6 +213,7 @@ function hasFoldableShape(
  * answer to anchor them to, that costs nothing visible.
  */
 export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
+  if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
   const partition = partitionTurn(inputs.items);
@@ -241,6 +243,7 @@ export function BlockRenderer({
   hasPendingElicitation = false,
   lastActivityAtS,
   showsWorking = false,
+  defaultExpanded = false,
   onRetryError,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
@@ -324,11 +327,15 @@ export function BlockRenderer({
   if (showFold) {
     return (
       <>
-        <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
+        <TurnWorkedFold
+          workedForS={workedForS}
+          animateCollapse={animateCollapse}
+          defaultOpen={defaultExpanded}
+        >
           {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
         {exempt.map(({ item, index }) =>
-          renderItem(item, index, false, false, false, onRetryError),
+          renderItem(item, index, false, false, false, false, onRetryError),
         )}
         {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
       </>
@@ -406,11 +413,13 @@ function renderSequence(
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
+    const isTextStreaming = liveEdge && i === lastIdx && item.kind === "text";
     rendered.push(
       renderItem(
         item,
         indexBase + i,
         i === reasoningStreamingIdx,
+        isTextStreaming,
         suppressReasoningDuration,
         followsText,
         onRetryError,
@@ -540,28 +549,30 @@ function isProvisionalTrace(items: RenderItem[]): boolean {
 function TurnWorkedFold({
   workedForS,
   animateCollapse,
+  defaultOpen,
   children,
 }: {
   workedForS?: number;
   animateCollapse: boolean;
+  defaultOpen: boolean;
   children: ReactNode;
 }) {
   const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
-  const [open, setOpen] = useState(animateCollapse);
+  const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  const userChangedOpenRef = useRef(false);
+  useLayoutEffect(() => {
+    // History hydration can identify an interjection after this fold mounted.
+    // Honor that late default unless the user has already made their own choice.
+    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+  }, [defaultOpen]);
   useEffect(() => {
-    if (!animateCollapse) return;
+    if (!animateCollapse || defaultOpen) return;
     const frame = requestAnimationFrame(() => setOpen(false));
     return () => cancelAnimationFrame(frame);
-  }, [animateCollapse]);
+  }, [animateCollapse, defaultOpen]);
 
-  // The trace stays MOUNTED while folded (`forceMount` below). Unmounting
-  // it made every expand rebuild the markdown tree from scratch, re-running
-  // async work (code highlighting, mermaid diagram rendering) over content
-  // that had already settled — the reopened trace visibly re-rendered and
-  // re-laid itself out. Kept content still must not be seen, tabbed into,
-  // or read by assistive tech while closed, so once the collapse animation
-  // settles (or immediately when settled history mounts closed) it is
-  // hidden with the `hidden` attribute — display:none, costing no layout.
+  // Keep the settled trace mounted so expansion reuses rendered markdown.
+  // Hide it after collapse so it cannot receive focus or affect layout.
   const [closedSettled, setClosedSettled] = useState(!animateCollapse);
   useEffect(() => {
     if (open || closedSettled) return undefined;
@@ -592,11 +603,11 @@ function TurnWorkedFold({
   const scrollOnOpenRef = useRef(false);
   const scrollLock = useContext(ConversationScrollLockContext);
   const handleOpenChange = (next: boolean) => {
+    userChangedOpenRef.current = true;
     scrollOnOpenRef.current = next;
     setUserOpened(next);
     setOpen(next);
-    // Reveal in the same commit as the open so the kept, already-rendered
-    // trace is on screen at the first open frame.
+    // Reveal the rendered trace in the first open frame.
     if (next) setClosedSettled(false);
   };
   useLayoutEffect(() => {
@@ -733,7 +744,7 @@ function renderToolRunFragment(
       <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
     );
   }
-  return renderItem(fragment.tool, runStart + fragment.index, false);
+  return renderItem(fragment.tool, runStart + fragment.index, false, false);
 }
 
 const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
@@ -778,6 +789,7 @@ function renderItem(
   item: RenderItem,
   index: number,
   isReasoningStreaming: boolean,
+  isTextStreaming: boolean,
   suppressReasoningDuration = false,
   followsText = false,
   onRetryError?: BlockRendererProps["onRetryError"],
@@ -791,7 +803,9 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+          <FilePathAwareMessageResponse mode={isTextStreaming ? "streaming" : "static"}>
+            {item.text}
+          </FilePathAwareMessageResponse>
         </div>
       );
     case "reasoning":
@@ -866,6 +880,7 @@ function renderItem(
       return (
         <ErrorBanner
           key={key}
+          itemId={item.itemId}
           message={item.message}
           source={item.source}
           code={item.code}
@@ -873,7 +888,17 @@ function renderItem(
           cause={item.cause}
           remediation={item.remediation}
           level={item.level}
-          onRetry={onRetryError ? () => onRetryError(item) : undefined}
+          relatedErrors={item.relatedErrors}
+          onRetry={
+            onRetryError
+              ? (actionableError) =>
+                  onRetryError(
+                    actionableError.itemId === item.itemId && actionableError.code === item.code
+                      ? item
+                      : { kind: "error", ...actionableError },
+                  )
+              : undefined
+          }
         />
       );
     case "policy_denied":

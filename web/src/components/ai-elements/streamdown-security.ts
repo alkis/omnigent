@@ -30,13 +30,8 @@ export const STREAMDOWN_PLUGINS = {
   // rewritten to `$$…$$` by `normalizeExplicitMathDelimiters`.
   math: createMathPlugin({ singleDollarTextMath: false }),
   mermaid,
-  // Chat renders mermaid fences with an app-owned renderer (custom
-  // renderers take precedence over the built-in mermaid block). The
-  // built-in defers rendering until the diagram scrolls into view and
-  // re-renders on every mount, which re-introduced the expand jolt on
-  // the settled-turn fold: its kept trace is hidden while folded, so a
-  // diagram inside it never intersects and only rendered after the
-  // expand. See mermaid-block.tsx.
+  // The app renderer pre-renders hidden diagrams and reuses them when a
+  // settled trace expands; custom renderers override the built-in block.
   renderers: [{ component: ChatMermaidBlock, language: "mermaid" }],
 };
 export const SECURE_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins(false);
@@ -50,6 +45,29 @@ export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 // lookahead keeps a cited position off the scheme branch: `notes.md:12` is a
 // filename plus a line number, but is otherwise shaped exactly like a scheme.
 const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+)?$)|\/\/|#)/;
+const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+))?$/;
+const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?\d+(?:C\d+)?)?$/i;
+
+export interface WorkspaceFileCitation {
+  path: string;
+  line: number | null;
+  column?: number;
+  hasPosition: boolean;
+}
+
+/** Splits the line target from a local-file citation, preserving its path. */
+export function splitWorkspaceFileCitation(text: string): WorkspaceFileCitation {
+  const match = text.match(COLON_POSITION_SUFFIX) ?? text.match(HASH_POSITION_SUFFIX);
+  if (!match || match.index === undefined) return { path: text, line: null, hasPosition: false };
+  const line = Number(match[1]);
+  const column = Number(match[2]);
+  return {
+    path: text.slice(0, match.index),
+    line: Number.isSafeInteger(line) && line > 0 ? line : null,
+    ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}),
+    hasPosition: true,
+  };
+}
 
 // Where a file link's href is parked once the path moves to the data
 // attribute. Must be a *named* fragment: harden passes a fragment-only href
@@ -95,7 +113,7 @@ function fileUriToLocalPath(href: string): string | null {
   } catch {
     return null;
   }
-  if (url.protocol !== "file:" || url.hostname || url.search || url.hash) return null;
+  if (url.protocol !== "file:" || url.hostname || url.search) return null;
   let path: string;
   try {
     path = decodeURIComponent(url.pathname);
@@ -106,7 +124,9 @@ function fileUriToLocalPath(href: string): string | null {
   if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
     return null;
   }
-  return path;
+  if (!url.hash) return path;
+  const cited = splitWorkspaceFileCitation(`${path}${url.hash}`);
+  return cited.hasPosition ? `${path}${url.hash}` : null;
 }
 
 /**
@@ -133,7 +153,9 @@ export function markWorkspaceFileLinks() {
       if (node.tagName !== "a") return;
       const href = node.properties?.href;
       if (typeof href !== "string" || !href) return;
-      if (NON_FILE_HREF.test(href) || href.includes("?") || href.includes("#")) return;
+      if (NON_FILE_HREF.test(href) || href.includes("?")) return;
+      const cited = splitWorkspaceFileCitation(href);
+      if (href.includes("#") && !cited.hasPosition) return;
       node.properties = {
         ...node.properties,
         href: PARKED_FILE_HREF,

@@ -1,28 +1,4 @@
-"""UI regression: expanding a settled message must not re-render its markdown.
-
-Journey: a turn whose process trace carries rich markdown (fenced code, a
-mermaid diagram, a table) settles and folds behind the "Worked" row. The user
-reloads the page (history path: the fold mounts closed) and clicks the row to
-expand the trace.
-
-Expected: the trace opens and holds still — the markdown inside was already
-rendered once, so re-opening it must not visibly re-render.
-
-Actual (the bug): the collapsible unmounts its children while closed, so every
-expand rebuilds the whole markdown tree from scratch. Code blocks flash
-unhighlighted for a frame, and the mermaid diagram re-renders asynchronously a
-few hundred ms after the expand settles — first collapsing to its placeholder,
-then popping in at full size — which jolts every element below it by hundreds
-of pixels. The jank recurs on every expand (warm caches included).
-
-The test seeds the turn deterministically through the external-item events a
-native forwarder uses (no LLM round-trip), installs a per-animation-frame
-sampler that tracks a marker paragraph's offset relative to the fold row, then
-expands the fold and asserts the offset never shifts after the first open
-frame. Today the mermaid re-render moves the marker ~250px, so this fails; it
-passes once an expand no longer re-renders settled markdown (or reserves the
-diagram's space).
-"""
+"""Verify that expanding settled rich markdown does not shift its layout."""
 
 from __future__ import annotations
 
@@ -33,12 +9,9 @@ from playwright.sync_api import Page, expect
 
 _FOLD = '[data-testid="turn-worked-fold"]'
 
-# How far (px) content below the diagram may drift after the expand's first
-# open frame. The expand height animation clips the content without moving
-# inner layout, so a stable renderer stays at ~0; the bug shifts it ~250px.
+# Maximum drift after the first open frame; the regression shifted about 250px.
 _MAX_POST_EXPAND_SHIFT_PX = 24
 
-# The marker paragraph the sampler tracks, placed below the mermaid diagram.
 _MARKER = "MARKER_BELOW_DIAGRAM"
 
 _NARRATION = """Let me sketch the flow first.
@@ -66,10 +39,7 @@ def helper(value: int) -> int:
 MARKER_BELOW_DIAGRAM paragraph that should hold still after the expand.
 """
 
-# Per-animation-frame sampler. Measures the marker paragraph's offset
-# RELATIVE to the fold's trigger row (both live in the same scroller, so
-# scrolling cancels out and only real layout shifts between them register).
-# Runs until the diagram has been rendered and stable for ~1s, or a hard cap.
+# Measuring relative to the trigger cancels scrolling within the shared container.
 _INSTALL_SAMPLER = """
 () => {
   window.__probe = { frames: [], done: false };
@@ -125,14 +95,7 @@ _INSTALL_SAMPLER = """
 def _publish_status(
     base_url: str, session_id: str, status: str, response_id: str | None = None
 ) -> None:
-    """Publish a session status edge through the native-forwarder event route.
-
-    :param base_url: Base URL of the local e2e server.
-    :param session_id: Session/conversation id.
-    :param status: ``"running"`` or ``"idle"``.
-    :param response_id: Turn id the edge belongs to.
-    :returns: None.
-    """
+    """Publish a native-forwarder session status event."""
     data: dict[str, object] = {"status": status}
     if response_id is not None:
         data["response_id"] = response_id
@@ -151,15 +114,7 @@ def _seed_item(
     item_data: dict,
     response_id: str,
 ) -> None:
-    """Mirror one native conversation item onto the session.
-
-    :param base_url: Base URL of the local e2e server.
-    :param session_id: Session/conversation id.
-    :param item_type: ``"message"`` / ``"function_call"`` / ``"function_call_output"``.
-    :param item_data: The item payload a native forwarder would emit.
-    :param response_id: Turn id the item belongs to.
-    :returns: None.
-    """
+    """Mirror one native conversation item onto the session."""
     resp = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={
@@ -172,16 +127,7 @@ def _seed_item(
 
 
 def _seed_settled_markdown_turn(base_url: str, session_id: str) -> None:
-    """Seed one settled turn whose process trace carries rich markdown.
-
-    The narration (code + mermaid + table) lands BEFORE the tool step and the
-    final answer, so once the turn settles it folds into the "Worked" row and
-    the markdown lives inside the collapsed trace.
-
-    :param base_url: Base URL of the local e2e server.
-    :param session_id: Session/conversation id.
-    :returns: None.
-    """
+    """Seed rich narration that folds behind a settled turn's Worked row."""
     thread = "resp_md_expand_jank"
     _seed_item(
         base_url,
@@ -239,35 +185,22 @@ def test_expanding_settled_fold_does_not_rerender_markdown(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Expanding a settled turn's fold must not jolt the markdown inside it.
-
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` from the local server.
-    :returns: None.
-    """
+    """Expanding a settled turn must not jolt its markdown."""
     base_url, session_id = seeded_session
     _seed_settled_markdown_turn(base_url, session_id)
 
-    # History path: navigate AFTER the turn settled so the fold mounts closed
-    # and its contents start unmounted (the state every reopened session is in).
+    # Navigate after settlement so the history fold mounts closed.
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
 
     fold = page.locator(_FOLD)
     expect(fold.first).to_be_visible(timeout=20_000)
-    # The final answer is outside the fold; the markdown is inside it.
     expect(page.get_by_text("All done - the answer is 42.")).to_be_visible()
 
-    # Give the page the beat a real reader spends on the answer before
-    # digging into the trace. This wait is not part of the assertion — the
-    # buggy renderer fails identically with or without it (the jolt happens
-    # on expand regardless) — it only de-flakes the fixed behavior on slow
-    # CI, where the folded trace's hidden diagram pre-render can lag the
-    # page load by a couple of seconds.
+    # Allow hidden diagram pre-rendering to finish on slow CI.
     page.wait_for_timeout(3_000)
 
-    # Sampler first, then the user's click, so the very first open frame is
-    # captured — the late diagram re-render lands a few hundred ms after it.
+    # Install before the click to capture the first open frame.
     page.evaluate(_INSTALL_SAMPLER)
     fold.locator('[data-slot="collapsible-trigger"]').first.click()
 
@@ -277,8 +210,7 @@ def test_expanding_settled_fold_does_not_rerender_markdown(
     open_frames = [f for f in frames if f["state"] == "open" and f["markerRelY"] is not None]
     assert open_frames, "fold never opened with the marker paragraph rendered"
 
-    # Sanity: the diagram must actually render, otherwise a broken mermaid
-    # pipeline would make the stability assertion pass vacuously.
+    # Prevent a broken Mermaid pipeline from passing vacuously.
     assert any(f["diagramH"] > 50 for f in frames), (
         "the mermaid diagram never rendered inside the expanded fold; "
         "the journey did not reach the state under test"
