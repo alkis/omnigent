@@ -10772,6 +10772,80 @@ async def test_patch_permission_mode_rejects_non_claude_session(
 
 
 @pytest.mark.parametrize(
+    "field,value,event_type,payload_key",
+    [
+        ("reasoning_effort", "high", "effort_change", "effort"),
+        ("model_override", "claude-opus-4-7", "model_change", "model"),
+    ],
+)
+async def test_patch_session_preference_forwards_only_when_value_changes(
+    client: httpx.AsyncClient,
+    field: str,
+    value: str,
+    event_type: str,
+    payload_key: str,
+) -> None:
+    """Repeated preference PATCHes do not reinject slash commands."""
+    from omnigent.runtime import set_runner_client
+
+    captured: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            body = json.loads(request.content) if request.content else None
+            captured.append(_ForwardedEffort(url=str(request.url), body=body))
+        return httpx.Response(204)
+
+    def _change_events(session_id: str) -> list[dict[str, Any] | None]:
+        return [
+            forwarded.body
+            for forwarded in captured
+            if forwarded.url.endswith(f"/v1/sessions/{session_id}/events")
+            and isinstance(forwarded.body, dict)
+            and forwarded.body.get("type") == event_type
+        ]
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        session_id = session["id"]
+        captured.clear()
+
+        changed = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={field: value},
+        )
+        assert changed.status_code == 200, changed.text
+        assert _change_events(session_id) == [{"type": event_type, payload_key: value}]
+
+        captured.clear()
+        unchanged = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={field: value},
+        )
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json()[field] == value
+        assert _change_events(session_id) == []
+
+        captured.clear()
+        cleared = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={field: "default"},
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()[field] is None
+        assert _change_events(session_id) == [{"type": event_type, payload_key: None}]
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+
+@pytest.mark.parametrize(
     "native_session,patch_effort,expected_persisted,expected_event_effort",
     [
         # (1) Native + claude-accepted level → POSTs effort_change.

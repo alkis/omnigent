@@ -2573,6 +2573,8 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        effort_changed = conv is None or conv.reasoning_effort != updated.reasoning_effort
+        model_changed = conv is None or conv.model_override != updated.model_override
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -2605,7 +2607,7 @@ def register_core_routes(
         # ``_forward_session_change_to_runner`` for the shared
         # runner-client fallback + non-2xx logging.
         live_forward = not body.silent
-        if live_forward and (effort is not None or clear_effort):
+        if live_forward and effort_changed and (effort is not None or clear_effort):
             await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -2615,7 +2617,7 @@ def register_core_routes(
                 # command.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
-        if live_forward and (model_override is not None or clear_model):
+        if live_forward and model_changed and (model_override is not None or clear_model):
             _model_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
