@@ -23,9 +23,24 @@ def record_dir(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
 def test_context_args_carry_record_video_dir(
     record_dir: Path,
     browser_context_args: dict[str, Any],
+    browser: Browser,
+    pytestconfig: pytest.Config,
 ) -> None:
-    """The sync-fixture context options must point Playwright at the record dir."""
-    assert browser_context_args.get("record_video_dir") == str(record_dir)
+    """Record to the environment default or the explicit pytest video directory."""
+    target = Path(browser_context_args["record_video_dir"])
+    if pytestconfig.getoption("video") == "off":
+        assert target == record_dir
+    context = browser.new_context(**browser_context_args)
+    try:
+        page = context.new_page()
+        page.goto("about:blank")
+        video = page.video
+        assert video is not None
+    finally:
+        context.close()
+    path = Path(video.path())
+    assert path.parent == target
+    assert path.stat().st_size > 0
 
 
 def test_sync_api_context_is_recorded(record_dir: Path, browser: Browser) -> None:
