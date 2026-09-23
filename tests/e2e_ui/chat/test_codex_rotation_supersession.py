@@ -1,25 +1,6 @@
-r"""UI journey: a Codex TUI ``/new`` must notify the superseded web conversation.
+"""A Codex /new must offer a continuation link in the superseded web conversation.
 
-Native Codex ``/new`` starts a fresh app-server thread; the codex-native
-forwarder rotates the Omnigent binding onto a replacement conversation and
-transfers the terminal. A user watching the OLD conversation in the web UI
-must be told what happened, exactly as claude-native's
-``_post_clear_supersession`` does after a ``/clear`` rotation: the client
-auto-redirects to the replacement conversation (the transient
-``session.superseded`` event) and the old transcript gains a durable assistant
-notice linking to it.
-
-Journey (real ``codex`` CLI, mock LLM): open the conversation, exchange one
-composer turn, switch to the Terminal view, run ``/new`` in the TUI, and wait
-for the rotation to land (the bridge state's ``session_id`` moves to the
-replacement). Then assert the old conversation's viewer is redirected and the
-old transcript links to the new conversation. While the bug is live the
-rotation completes silently, so the redirect assertion times out on the dead
-conversation's URL.
-
-Marked ``nightly``: boots a real codex CLI and drives its TUI, like
-``tests/e2e_ui/messages/test_native_codex_render_parity.py``.
-"""
+Drive the terminal and browser through the native session-rotation path."""
 
 from __future__ import annotations
 
@@ -62,22 +43,7 @@ _NOTICE_TIMEOUT_S = 30.0
 
 
 def _wait_for_rotation(old_session_id: str, *, timeout_s: float = _ROTATION_TIMEOUT_S) -> str:
-    """Wait until codex-native rotates the bridge onto a replacement session.
-
-    ``_create_thread_replacement_session`` rewrites the bridge state (keyed by
-    the original session id) with the replacement session id as the final
-    rotation step, so this is the harness's own signal that ``/new`` landed.
-    In the e2e_ui harness the runner is in-process on this machine, so the
-    file is directly readable.
-
-    :param old_session_id: The session id ``/new`` rotates away from (also the
-        codex-native bridge id).
-    :param timeout_s: Max seconds to wait for the rotation to land.
-    :returns: The replacement Omnigent session id.
-    :raises AssertionError: When no rotation lands within the budget — a
-        TUI-driving problem, distinct from the missing-notification bug this
-        test guards.
-    """
+    """Poll the original bridge until its state names a successor session."""
     deadline = time.monotonic() + timeout_s
     observed: str | None = None
     while time.monotonic() < deadline:
@@ -95,14 +61,7 @@ def _wait_for_rotation(old_session_id: str, *, timeout_s: float = _ROTATION_TIME
 
 
 def _wait_for_supersession_notice(base_url: str, old_session_id: str, new_session_id: str) -> None:
-    """Wait for the durable continuation notice on the superseded conversation.
-
-    :param base_url: Spawned server base URL.
-    :param old_session_id: The superseded conversation id.
-    :param new_session_id: The replacement conversation the notice must link.
-    :raises AssertionError: When no assistant message linking to the
-        replacement conversation appears within the budget.
-    """
+    """Wait for the durable continuation notice on the old conversation."""
     deadline = time.monotonic() + _NOTICE_TIMEOUT_S
     while time.monotonic() < deadline:
         for item in _ordered_message_items(base_url, old_session_id):

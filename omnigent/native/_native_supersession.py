@@ -1,16 +1,4 @@
-"""Shared supersession notice for native-harness session rotation.
-
-The claude-native, codex-native, and antigravity-native harnesses all move the
-Omnigent session binding onto a fresh conversation when the user starts a new
-vendor conversation in the pane (``/clear`` in Claude/Antigravity, ``/new`` in
-Codex). The abandoned OLD conversation must be told, or its web view is
-stranded: the "Working…" spinner never clears (its terminal moved to the new
-session, so the turn-end edge never arrives), no message links to where work
-continued, and a client actively viewing it never redirects.
-
-:func:`post_supersession_notice` is that notification, extracted from the
-claude-native forwarder so every rotation path shares one implementation.
-"""
+"""Notify the old conversation when a native harness rotates to its successor."""
 
 from __future__ import annotations
 

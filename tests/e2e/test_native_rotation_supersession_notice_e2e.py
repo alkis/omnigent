@@ -1,52 +1,7 @@
-"""Regression: native session rotation must notify the superseded conversation.
+"""Native rotation must notify the superseded conversation.
 
-All three rotation-capable native harnesses move the Omnigent session binding
-onto a fresh conversation when the user starts a new vendor conversation in the
-pane (``/new`` in Codex, ``/clear`` in Antigravity/Claude). Only ``claude-native``
-tells the abandoned OLD conversation about it: after rotating it calls
-``_post_clear_supersession`` (``omnigent/harnesses/claude_native/forwarder.py``),
-which posts three events to the OLD conversation's ``/events`` endpoint, in order:
-
-1. ``external_session_status: idle`` -- so the old conversation's "Working..."
-   spinner stops (its terminal moved to the new session, so it will never
-   receive the turn-end edge that would normally clear it);
-2. a persisted assistant ``external_conversation_item`` (a ``message``) linking
-   to the new conversation -- the durable record that survives reconnects;
-3. a transient ``external_session_superseded`` event the server republishes as
-   ``session.superseded`` (``reason="clear"``), so a client actively viewing the
-   old conversation auto-redirects.
-
-``codex-native`` and ``antigravity-native`` rotate the binding, transfer the
-terminal, and PATCH the old session's ``runner_id`` to ``""`` -- but post NONE of
-the three supersession events. So the old web conversation is stranded: its
-"Working..." spinner never clears, it gains no link to where work continued, and
-a user watching it never redirects.
-
-What this test drives
----------------------
-The user-facing failure is on the **web** surface (the old conversation view),
-triggered by a **terminal** action (``/new`` / ``/clear``). This test pins the
-gap at the harness-level producer boundary the fix touches: it drives the
-**real** codex/antigravity rotation entry points through a recording Omnigent
-client and asserts on the exact set of HTTP posts each rotation makes to the OLD
-session -- deterministically, and for BOTH harnesses in one place (e2e_ui has no
-real ``agy`` binary). The codex web half is additionally driven live end-to-end
-in ``tests/e2e_ui/chat/test_codex_rotation_supersession.py`` (real Codex
-``/new`` in the SPA terminal against the mock LLM, showing the stranded browser
-that never redirects). The web redirect/notice machinery the missing posts feed
-is present and already covered by
-``tests/e2e_ui/chat/test_session_superseded_redirect.py``; the bug is purely that
-codex/antigravity never emit the events.
-
-* ``test_claude_native_rotation_posts_supersession_notice`` is the positive
-  control -- it pins the three-post contract on the only producer that has it,
-  and passes today.
-* ``test_codex_native_rotation_posts_supersession_notice`` and
-  ``test_antigravity_native_rotation_posts_supersession_notice`` drive the real
-  codex/antigravity rotations and assert the SAME three posts land on the OLD
-  session. Both FAIL on buggy main (zero posts) and pass once the fix hoists the
-  supersession notice into the shared rotation paths.
-"""
+Drive the Codex and Antigravity rotation entry points with recorded writes from
+a fake HTTP client. This verifies event routing without a live server or TUI."""
 
 from __future__ import annotations
 
@@ -84,14 +39,7 @@ SUPERSESSION_EVENT_TYPES = frozenset({IDLE_STATUS, NOTICE_ITEM, SUPERSEDED_EVENT
 
 
 class _RecordingAP:
-    """httpx-shaped Omnigent client: answers the snapshot GET, records writes.
-
-    The rotation entry points fetch the old session snapshot (GET), create the
-    replacement (POST ``/v1/sessions``), and issue PATCH/POST calls to bind,
-    transfer the terminal, and (for the supersession notice) POST events to the
-    OLD session. Recording every call lets us assert exactly which supersession
-    events -- if any -- reached the old conversation.
-    """
+    """Fake HTTP client that supplies snapshots and records rotation writes."""
 
     def __init__(self) -> None:
         """Initialize with an empty call log."""
@@ -137,15 +85,7 @@ class _RecordingAP:
         return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
     def supersession_events_to_old(self) -> list[str]:
-        """Return supersession event types POSTed to the OLD session's /events.
-
-        :returns: The ordered ``type`` values of the supersession posts that
-            targeted ``/v1/sessions/conv_old/events`` (a subset of
-            :data:`SUPERSESSION_EVENT_TYPES`), e.g.
-            ``["external_session_status", "external_conversation_item",
-            "external_session_superseded"]`` after the fix, or ``[]`` on the
-            buggy build.
-        """
+        """Return supersession event types posted to the old session."""
         old_events_url = f"/v1/sessions/{OLD_SESSION}/events"
         return [
             str(body.get("type"))
@@ -193,15 +133,7 @@ async def test_claude_native_rotation_posts_supersession_notice() -> None:
 
 
 async def test_codex_native_rotation_posts_supersession_notice(tmp_path: Path) -> None:
-    """A Codex ``/new`` rotation must notify the superseded conversation.
-
-    Drives the real ``_maybe_rotate_session_on_thread_started`` with the exact
-    envelope Codex's app-server emits when the user runs ``/new`` -- a fresh,
-    non-ephemeral, top-level ``user`` thread. On buggy main the rotation happens
-    (a replacement session is created, the terminal transferred) but no
-    supersession events reach the old session, so this FAILS. It passes once the
-    fix posts the notice from the codex rotation path.
-    """
+    """A Codex thread-start rotation must notify the old conversation."""
     ap = _RecordingAP()
     codex_write_bridge_state(
         tmp_path,
@@ -251,14 +183,7 @@ async def test_codex_native_rotation_posts_supersession_notice(tmp_path: Path) -
 
 
 async def test_antigravity_native_rotation_posts_supersession_notice(tmp_path: Path) -> None:
-    """An Antigravity ``/clear`` rotation must notify the superseded conversation.
-
-    Drives the real ``_rotate_session_for_cascade`` (the agy reader's ``/clear``
-    rotation entry point) against a freshly minted cascade. On buggy main it
-    rotates the binding + transfers the terminal but posts no supersession events
-    to the old session, so this FAILS. It passes once the fix posts the notice
-    from the antigravity rotation path.
-    """
+    """An Antigravity cascade rotation must notify the old conversation."""
     ap = _RecordingAP()
     agy_write_bridge_state(
         tmp_path,

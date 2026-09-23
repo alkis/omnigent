@@ -1,34 +1,7 @@
-r"""UI journey: an agy TUI ``/clear`` must notify the superseded web conversation.
+"""An Antigravity /clear must update the superseded web conversation.
 
-Antigravity-native ``/clear`` mints a fresh cascade on the live agy process;
-the RPC reader detects the newer-active sibling and rotates the Omnigent
-binding onto a replacement conversation, transferring the terminal. A user
-watching the OLD conversation in the web UI must be told, exactly as
-claude-native's ``_post_clear_supersession`` does: the client auto-redirects
-to the replacement conversation (the transient ``session.superseded`` event)
-and the old transcript gains a durable assistant notice linking to it.
-
-The real ``agy`` CLI is OAuth-only (interactive Google sign-in), which CI
-cannot provision, so this drives the REAL runner launch, cold-start, reader,
-and rotation paths against a scripted agy stand-in
-(``tests/fixtures/antigravity/fake_agy.py``): a fake ``agy`` binary on the
-runner's PATH that renders agy's composer chrome in the tmux pane and serves
-agy's loopback connect-RPC surface. Typing ``/clear`` into its TUI mints a new
-cascade just like the vendor CLI, and everything downstream of that signal —
-detection, rotation, terminal transfer, and the missing supersession notice —
-is the genuine omnigent code under test.
-
-Journey: open the conversation, exchange one turn typed in the Terminal view
-(mirrored to the web transcript by the RPC reader), run ``/clear`` in the TUI,
-and wait for the rotation to land (the bridge state's ``session_id`` moves to
-the replacement). Then assert the old conversation's viewer is redirected and
-the old transcript links to the new conversation. While the bug is live the
-rotation completes silently, so the redirect assertion times out on the dead
-conversation's URL.
-
-Marked ``nightly``: boots a dedicated server + runner and drives a TUI, like
-``tests/e2e_ui/messages/test_native_codex_render_parity.py``.
-"""
+Drive the real server, runner, reader and browser with a scripted agy stand-in;
+verify that the old conversation offers navigation to its successor."""
 
 from __future__ import annotations
 
@@ -87,17 +60,7 @@ _MIRROR_TIMEOUT_MS = 60_000
 
 
 def _create_native_antigravity_session(base_url: str, runner_id: str) -> str:
-    """Register the ``antigravity-native`` wrapper agent and bind its session.
-
-    Mirrors ``_create_native_codex_session``: reuses the exact terminal-first
-    spec ``omnigent antigravity`` ships and stamps the same wrapper /
-    terminal-first labels, so binding triggers the runner's antigravity-native
-    auto-bootstrap (agy terminal launch, cold-start, RPC reader).
-
-    :param base_url: Spawned server base URL.
-    :param runner_id: The token-bound runner id to bind.
-    :returns: The new session/conversation id.
-    """
+    """Register and bind an Antigravity wrapper session."""
     from omnigent._wrapper_labels import (
         ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
         UI_MODE_LABEL_KEY,
@@ -140,13 +103,7 @@ def fake_agy_antigravity_session(
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
 ) -> Iterator[tuple[str, str]]:
-    """Spawn a dedicated server + runner whose ``agy`` is the scripted stand-in.
-
-    A dedicated server keeps the fake-agy PATH shim and the fake
-    ``GEMINI_API_KEY`` (which satisfies the antigravity-native credential
-    readiness probe) away from the shared ``live_server`` used by unrelated
-    tests.
-    """
+    """Run an isolated server and runner with the scripted agy executable."""
     if request.config.getoption("--ui-base-url"):
         pytest.skip("fake-agy antigravity e2e requires an isolated spawned server")
     if shutil.which("tmux") is None:
@@ -285,14 +242,7 @@ def fake_agy_antigravity_session(
 
 
 def _wait_for_cold_start(session_id: str, *, timeout_s: float = _COLD_START_TIMEOUT_S) -> str:
-    """Wait until the runner's cold-start binds agy's real cascade id.
-
-    :param session_id: The antigravity-native session id (also its bridge id).
-    :param timeout_s: Max seconds to wait for the placeholder to be replaced.
-    :returns: The bound cascade/conversation id.
-    :raises AssertionError: When the cold-start never lands — a launch/driving
-        problem, distinct from the missing-notification bug this test guards.
-    """
+    """Wait for cold-start to bind the real cascade ID."""
     deadline = time.monotonic() + timeout_s
     observed: str | None = None
     while time.monotonic() < deadline:
@@ -310,17 +260,7 @@ def _wait_for_cold_start(session_id: str, *, timeout_s: float = _COLD_START_TIME
 
 
 def _wait_for_rotation(old_session_id: str, *, timeout_s: float = _ROTATION_TIMEOUT_S) -> str:
-    """Wait until the reader rotates the bridge onto a replacement session.
-
-    ``_rotate_session_for_cascade`` rewrites the bridge state (keyed by the
-    original session id) with the replacement session id as its final step, so
-    this is the harness's own signal that ``/clear`` rotation landed.
-
-    :param old_session_id: The session id ``/clear`` rotates away from.
-    :param timeout_s: Max seconds to wait for the rotation to land.
-    :returns: The replacement Omnigent session id.
-    :raises AssertionError: When no rotation lands within the budget.
-    """
+    """Poll the original bridge until its state names a successor session."""
     deadline = time.monotonic() + timeout_s
     observed: str | None = None
     while time.monotonic() < deadline:
