@@ -28,6 +28,7 @@ _STABLE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SEND_TEXT = "sentinel-stable-id-e2e verify this goes through"
 _COMPOSER_LABEL = "Message the agent"
 _RETRY_TEXT = "sentinel-retry-e2e the first post never gets an answer"
+_RELOAD_TEXT = "sentinel-reload-e2e this message must survive a refresh"
 
 
 def test_message_post_carries_stable_id(
@@ -136,3 +137,61 @@ def test_lost_first_post_is_resent_with_the_same_stable_id(
     expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)
     expect(bubble).to_have_count(1)
     expect(composer).to_have_value("")
+
+
+def test_parked_send_survives_a_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A send that could not reach the server comes back after a reload.
+
+    Every ``POST /events`` is aborted at the network layer until the page has
+    been reloaded, so the send parks ("Sending · Retry · Cancel"). After the
+    reload the message must still be in the transcript, and once the network
+    is back it must be re-sent with the *same* ``stable_id`` — not lost, and
+    not duplicated.
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    stable_ids: list[str] = []
+    state = {"block": True}
+
+    def _intercept(route, request):  # type: ignore[no-untyped-def]
+        if f"/v1/sessions/{session_id}/events" in request.url and request.method == "POST":
+            body = json.loads(request.post_data or "{}")
+            if body.get("type") == "message":
+                stable_ids.append(body["data"]["stable_id"])
+                if state["block"]:
+                    route.abort("failed")
+                    return
+        route.continue_()
+
+    page.route("**/v1/sessions/*/events", _intercept)
+
+    composer = page.get_by_label(_COMPOSER_LABEL)
+    expect(composer).to_be_visible()
+    composer.fill(_RELOAD_TEXT)
+    page.get_by_role("button", name="Send", exact=True).click()
+
+    bubble = page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+        has_text=_RELOAD_TEXT
+    )
+    expect(bubble).to_be_visible(timeout=10_000)
+    expect(page.locator('[data-testid="send-delivery"][data-state="stalled"]')).to_be_visible(
+        timeout=15_000
+    )
+
+    page.reload()
+    # Still here after the reload, still parked (the network is still down).
+    expect(bubble).to_be_visible(timeout=15_000)
+    expect(page.locator('[data-testid="send-delivery"]')).to_be_visible(timeout=15_000)
+
+    # Network back: the revived send goes through with the original id.
+    state["block"] = False
+    page.get_by_role("button", name="Retry").click()
+    expect(page.locator('[data-testid="send-delivery"]')).to_have_count(0, timeout=15_000)
+    expect(bubble).to_have_count(1)
+    assert len(stable_ids) >= 2, f"expected the parked send to be re-sent: {stable_ids}"
+    assert len(set(stable_ids)) == 1, f"re-send changed the stable_id: {set(stable_ids)}"
+    expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)

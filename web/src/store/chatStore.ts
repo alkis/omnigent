@@ -84,6 +84,7 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
+import { forgetPendingSend, persistPendingSend, readPendingSends } from "@/lib/pendingSends";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -1367,6 +1368,134 @@ function markPendingSend(
   }));
 }
 
+/**
+ * Keep a parked or refused bubble across a reload. Attachments that never
+ * uploaded (still on `pending:` placeholder ids) have no server copy to
+ * re-send, so such a bubble stays in tab memory only.
+ */
+function persistParkedBubble(sessionId: string, tempId: string): void {
+  const bubble = setterForState(sessionId)?.pendingUserMessages.find((p) => p.tempId === tempId);
+  if (bubble?.stableId === undefined) return;
+  const unuploaded = bubble.content.some(
+    (b) =>
+      (b.type === "input_image" || b.type === "input_file") &&
+      b.file_id?.startsWith(PENDING_FILE_PREFIX) === true,
+  );
+  if (unuploaded) return;
+  persistPendingSend(sessionId, {
+    stableId: bubble.stableId,
+    content: bubble.content,
+    ...(bubble.createdAtS !== undefined ? { createdAtS: bubble.createdAtS } : {}),
+    ...(bubble.author !== undefined ? { author: bubble.author } : {}),
+  });
+}
+
+function forgetParkedBubble(sessionId: string, tempId: string): void {
+  const bubble = setterForState(sessionId)?.pendingUserMessages.find((p) => p.tempId === tempId);
+  if (bubble?.stableId !== undefined) forgetPendingSend(sessionId, bubble.stableId);
+}
+
+/**
+ * The server accepted a send (first attempt or re-send): the message is now
+ * the server's. Drop the optimistic bubble when the response names a copy
+ * already on screen — a committed item the stream delivered, or a
+ * snapshot-replayed pending entry — otherwise mark it posted and let its
+ * consumed event pop it as usual.
+ */
+function settleAcceptedSend(
+  sessionId: string,
+  tempId: string,
+  postResult: Awaited<ReturnType<typeof postEvent>>,
+): void {
+  forgetParkedBubble(sessionId, tempId);
+  setterFor(sessionId)((s) => {
+    const duplicateOnScreen =
+      (postResult.itemId !== undefined && hasCommittedItem(s.blocks, postResult.itemId)) ||
+      (postResult.pendingId !== undefined &&
+        s.pendingUserMessages.some(
+          (p) => p.tempId === postResult.pendingId && p.tempId !== tempId,
+        ));
+    if (duplicateOnScreen) {
+      return { pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId) };
+    }
+    return {
+      pendingUserMessages: s.pendingUserMessages.map((p) =>
+        p.tempId === tempId ? { ...p, posted: true, stalled: false, sendError: undefined } : p,
+      ),
+    };
+  });
+}
+
+async function deliverRevivedSend(
+  sessionId: string,
+  tempId: string,
+  content: MessageContentBlock[],
+  stableId: string,
+): Promise<void> {
+  const postResult = await postEvent(sessionId, {
+    type: "message",
+    data: { role: "user", content, stable_id: stableId },
+  });
+  if (postResult.denied) {
+    forgetPendingSend(sessionId, stableId);
+    setterFor(sessionId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+    }));
+    return;
+  }
+  settleAcceptedSend(sessionId, tempId, postResult);
+  queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+}
+
+/**
+ * Revive sends this tab parked before a reload. Called on a cold load once
+ * the snapshot's pending entries and history are in place: a record whose
+ * message the server already shows (a replayed pending entry with the same
+ * content, or a committed copy) is dropped; the rest come back as stalled
+ * bubbles and are re-sent at once with their original stable id.
+ */
+export function rehydratePersistedSends(conversationId: string): void {
+  const records = readPendingSends(conversationId);
+  if (records.length === 0) return;
+  const state = setterForState(conversationId);
+  if (state === null) return;
+  const committedTexts = committedUserTextsOf(state.blocks);
+  const serverKeys = state.pendingUserMessages.map((p) => contentKeyOf(p.content));
+  const revived: PendingUserMessage[] = [];
+  for (const record of records) {
+    if (state.pendingUserMessages.some((p) => p.stableId === record.stableId)) continue;
+    const twin = serverKeys.indexOf(contentKeyOf(record.content));
+    const text = messageContentText(record.content);
+    if (twin !== -1 || (text !== "" && committedTexts.some((c) => c.endsWith(text)))) {
+      if (twin !== -1) serverKeys.splice(twin, 1);
+      forgetPendingSend(conversationId, record.stableId);
+      continue;
+    }
+    pendingSeq += 1;
+    const tempId = `pend_${pendingSeq}`;
+    revived.push({
+      tempId,
+      content: record.content,
+      stableId: record.stableId,
+      stalled: true,
+      ...(record.createdAtS !== undefined ? { createdAtS: record.createdAtS } : {}),
+      ...(record.author !== undefined ? { author: record.author } : {}),
+    });
+    pendingSendRetries.set(tempId, {
+      sessionId: conversationId,
+      deliver: () => deliverRevivedSend(conversationId, tempId, record.content, record.stableId),
+      timer: null,
+      inFlight: false,
+      latchOnSuccess: true,
+    });
+  }
+  if (revived.length === 0) return;
+  setterFor(conversationId)((s) => ({
+    pendingUserMessages: [...s.pendingUserMessages, ...revived],
+  }));
+  void retryStalledSends(conversationId);
+}
+
 function clearPendingSendRetry(tempId: string): void {
   const entry = pendingSendRetries.get(tempId);
   if (entry?.timer) clearTimeout(entry.timer);
@@ -1387,6 +1516,7 @@ function parkStalledSend(
   latchOnSuccess: boolean,
 ): void {
   markPendingSend(sessionId, tempId, { stalled: true });
+  persistParkedBubble(sessionId, tempId);
   // The turn is not running anywhere yet; don't leave the shimmer on.
   if (latchOnSuccess) settleSendIdle(setterFor(sessionId));
   pendingSendRetries.set(tempId, {
@@ -2477,6 +2607,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // bubble. Settle local state from the POST response instead of
         // depending on the live stream being connected.
         if (postResult.denied) {
+          forgetParkedBubble(sessionId, tempId);
           // Target the session this send posted to: the user may have navigated
           // away while the POST was open, and settling the VISIBLE conversation
           // would clobber an unrelated chat's composer state.
@@ -2499,24 +2630,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           // what releases this conversation's entry for eviction, since the
           // server can now replay it. The bubble keeps rendering until its
           // consumed event pops it.
-          setterFor(sessionId)((s) => {
-            // A re-send answered with an item the stream already delivered:
-            // the first attempt landed and only its response was lost. The
-            // committed copy is on screen and its consumed event has fired,
-            // so drop the optimistic bubble rather than wait for one.
-            if (postResult.itemId !== undefined && hasCommittedItem(s.blocks, postResult.itemId)) {
-              return {
-                pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-              };
-            }
-            return {
-              pendingUserMessages: s.pendingUserMessages.map((p) =>
-                p.tempId === tempId
-                  ? { ...p, posted: true, stalled: false, sendError: undefined }
-                  : p,
-              ),
-            };
-          });
+          settleAcceptedSend(sessionId, tempId, postResult);
         }
         // Note: native-terminal messages return a `pending_id`, but the
         // optimistic bubble deliberately keeps its client temp id as its
@@ -2601,6 +2715,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           stalled: false,
           sendError: { message, code },
         });
+        persistParkedBubble(postedSessionId, tempId);
         pendingSendRetries.set(tempId, {
           sessionId: postedSessionId,
           deliver,
@@ -2666,6 +2781,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const sessionId = pendingSendRetries.get(tempId)?.sessionId ?? get().conversationId;
     clearPendingSendRetry(tempId);
     if (sessionId === null) return;
+    forgetParkedBubble(sessionId, tempId);
     // A bubble still inside its send's own retry loop is dropped here too; the
     // loop notices on its next failure and releases the turn latch.
     setterFor(sessionId)((s) => ({
@@ -4441,6 +4557,9 @@ async function bindStream(
       };
     });
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
+    // Sends this tab parked before a reload come back and are re-sent now that
+    // the snapshot shows what the server already has.
+    if (hydratePending) rehydratePersistedSends(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (isConversationDisposed(id)) return;

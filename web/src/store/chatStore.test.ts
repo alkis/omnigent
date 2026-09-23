@@ -15,6 +15,7 @@
 // Session metadata and item pages are shimmed through `seedSession`
 // helpers so tests can model capped snapshots and full transcripts.
 
+import { persistPendingSend, readPendingSends } from "@/lib/pendingSends";
 import type * as IdentityModule from "@/lib/identity";
 
 import { type InfiniteData, QueryClient } from "@tanstack/react-query";
@@ -83,6 +84,7 @@ import {
   type PendingUserMessage,
   bindConversationForTest,
   releaseConversation,
+  rehydratePersistedSends,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
@@ -5316,6 +5318,7 @@ describe("chatStore — send (lost response re-send)", () => {
     new Set(bodies.map((b) => (b as { data: { stable_id: string } }).data.stable_id));
 
   beforeEach(() => {
+    sessionStorage.clear();
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -5427,6 +5430,70 @@ describe("chatStore — send (lost response re-send)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps a parked send across a reload and re-sends it with the same stable_id", async () => {
+    vi.useFakeTimers();
+    try {
+      installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+      const sending = useChatStore.getState().send("survive a reload", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(8_000);
+      await sending;
+      const parked = useChatStore.getState().pendingUserMessages[0]!;
+      expect(parked.stalled).toBe(true);
+      // Parked → remembered for this tab, keyed by the conversation.
+      expect(readPendingSends("conv_existing")).toEqual([
+        expect.objectContaining({ stableId: parked.stableId, content: parked.content }),
+      ]);
+
+      // "Reload": tab memory is gone, the network is back, the cold load revives it.
+      useChatStore.setState({ pendingUserMessages: [], status: "idle" });
+      const bodies = installFlakyPost(0, () =>
+        mockResponse({ queued: true, item_id: "msg_revived" }),
+      );
+      rehydratePersistedSends("conv_existing");
+      const revived = useChatStore.getState().pendingUserMessages[0]!;
+      expect(revived).toMatchObject({ stableId: parked.stableId, stalled: true });
+      expect(revived.tempId).not.toBe(parked.tempId);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const state = useChatStore.getState();
+      expect(bodies).toHaveLength(1);
+      expect(stableIdsOf(bodies)).toEqual(new Set([parked.stableId]));
+      expect(state.pendingUserMessages[0]).toMatchObject({ tempId: revived.tempId, posted: true });
+      expect(state.status).toBe("streaming");
+      expect(readPendingSends("conv_existing")).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not revive a remembered send the server already shows", () => {
+    const content = [{ type: "input_text" as const, text: "already there" }];
+    // The first attempt landed after all: the snapshot replays it as a pending entry.
+    persistPendingSend("conv_existing", { stableId: "f".repeat(32), content });
+    useChatStore.setState({ pendingUserMessages: [{ tempId: "pending_srv_1", content }] });
+    rehydratePersistedSends("conv_existing");
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pending_srv_1",
+    ]);
+    expect(readPendingSends("conv_existing")).toEqual([]);
+
+    // Or it was committed while the tab was away.
+    persistPendingSend("conv_existing", { stableId: "e".repeat(32), content });
+    useChatStore.setState({
+      pendingUserMessages: [],
+      blocks: [
+        {
+          type: "user_message",
+          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: "msg_c" },
+          content,
+        } as UserMessageBlock,
+      ],
+    });
+    rehydratePersistedSends("conv_existing");
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_existing")).toEqual([]);
   });
 });
 
