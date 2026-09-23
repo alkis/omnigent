@@ -143,6 +143,10 @@ run identity, plan template, and plan-ready signal format. Otherwise continue th
 normal workflow without a planning pause. The coordinator is automated; do not
 ask a person to register the plan, resume the session, or collect the account.
 
+For a prepared runtime, consult the [driving recipes](recipes.md) for environment
+checks and supported user entry points. Doctor findings can inform the plan;
+a connectivity smoke test never replaces the reported journey or proves its outcome.
+
 Use the captured report and dated discussion to reconstruct the journey. Keep
 reported requirements separate from inferences and unknowns. Missing attachments,
 partial discussion, and later clarifications must remain visible; do not rewrite

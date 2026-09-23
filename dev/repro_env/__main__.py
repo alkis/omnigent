@@ -6,12 +6,50 @@ import argparse
 import json
 import os
 import subprocess
+import sys
+import uuid
 from pathlib import Path
 
 import httpx
 
 from .runtime import serve
 from .transport import Relay
+
+RECIPES = {
+    "claude-native": (
+        "test_native_claude_render_parity.py::test_native_claude_message_render_parity"
+    ),
+    "codex-native": "test_native_codex_render_parity.py::test_native_codex_message_render_parity",
+    "openai-agents": "test_message_render_parity.py::test_custom_agent_message_render_parity",
+}
+
+
+def smoke(output: Path, harness: str) -> int:
+    from .doctor import doctor
+
+    destination = output / "smoke" / f"{harness}-{uuid.uuid4().hex}"
+    destination.mkdir(parents=True, mode=0o700)
+    print(f"Smoke evidence: {destination}", flush=True)
+    if doctor(output, harness, [], destination / "doctor.json"):
+        return 1
+    return execute(
+        output,
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-o",
+            "addopts=",
+            "-p",
+            "dev.repro_env.evidence",
+            f"tests/e2e_ui/messages/{RECIPES[harness]}",
+            "--ui-skip-build",
+            "--video=on",
+            "--tracing=on",
+            f"--output={destination / 'browser'}",
+            f"--repro-evidence={destination}",
+        ],
+    )
 
 
 def execute(output: Path, command: list[str]) -> int:
@@ -51,6 +89,11 @@ def main() -> int:
     run.add_argument("command", nargs=argparse.REMAINDER)
     commands.add_parser("stop")
     commands.add_parser("status")
+    check = commands.add_parser("doctor")
+    check.add_argument("--harness", choices=RECIPES, required=True)
+    check.add_argument("--requirements", type=Path)
+    probe = commands.add_parser("smoke")
+    probe.add_argument("--harness", choices=RECIPES, required=True)
     args = parser.parse_args()
     output = args.output.resolve()
     if args.action == "serve":
@@ -61,6 +104,15 @@ def main() -> int:
     if args.action == "status":
         print((output / "environment.json").read_text())
         return 0
+    if args.action == "doctor":
+        from .doctor import doctor
+
+        requirements = json.loads(args.requirements.read_text()) if args.requirements else []
+        return doctor(
+            output, args.harness, requirements, output / f"doctor-{uuid.uuid4().hex}.json"
+        )
+    if args.action == "smoke":
+        return smoke(output, args.harness)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("exec requires a command after --")
