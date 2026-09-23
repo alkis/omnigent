@@ -1,33 +1,10 @@
-"""E2E regression: forking a native session across DIFFERENT hosts.
+"""Cross-host native forks must drop the source-host resume directive.
 
-Journey: start a claude-native session bound to host A and run a turn (Claude
-assigns a host-local transcript; the wrapper bridge reports its id via
-``PATCH /v1/sessions``), then clone the session onto a DIFFERENT online host B
-via the Clone dialog. The clone must open with the prior conversation history,
-not a blank terminal.
-
-Failure mode guarded here: the fork's one-shot resume directive
-(``FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY``) names the source's transcript on
-host A. An external fork is created UNBOUND — the target host is picked
-afterwards via ``POST /v1/hosts/{host_id}/runners`` — so the directive is
-stamped before the host is known and must be re-evaluated at bind time. Bound
-to a different host it routes the runner into a doomed clone of a transcript
-that isn't there (launches fresh, silently losing all history) and blocks the
-cross-host-safe rebuild-from-items fallback, which requires the directive to
-be absent. A managed fork already skips the directive for the same reason.
-
-Contract asserted: a native fork bound to a host other than its source's must
-NOT carry the host-local resume directive (while keeping the carry-history
-marker), so the runner rebuilds history from the copied Omnigent items.
-
-Scope: drives the real cross-host path — a real ``omnigent server``, two real
-host daemons (separate ``HOME``\\ s => two distinct hosts), the real fork and
-bind routes — and asserts on the persisted directive, the direct cause of the
-history loss. Rendering the visible symptom (the blank terminal) additionally
-needs an interactive Claude login anchored to the real ``$HOME``; that layer
-is covered by the ``OMNIGENT_E2E_CLAUDE_NATIVE``-gated
-``test_host_claude_native_fork_e2e``. Hermetic: dummy LLM key, no turn runs.
-"""
+Run a real server and two host daemons with separate homes, fork a native
+session, then bind it to the other host. Assert the persisted directive is
+removed while the carry-history marker remains. This enables rebuilding
+from copied items but does not execute a model turn or verify rendered
+history. That layer requires the gated test_host_claude_native_fork_e2e."""
 
 from __future__ import annotations
 

@@ -28,7 +28,12 @@ from pydantic import BaseModel
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.db.utils import now_epoch
-from omnigent.debug_logging import add_audit_attrs
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_session_id,
+)
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -580,27 +585,15 @@ def _drop_cross_host_fork_resume_directive(
     conv: Conversation,
     host_id: str,
 ) -> None:
-    """Drop a fork's host-local native-resume directive on a cross-host bind.
+    """Drop a native fork's local-transcript directive when binding to another host.
 
-    The directive (:data:`FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY`) tells the
-    runner to clone the fork source's LOCAL native transcript — a file that
-    exists only on the source's host. An external fork is created unbound, so
-    the directive is stamped before the target host is known; when the fork
-    then binds to a DIFFERENT host, the clone is doomed (the runner finds no
-    transcript and launches fresh, silently losing all carried history) and
-    the directive's presence blocks the cross-host-safe rebuild-from-items
-    path. Re-evaluate it here, at bind time: a fork bound to a host other
-    than its source's drops the directive — mirroring the managed-fork skip
-    at fork time — so the runner rebuilds history from the copied items.
+    External forks are created unbound, so the target becomes known here.
+    Removing the directive enables rebuild-from-items. Keep it for same-host
+    binds or unknown source hosts, where the transcript may remain accessible.
 
-    Conservative on unknowns: a same-host bind keeps the higher-fidelity
-    transcript clone, and a missing source session or unbound source host
-    leaves the directive untouched (the transcript may still be reachable).
-
-    :param conversation_store: Store holding the session rows and labels.
-    :param conv: The session being bound (labels as loaded at launch).
-    :param host_id: The host the session is being bound to.
-    """
+    :param conversation_store: Store holding session rows and labels.
+    :param conv: Fork being bound, with its launch-time labels.
+    :param host_id: Target host."""
     if conv.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) is None:
         return
     source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
@@ -855,6 +848,8 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        set_current_session_id(body.session_id)
+        add_audit_attrs(session_id=body.session_id, host_id=host_id)
 
         # W6: validate the requested workspace against the agent's
         # os_env.cwd sandbox boundary BEFORE binding — the same check
@@ -932,6 +927,15 @@ def create_hosts_router(
 
         async def _rollback_failed_launch() -> None:
             """Clear state created by a failed runner launch."""
+            _logger.error(
+                "Runner launch failed; clearing binding",
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=body.session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                ),
+            )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
@@ -980,6 +984,17 @@ def create_hosts_router(
                     workspace = worktree.worktree_path
                     git_branch = worktree.branch
 
+            try:
+                await host_registry.admit_launch(
+                    conn,
+                    body.session_id,
+                    allow_unbound=True,
+                    transfer_from_host_id=target.conv.host_id,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
+
             bound = await asyncio.to_thread(
                 conversation_store.set_runner_id,
                 body.session_id,
@@ -1026,6 +1041,18 @@ def create_hosts_router(
             host_id,
         )
 
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=body.session_id,
+                runner_id=runner_id,
+                operation="launch",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -1037,6 +1064,11 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                inference_config=(
+                    target.conv.inference_snapshot["runtime_config"]
+                    if target.conv.inference_snapshot
+                    else None
+                ),
             )
         )
         try:
@@ -1635,7 +1667,7 @@ def create_hosts_router(
         :param path: Absolute path inside the repo on the host to list
             worktrees for, e.g. ``"/Users/alice/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
-            is_main, detached}, ...]}`` (main first).
+            is_main, detached, updated_at?}, ...]}`` (main first).
         :raises HTTPException: 404 if host not found, 403 if not owned
             by caller, 409 if host is offline/unresponsive, 400 on path
             validation or a non-git path.

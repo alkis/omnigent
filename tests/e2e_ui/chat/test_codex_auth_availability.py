@@ -183,9 +183,11 @@ async def _register_routes(
 
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/agents", handle_agents)
-    # Registered after the broad globs so it wins the kind=any discovery scan;
+    # Registered after the broad globs so it wins the visibility=mine discovery scan;
     # the bare conversation-list GET still falls through to the real server.
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 async def _open_entry_config(page, agent_id: str) -> None:
@@ -327,17 +329,15 @@ async def _drive_codex_badge(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Polly auto-selects (sole agent); its Agent Harness options live in
-            # the gear config modal's Select. Radix mirrors the selected item's
-            # content in the trigger, so a badge can match twice — take .first.
-            await _open_entry_config(page, "ag_polly_e2e")
-            badge = page.get_by_test_id("new-chat-landing-harness-warning-codex").first
-            await expect(badge).to_be_visible(timeout=30_000)
-            # This test doesn't enable harness_install in OMNIGENT_FEATURES, so the
-            # picker runs on the feature-OFF default — where the badge keeps the
-            # original per-reason text ("needs auth"). (With the feature ON the
-            # badge collapses to a single "needs setup" and the reason moves into
-            # the setup dialog.)
-            await expect(badge).to_contain_text("needs auth")
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(page.get_by_test_id("new-chat-landing-agent-warning")).to_be_visible()
+            await picker.hover()
+            await expect(page.get_by_test_id("new-chat-landing-agent-tooltip")).to_contain_text(
+                f"Polly needs Codex authentication on {_HOST_NAME} — "
+                "run codex login on that machine."
+            )
+            await picker.click()
+            row = page.get_by_test_id("new-chat-landing-agent-ag_polly_e2e")
+            await expect(row).to_have_attribute("aria-disabled", "true")
         finally:
             await browser.close()
