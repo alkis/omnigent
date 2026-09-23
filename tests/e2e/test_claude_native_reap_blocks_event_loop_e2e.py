@@ -1,24 +1,7 @@
-"""End-to-end regression: claude-native failed-turn cleanup blocks the event loop.
+"""Failed-turn cleanup must keep heartbeats responsive while tmux blocks.
 
-``ClaudeNativeExecutor._reap_failed_turn()`` calls ``kill_session(...,
-timeout_s=1.0)`` synchronously from the async ``run_turn`` coroutine. The
-``timeout_s`` argument only bounds waiting for the ``tmux.json``
-advertisement; the actual ``tmux kill-session`` subprocess is bounded by
-``_TMUX_SEND_TIMEOUT_S`` (10s). A slow or unresponsive tmux server therefore
-stalls the whole event loop — heartbeats, steering-message delivery, and
-cancellation on that loop cannot advance until the subprocess returns.
-
-This test drives the real executor and the real bridge cleanup path
-(``kill_session`` → ``_wait_for_tmux_info`` → ``_run_tmux`` →
-``subprocess.run``). The only fault injections are the two the report
-prescribes: a ``tmux`` shim on PATH that stands in for a slow tmux server
-(its ``kill-session`` blocks), and the injection helper raising
-``ClaudePromptTimeout`` — the exact exception the production readiness gate
-raises when Claude's input box never renders — to route ``run_turn`` into
-``_reap_failed_turn``. A heartbeat coroutine on the same loop must keep
-ticking while cleanup waits on tmux; today it freezes for the full duration
-of the kill-session subprocess.
-"""
+The real executor/bridge calls a slow tmux shim; delivery is forced to time out.
+This measures elapsed time without a live Claude process or provider."""
 
 from __future__ import annotations
 
@@ -53,17 +36,7 @@ _HEARTBEAT_INTERVAL_S = 0.01
 
 
 def _write_slow_tmux_shim(shim_dir: Path, kill_marker: Path) -> Path:
-    """
-    Install a ``tmux`` shim that behaves like a slow tmux server.
-
-    ``kill-session`` blocks for ``_SLOW_KILL_S`` before succeeding and
-    touches ``kill_marker`` so the test can prove the real cleanup
-    subprocess ran; every other tmux subcommand succeeds immediately.
-
-    :param shim_dir: Directory placed at the front of ``PATH``.
-    :param kill_marker: File the shim touches after the slow kill.
-    :returns: Path to the executable shim.
-    """
+    """Write a tmux shim whose delayed kill-session marks successful cleanup."""
     shim = shim_dir / "tmux"
     shim.write_text(
         "#!/bin/sh\n"
@@ -85,16 +58,7 @@ async def test_reap_failed_turn_does_not_stall_event_loop(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    Heartbeats keep ticking while claude-native cleanup waits on tmux.
-
-    Reproduces the defect: after a prompt-delivery timeout,
-    ``_reap_failed_turn`` runs ``tmux kill-session`` synchronously on the
-    event loop, so a heartbeat coroutine on the same loop cannot advance
-    until the (up to 10s) subprocess returns. The turn must still end in
-    ``ExecutorError`` and cleanup must still complete before that error is
-    yielded — offloading must not skip or orphan the kill.
-    """
+    """Heartbeats must keep ticking while failed-turn cleanup waits for the tmux shim."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     # A real advertisement, so kill_session's _wait_for_tmux_info gate
@@ -123,18 +87,7 @@ async def test_reap_failed_turn_does_not_stall_event_loop(
         content: str,
         timeout_s: float = 30.0,
     ) -> None:
-        """
-        Stand in for a readiness failure: the production gate's exception.
-
-        :param bridge_dir_arg: Bridge directory passed by the executor.
-        :param content: Text the executor tried to deliver.
-        :param timeout_s: Readiness timeout (unused — the fake fails fast
-            instead of spending the real gate's 30s).
-        :returns: None. Always raises.
-        :raises ClaudePromptTimeout: Unconditionally, exactly as
-            ``_wait_for_claude_prompt_ready`` does when Claude's input box
-            never renders.
-        """
+        """Raise the same exception as the production readiness timeout."""
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("Claude's input box never rendered; message not delivered.")
 
