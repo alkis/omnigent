@@ -1,11 +1,4 @@
-"""Bounded retry of transient HTTP 429 throttles on native request paths.
-
-The Omnigent server or its ingress can transiently rate-limit a request
-(HTTP 429, e.g. ``RESOURCE_EXHAUSTED``). Native startup and policy
-requests treat an explicit 429 as retryable within a bounded budget,
-honouring a bounded ``Retry-After`` hint. Every other 4xx stays final,
-and transport errors keep the caller's existing handling.
-"""
+"""Bound retries of transient HTTP 429 responses on native request paths."""
 
 from __future__ import annotations
 

@@ -1,49 +1,7 @@
-"""E2E regression: transient HTTP 429 must be retried on native request paths.
+"""Retry one transient HTTP 429 on native startup, runner binding and policy checks.
 
-When the Omnigent server or its ingress transiently
-rate-limits, three native (terminal-first) request paths fail immediately on a
-single HTTP 429 instead of retrying with bounded backoff:
-
-1. **Fresh session creation** -- ``POST /v1/sessions``. The CLI surfaces the
-   first 429 and exits: ``Codex session creation failed (429): ...``.
-2. **Native runner binding** -- ``PATCH /v1/sessions/{id}``. Startup aborts:
-   ``Native terminal session runner bind failed (429): ...``.
-3. **Native policy evaluation** -- ``POST /v1/sessions/{id}/policies/evaluate``.
-   ``native_policy_hook.post_evaluate_with_retry`` treats every status below 500
-   as final, so a single 429 fails **closed** and blocks ``UserPromptSubmit`` /
-   ``PreToolUse``.
-
-Expected (the behaviour these tests assert, i.e. the fail->pass target): each
-path retries an explicit 429 with bounded exponential backoff (honouring a
-bounded ``Retry-After``) and succeeds once the throttle clears; all other 4xx
-stay final; transport-error handling is unchanged.
-
-Because the retry does not exist yet, **these tests fail on the current build**
-(that failure is the reproduction) and pass once the fix lands. The 429 is a
-real fault the happy path never reaches, so each test *injects* it at the HTTP
-layer -- a real server/endpoint returning ``429`` exactly once, then succeeding
--- and drives the real product code (never a hand-fabricated end state):
-
-* ``test_native_codex_startup_retries_transient_429_on_session_creation`` drives
-  the **real** ``omnigent codex --server <proxy>`` CLI end to end through a
-  429-injecting reverse proxy in front of a real ``omnigent server``. This is the
-  user's own journey; it films as the ``cli`` surface. (Full startup can't finish
-  in a pure-CI harness -- the host/runner control tunnels need a WebSocket the
-  plain proxy does not forward -- so the test asserts only that the transient 429
-  no longer aborts startup and is retried, not that the whole launch completes.)
-* ``test_runner_bind_retries_transient_429`` and
-  ``test_policy_evaluation_retries_transient_429`` drive the real
-  ``bind_session_runner`` / ``post_evaluate_with_retry`` product functions
-  against a loopback endpoint returning a transient 429. Their full CLI/TUI
-  journeys (runner-online tunnel; a governed Codex tool call) are not drivable in
-  a pure-CI harness, so they are exercised at the client-function boundary the
-  report names -- the same HTTP fault, the same retry logic.
-
-Each test proves a retry by asserting the endpoint saw the target request **more
-than once** and the operation then succeeded -- exactly what the fix introduces
-and a regression would remove. No server allow-list token, no LLM credentials,
-and no network are required.
-"""
+Local fault-injection endpoints exercise real HTTP requests. The startup case
+runs the CLI through a proxy to a real server; no provider request is needed."""
 
 from __future__ import annotations
 
@@ -122,15 +80,7 @@ def _free_port() -> int:
 
 
 class _Transient429Server(ThreadingHTTPServer):
-    """Loopback endpoint that returns 429 exactly once on a target request.
-
-    The first request matching ``(inject_method, inject_path)`` gets a real
-    ``429`` with a ``RESOURCE_EXHAUSTED`` body and ``Retry-After: 1`` (the
-    workspace's real-world throttle shape); every later request -- including a
-    retry of the same call -- gets ``success_status`` with ``success_body``. All
-    requests are recorded in :attr:`seen` so a test can prove whether a retry
-    happened.
-    """
+    """Loopback endpoint that returns 429 once for the selected method and path."""
 
     daemon_threads = True
 
@@ -200,15 +150,7 @@ class _Transient429Handler(BaseHTTPRequestHandler):
 
 
 class _Transient429Proxy(ThreadingHTTPServer):
-    """Reverse proxy that forwards to a real server but 429s one target request.
-
-    Stands in for "the Omnigent server or ingress transiently rate-limiting":
-    the first ``POST /v1/sessions`` (the target) gets a real ``429``; every other
-    request -- and later ``POST /v1/sessions`` -- is transparently forwarded to
-    the upstream server. WebSocket upgrades (the host/runner control tunnels) are
-    rejected with 502 so the proxy thread never blocks; the session-creation 429
-    aborts (or, post-fix, is retried) before those tunnels matter.
-    """
+    """Forward requests to a real server after returning one targeted 429."""
 
     daemon_threads = True
 
@@ -425,22 +367,7 @@ def _run_cli_until_exit(args: list[str], *, env: dict[str, str], timeout: float)
     reason="native codex CLI journey needs `tmux` and the `omnigent` console script",
 )
 def test_native_codex_startup_retries_transient_429_on_session_creation(tmp_path: Path) -> None:
-    """A transient 429 on ``POST /v1/sessions`` must be retried, not fatal.
-
-    Drives the real ``omnigent codex --server <proxy>`` CLI through a reverse
-    proxy that returns one transient 429 on session creation.
-
-    * **Current (buggy) build:** the CLI surfaces the first 429 and exits --
-      ``Codex session creation failed (429): {"error_code":"RESOURCE_EXHAUSTED",...}``
-      -- after exactly one ``POST /v1/sessions``. This test therefore FAILS on
-      the current build: that failure is the live reproduction.
-    * **Fixed build:** the CLI retries the 429 with bounded backoff, session
-      creation succeeds on a later attempt (>= 2 POSTs), and startup no longer
-      aborts on the transient throttle. (Startup ultimately can't complete in
-      this harness because the host/runner tunnels need a WebSocket the plain
-      proxy doesn't forward -- so we assert only that the 429 was retried, not
-      that the whole launch finished.)
-    """
+    """Retry session creation through the real Codex CLI and a fault-injection proxy."""
     with _omnigent_server(tmp_path) as upstream:
         proxy = _Transient429Proxy(upstream, inject_method="POST", inject_path="/v1/sessions")
         proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
@@ -488,17 +415,7 @@ def test_native_codex_startup_retries_transient_429_on_session_creation(tmp_path
 
 
 def test_runner_bind_retries_transient_429() -> None:
-    """A transient 429 on ``PATCH /v1/sessions/{id}`` must be retried.
-
-    Drives the real ``bind_session_runner`` (the product function native startup
-    calls) against a loopback endpoint returning one transient 429.
-
-    * **Current (buggy) build:** it raises ``click.ClickException`` -- ``Native
-      terminal session runner bind failed (429): ...`` -- on the first 429, after
-      exactly one PATCH. This test FAILS there (the reproduction).
-    * **Fixed build:** it retries the 429 and returns normally once the PATCH
-      succeeds (>= 2 PATCHes).
-    """
+    """Retry a transient 429 while binding the runner over HTTP."""
     session_id = "conv_abc123"
     inject_path = f"/v1/sessions/{session_id}"
     server = _Transient429Server(
@@ -534,18 +451,7 @@ def test_runner_bind_retries_transient_429() -> None:
 
 
 def test_policy_evaluation_retries_transient_429() -> None:
-    """A transient 429 on policy evaluation must be retried, not fail closed.
-
-    Drives the real ``post_evaluate_with_retry`` against a loopback endpoint
-    returning one transient 429.
-
-    * **Current (buggy) build:** it treats every status below 500 as final, so it
-      returns ``(None, "server returned 429...")`` after a single POST and the
-      native hook fails closed -- blocking ``UserPromptSubmit`` / ``PreToolUse``.
-      This test FAILS there (the reproduction).
-    * **Fixed build:** it retries the explicit 429 and returns the real verdict
-      response (>= 2 POSTs, ``resp`` populated, ``error`` ``None``).
-    """
+    """Retry transient policy-evaluation throttling without failing closed."""
     session_id = "conv_policy1"
     inject_path = f"/v1/sessions/{session_id}/policies/evaluate"
     server = _Transient429Server(
