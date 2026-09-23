@@ -954,12 +954,6 @@ aside[aria-label="Workspace"][data-maximized] {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
   }
 
-  /* With the bottom pill retired the terminal card is the lowest content in
-     the terminal view — keep it clear of the home indicator. */
-  [data-ios-native] .main-terminal-view {
-    padding-bottom: calc(0.375rem + var(--omnigent-safe-bottom));
-  }
-
   [data-ios-native] .chat-scroll-fade {
     mask-image: linear-gradient(
       to bottom,
