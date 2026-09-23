@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runtime import pending_inputs
+from omnigent.runtime import pending_inputs, session_stream
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -116,6 +116,38 @@ async def test_duplicate_repost_restores_the_drained_pending_input(
     assert await _message_texts(client, session_id) == ["first msg"]
 
 
+async def test_native_submission_identity_survives_consumption_and_forwarder_retry(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lost POST receipts can be reconciled after the pending entry is consumed."""
+    session_id = await _create_session(client, "idem-submission")
+    stable_id = "a" * 32
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "web prompt"}], stable_id=stable_id
+    )
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(session_stream, "publish", lambda _session, event: events.append(event))
+
+    first = await _post_item(client, session_id, text="web prompt", source_id="native-1")
+    assert first["item_id"] != stable_id
+    assert pending_inputs.snapshot_for(session_id) == []
+    consumed = [event for event in events if event["type"] == "session.input.consumed"]
+    assert len(consumed) == 1
+    assert consumed[0]["data"]["cleared_pending_id"] == pending_id
+    assert consumed[0]["data"]["data"]["client_submission_id"] == stable_id
+
+    next_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "next prompt"}], stable_id="b" * 32
+    )
+    duplicate = await _post_item(client, session_id, text="web prompt", source_id="native-1")
+    assert duplicate["item_id"] == first["item_id"]
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [next_id]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    messages = [item for item in items if item["type"] == "message"]
+    assert len(messages) == 1
+    assert messages[0]["client_submission_id"] == stable_id
+
+
 async def test_bad_source_id_is_rejected(client: httpx.AsyncClient) -> None:
     session_id = await _create_session(client, "idem-bad")
     resp = await client.post(
@@ -148,6 +180,9 @@ def test_client_cannot_smuggle_a_stable_id() -> None:
             "role": "user",
             "content": [{"type": "input_text", "text": "x"}],
             "stable_id": "ab" * 16,
+            "client_submission_id": "ab" * 16,
         },
     )
-    assert _build_new_item(body, "resp").stable_id is None
+    item = _build_new_item(body, "resp")
+    assert item.stable_id is None
+    assert item.data.model_dump().get("client_submission_id") is None

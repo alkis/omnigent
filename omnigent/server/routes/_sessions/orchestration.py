@@ -2520,6 +2520,14 @@ async def _persist_external_conversation_item(
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
+            if drained.stable_id is not None:
+                item = item.model_copy(
+                    update={
+                        "data": item.data.model_copy(
+                            update={"client_submission_id": drained.stable_id}
+                        )
+                    }
+                )
             # Apply the original sender's identity recorded at POST time.
             # The transcript forwarder is the single writer here and has no
             # auth context, so the persisted item would otherwise have
