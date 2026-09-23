@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     # since ``ambient`` pulls in onboarding-only deps this module avoids on the
     # runner's session-create hot path).
     from omnigent.onboarding.ambient import CodexConfigTransport
+    from omnigent.spec.types import ExecutorAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -265,6 +266,8 @@ class PiProviderConfig:
     )
     # Only configured tier maps with multiple distinct models scope the picker.
     curated_models: bool = False
+    model_allowlist: tuple[str, ...] | None = None
+    inference_bound: bool = False
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -490,23 +493,7 @@ def pi_own_login_model_arg(selection: str) -> str | None:
 
 
 def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None = None) -> bool:
-    """Whether *reference* names a model on one of Pi's own logged-in providers.
-
-    A live Pi picker selection is persisted as the ``provider/model``
-    reference the resident Pi reported (e.g. ``openai-codex/gpt-5.6-sol`` on
-    Pi's own OAuth login). String shape alone cannot separate such a reference
-    from a slash-shaped gateway model id (``openai/gpt-4o`` on OpenRouter), so
-    membership in Pi's own login catalog -- ``auth.json`` +
-    ``models-store.json``, the same files :func:`pi_own_login_model_options`
-    renders -- is the provenance signal: only a reference that catalog
-    actually serves selects Pi's own login.
-
-    :param reference: A candidate ``provider/model`` picker value.
-    :param agent_dir: Pi agent dir override (tests); defaults to the host's
-        own Pi agent dir.
-    :returns: ``True`` when the reference's provider is logged in and its
-        cached catalog lists the model id.
-    """
+    """Return whether Pi's own logged-in catalog serves *reference*."""
     if not reference:
         return False
     provider_id, separator, model_id = reference.partition("/")
@@ -1369,6 +1356,8 @@ def _live_family_model_entries(
     :returns: The configured entries followed by every live model id, deduped;
         unchanged when the listing fails.
     """
+    if provider.model_allowlist is not None:
+        return list(provider.extra_models)
     listing_provider = provider.listing_provider
     if listing_provider is None:
         return list(provider.extra_models)
@@ -1402,7 +1391,7 @@ def _live_family_model_entries(
 
 
 def _inline_family_pi_provider(
-    entry: ProviderEntry, *, model: str | None
+    entry: ProviderEntry, *, model: str | None, preserve_model_ids: bool = False
 ) -> PiProviderConfig | None:
     """Resolve a key/gateway/local provider into Pi config from its family.
 
@@ -1454,13 +1443,14 @@ def _inline_family_pi_provider(
         # front arbitrary inventories (a proxy fronting the Databricks AI
         # Gateway is addressed by the prefixed endpoint name). A configured
         # family default is exempt — it names an id its own endpoint serves.
-        if model is not None:
+        if model is not None and not preserve_model_ids:
             resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
         # Anthropic API but rejected by the Databricks AI Gateway, and in a Pi
         # ``enabledModels`` ref the "[" would route the pattern through Pi's
         # glob matcher instead of its exact reference match.
-        resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
+        if not preserve_model_ids:
+            resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
         model_entry = _gateway_pi_model_entry(
             resolved_model,
             configured_context_window=family.context_window,
@@ -1519,17 +1509,15 @@ def resolve_pi_native_provider(
     *,
     model: str | None = None,
     config_loader: Callable[[], dict[str, object]] = load_config,
+    auth: ExecutorAuth | None = None,
 ) -> PiProviderConfig | None:
     """Resolve the omnigent-configured provider for a native Pi session.
 
     Reads the default provider for the Pi surface from
     ``~/.omnigent/config.yaml`` and translates it into Pi ``models.json``
     config. Returns ``None`` — leaving Pi to use its own ``/login`` — when no
-    usable provider is configured, the default is a subscription / CLI-login
-    provider (a CLI's own login can't be reused outside that CLI), or *model*
-    is a provider-qualified reference Pi's own login serves (see
-    :func:`pi_own_login_serves_reference`) — an explicit pick of one of Pi's
-    own providers must not be re-routed through the configured one.
+    usable provider is configured, or the default is a subscription / CLI-login
+    provider (a CLI's own login can't be reused outside that CLI).
 
     :param model: Session model override (``model_override``), or ``None`` to
         use the provider's default model.
@@ -1538,22 +1526,80 @@ def resolve_pi_native_provider(
     :returns: The resolved provider config, or ``None`` to fall back to Pi's
         own credentials.
     """
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
+
+    try:
+        if config_loader is load_config:
+            from omnigent.onboarding.provider_config import _load_config
+
+            base_config = _load_config()
+        else:
+            base_config = config_loader()
+    except Exception:  # noqa: BLE001 — legacy config failures fall back to Pi's own login
+        _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
+        return None
+    config = load_runtime_inference_config(base_config)
+    binding = binding_for_harness(config, "pi-native")
+    if binding is not None:
+        entry = resolve_bound_provider(config, "pi-native", auth)
+        selected = resolve_bound_model(config, "pi-native", model)
+        if entry is None:
+            raise ValueError("The Pi inference binding has no configured provider.")
+        resolved = _inline_family_pi_provider(entry, model=selected, preserve_model_ids=True)
+        if resolved is None:
+            raise ValueError(f"Configured provider {entry.name!r} cannot route Pi.")
+        if binding.model_allowlist is not None:
+            grouped: dict[str, PiProviderConfig] = {}
+            provider_ids = {
+                "anthropic-messages": _PI_PROVIDER_ID,
+                "openai-responses": _PI_OPENAI_PROVIDER_ID,
+                "openai-completions": _PI_COMPLETIONS_PROVIDER_ID,
+            }
+            for model_id in binding.model_allowlist:
+                routed = _inline_family_pi_provider(entry, model=model_id, preserve_model_ids=True)
+                if routed is None:
+                    raise ValueError(
+                        f"Configured provider {entry.name!r} cannot route {model_id!r}."
+                    )
+                provider_id = provider_ids[routed.api]
+                model_entry = next(row for row in routed.extra_models if row["id"] == model_id)
+                previous = grouped.get(provider_id)
+                grouped[provider_id] = replace(
+                    routed,
+                    provider_id=provider_id,
+                    extra_models=[*(previous.extra_models if previous else []), model_entry],
+                )
+            primary_id = provider_ids[resolved.api]
+            primary = grouped.pop(primary_id)
+            resolved = replace(
+                primary,
+                model=resolved.model,
+                additional_providers={
+                    pid: provider.to_models_config()["providers"][pid]
+                    for pid, provider in grouped.items()
+                },
+                curated_models=True,
+                model_allowlist=binding.model_allowlist,
+            )
+        return replace(resolved, inference_bound=True)
+
     selection = _split_pi_native_model_selection(model)
     unmanaged_prefix_warning: str | None = None
     if selection is not None:
         _, model = selection
     try:
-        config = config_loader()
         if selection is None and model and "/" in model:
             prefix, _, bare = model.partition("/")
             providers = config.get("providers")
             names_configured_provider = (
                 bool(bare) and isinstance(providers, dict) and prefix in providers
             )
-            # An explicit reference to one of Pi's OWN providers (e.g. a live
-            # picker selection on its openai-codex OAuth login) must not be
-            # funneled through the configured provider: that rewrites it into
-            # the generated ``omnigent`` namespace, an id no endpoint serves.
+            # Preserve Pi-login references unless they name a configured provider.
             if not names_configured_provider and pi_own_login_serves_reference(model):
                 _LOGGER.info(
                     "pi-native: model %r is served by Pi's own %r login; "
@@ -1763,7 +1809,9 @@ def pi_native_provider_launch(
     # primary provider. Read the rendered config so family fallbacks agree.
     selected_model = provider.model
     model_provider_id = provider.provider_id
-    selection_parts = _split_pi_native_model_selection(selection)
+    selection_parts = (
+        None if provider.inference_bound else _split_pi_native_model_selection(selection)
+    )
     if selection_parts is not None:
         candidate_provider, candidate_model = selection_parts
         configured = rendered["providers"].get(candidate_provider)
@@ -1801,6 +1849,8 @@ def pi_native_provider_launch(
         overlay["enabledModels"] = enabled_refs
     prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
+    if provider.inference_bound:
+        env["OMNIGENT_PI_INFERENCE_BOUND"] = "1"
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding
     # --provider. Pass the fully-qualified "provider/model" reference so Pi's

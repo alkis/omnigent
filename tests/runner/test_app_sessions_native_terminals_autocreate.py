@@ -541,7 +541,6 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
 
 
 def _seed_pi_own_login_catalog(agent_dir: Path) -> None:
-    """Log Pi into openai-codex with ``gpt-5.6-sol`` in its cached catalog."""
     agent_dir.mkdir(parents=True, exist_ok=True)
     (agent_dir / "auth.json").write_text(json.dumps({"openai-codex": {"type": "oauth"}}))
     (agent_dir / "models-store.json").write_text(
@@ -556,13 +555,6 @@ async def _launch_pi_terminal_args(
     model_override: str | None,
     agent_spec: AgentSpec | None = None,
 ) -> list[str]:
-    """Drive pi-native auto-create against a ``default: pi`` gateway config.
-
-    Pins ``PI_CODING_AGENT_DIR`` to ``<tmp>/pi-own-login`` (tests seed it
-    beforehand or leave it empty) and wraps the real
-    ``resolve_pi_native_provider`` with a hermetic config, so the
-    ``--provider``/``--model`` launch decision under test is production code.
-    """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
@@ -639,17 +631,6 @@ async def test_auto_create_pi_terminal_passes_pi_own_login_reference_through(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cold resume keeps an explicit reference to Pi's own login verbatim.
-
-    A pi-native session pinned to ``openai-codex/gpt-5.6-sol`` (served by
-    Pi's own openai-codex login) relaunches while the config carries an
-    OpenRouter gateway with ``default: pi``. Funneling the selection through
-    that provider launched Pi with ``--provider omnigent --model
-    omnigent/openai-codex/gpt-5.6-sol`` — an id no endpoint serves, so the
-    next message 400s and the model picker collapses to that single entry.
-    The relaunch must pass the reference through and let Pi resolve it on its
-    own login.
-    """
     _seed_pi_own_login_catalog(tmp_path / "pi-own-login")
 
     args = await _launch_pi_terminal_args(
@@ -666,12 +647,6 @@ async def test_auto_create_pi_terminal_spec_pinned_own_login_reference_passes_th
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A spec-pinned reference to Pi's own login gets the same pass-through.
-
-    ``executor.model`` is the launch model on every relaunch when no
-    per-session override is persisted, so a wrapper spec pinning
-    ``openai-codex/gpt-5.6-sol`` hits the same rewrite seam.
-    """
     _seed_pi_own_login_catalog(tmp_path / "pi-own-login")
 
     args = await _launch_pi_terminal_args(
@@ -695,12 +670,6 @@ async def test_auto_create_pi_terminal_keeps_gateway_routing_for_slash_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A slash-shaped gateway override keeps managed provider routing.
-
-    ``openai/gpt-4o-mini`` names an OpenRouter model, not a logged-in Pi
-    provider (the login catalog is empty here), so the launch must still
-    register the managed provider and select its qualified reference.
-    """
     args = await _launch_pi_terminal_args(
         tmp_path, monkeypatch, model_override="openai/gpt-4o-mini"
     )
@@ -2188,8 +2157,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        bridge_dir: Path,
     ) -> Path:
         """Record the resume id and return a transcript path."""
+        assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -2336,7 +2307,9 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         session_id: str,
         external_session_id: str,
         workspace: Path,
+        bridge_dir: Path,
     ) -> Path:
+        assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -4432,7 +4405,7 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+@pytest.mark.parametrize("endpoint", ["subscription", "gateway", "bound"])
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
     tmp_path: Path,
@@ -4448,6 +4421,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     spellings, launches on its own default instead and resets the pick to Default.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inference_config import inference_config_scope
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -4506,11 +4480,12 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
             )
 
     patches: list[dict[str, Any]] = []
+    selected_model = "private/model-b[large]" if endpoint == "bound" else "claude-opus-4-8"
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
-        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+        return httpx.Response(200, json={"model_override": selected_model, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -4530,17 +4505,34 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
+    inference = (
+        {
+            "providers": {"gateway": {"kind": "gateway"}},
+            "inference": {
+                "harnesses": {
+                    "claude-native": {
+                        "provider": "gateway",
+                        "default_model": "private/model-a",
+                        "model_allowlist": ["private/model-a", selected_model],
+                    }
+                }
+            },
+        }
+        if endpoint == "bound"
+        else {}
     )
+    with inference_config_scope(inference):
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
     args = captured["spec"].args
     pick_resets = [body for body in patches if "model_override" in body]
-    if endpoint == "subscription":
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
+    if endpoint in ("subscription", "bound"):
+        assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
         assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"

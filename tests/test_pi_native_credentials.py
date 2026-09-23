@@ -179,7 +179,6 @@ def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
 
 
 def _openrouter_default_pi_config() -> dict[str, object]:
-    """A config whose OpenRouter gateway provider claims the pi surface."""
     return {
         "providers": {
             "openrouter": {
@@ -196,7 +195,6 @@ def _openrouter_default_pi_config() -> dict[str, object]:
 
 
 def _seed_pi_login_catalog(agent_dir: Path, provider_id: str, model_ids: list[str]) -> None:
-    """Write a Pi own-login catalog: *provider_id* logged in, serving *model_ids*."""
     agent_dir.mkdir(parents=True, exist_ok=True)
     (agent_dir / "auth.json").write_text(json.dumps({provider_id: {"type": "oauth"}}))
     (agent_dir / "models-store.json").write_text(
@@ -205,14 +203,11 @@ def _seed_pi_login_catalog(agent_dir: Path, provider_id: str, model_ids: list[st
 
 
 def test_pi_own_login_reference_classification(tmp_path: Path) -> None:
-    """Only references the login catalog actually serves match."""
     _seed_pi_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
 
     assert creds.pi_own_login_serves_reference("openai-codex/gpt-5.6-sol", tmp_path)
-    # Provider not logged in / model not in its store.
     assert not creds.pi_own_login_serves_reference("anthropic/claude-opus-5", tmp_path)
     assert not creds.pi_own_login_serves_reference("openai-codex/gpt-4o", tmp_path)
-    # Bare ids and degenerate values are not provider references.
     assert not creds.pi_own_login_serves_reference("gpt-5.6-sol", tmp_path)
     assert not creds.pi_own_login_serves_reference("/gpt-5.6-sol", tmp_path)
     assert not creds.pi_own_login_serves_reference("openai-codex/", tmp_path)
@@ -221,7 +216,6 @@ def test_pi_own_login_reference_classification(tmp_path: Path) -> None:
 
 
 def test_pi_own_login_reference_matches_slash_bearing_model_id(tmp_path: Path) -> None:
-    """A store model id containing ``/`` matches past the provider prefix."""
     _seed_pi_login_catalog(tmp_path, "openrouter", ["qwen/qwen3-coder"])
 
     assert creds.pi_own_login_serves_reference("openrouter/qwen/qwen3-coder", tmp_path)
@@ -231,15 +225,6 @@ def test_pi_own_login_reference_matches_slash_bearing_model_id(tmp_path: Path) -
 def test_resolve_prefers_pi_own_login_for_served_reference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An explicit reference Pi's own login serves bypasses the default provider.
-
-    A cold resume re-resolves the persisted picker selection; funneling a
-    reference to Pi's own openai-codex login through the ``default: pi``
-    gateway used to launch Pi with ``--model omnigent/openai-codex/...`` — an
-    id no endpoint serves, so the next message 400s and the picker collapses
-    to that single entry. Resolution must yield ``None`` so the selection
-    passes through to Pi's own login verbatim.
-    """
     _seed_pi_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
 
@@ -253,13 +238,6 @@ def test_resolve_prefers_pi_own_login_for_served_reference(
 def test_resolve_keeps_gateway_routing_for_unserved_slash_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A slash-shaped gateway id keeps managed routing when Pi's login lacks it.
-
-    ``openai/gpt-4o-mini`` is a legitimate OpenRouter model id, and no Pi
-    ``openai`` login serves it here, so the configured provider must keep
-    serving it — diverting it to Pi's own resolver would break the session
-    (Pi would need a separate ``/login``).
-    """
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
 
     provider = creds.resolve_pi_native_provider(
@@ -273,11 +251,6 @@ def test_resolve_keeps_gateway_routing_for_unserved_slash_model(
 def test_resolve_configured_provider_prefix_wins_over_pi_own_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A value qualified by a configured provider's name keeps managed routing.
-
-    The configured-name split is the established meaning of such values, even
-    when Pi's own catalog happens to serve the same reference.
-    """
     _seed_pi_login_catalog(tmp_path, "openrouter", ["gpt-4o-mini"])
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
 
