@@ -46,9 +46,7 @@ describe("resolveHostBadge", () => {
   });
 
   it("falls back to the raw host_id when the host record is unresolved", () => {
-    // Older server (no snapshot identity) or a deleted host row: there's
-    // no name to show, but the session IS host-bound, so the badge must
-    // still answer "which host" with the id.
+    // Older snapshots and deleted hosts still expose the bound ID.
     expect(resolveHostBadge({ hostId: "host_x9", host: undefined, online: true })).toEqual({
       label: "host_x9",
       status: "online",
@@ -56,9 +54,7 @@ describe("resolveHostBadge", () => {
   });
 
   it("uses the snapshot-carried host name when the host list can't resolve it", () => {
-    // Shared session: /v1/hosts is owner-scoped, so the viewer's list never
-    // contains the owner's host. The snapshot's server-resolved name is what
-    // keeps the badge readable instead of the raw hex id.
+    // Shared viewers use the snapshot because the host list is owner-scoped.
     expect(
       resolveHostBadge({
         hostId: "host_x9",
@@ -82,8 +78,7 @@ describe("resolveHostBadge", () => {
   });
 
   it("prefers the caller's own host-list record over the snapshot identity", () => {
-    // The owner's list entry is live (renames propagate on the 10s poll);
-    // the snapshot name is the fallback for viewers who can't list the host.
+    // Prefer live owner-list entries so renames propagate.
     expect(
       resolveHostBadge({
         hostId: "host_a1b2",
@@ -208,8 +203,7 @@ describe("HostBadge", () => {
   });
 
   it("shows the snapshot host name for a shared session's viewer", () => {
-    // The viewer's owner-scoped /v1/hosts list can't resolve the owner's
-    // host, but the snapshot carries the server-resolved name.
+    // Shared viewers resolve the name from the snapshot.
     useSessionMock.mockReturnValue({
       session: { hostId: "host_x9", hostName: "alices-macbook" },
       isLoading: false,
