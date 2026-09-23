@@ -1,45 +1,4 @@
-"""E2E: the new-session picker must warn about native-terminal agents on Windows.
-
-## Bug
-
-Native terminal harnesses (tmux/PTY) cannot launch on Windows: the runner
-refuses them with ``native_terminal_start_failed``. But the host daemon's
-``configured_harness_map()`` (:mod:`omnigent.onboarding.harness_readiness`)
-never consults the platform — it reports a native harness as ready whenever
-its CLI binary is installed and credentialed. A Windows machine with
-``claude.exe`` on PATH therefore sends ``configured_harnesses:
-{"claude-native": true}``, the web picker renders "Claude Code" with **no
-warning badge**, and every launch the picker just offered fails immediately.
-
-## Journey
-
-1. A Windows host with the claude CLI installed and credentialed connects —
-   its daemon computes ``configured_harness_map()`` and sends the result in
-   its hello frame.
-2. The user opens the web UI's new-session agent picker with that host
-   selected.
-3. The picker lists "Claude Code". Expected: the row carries the amber
-   unavailability warning (the agent cannot launch on this host). Observed on
-   the buggy build: no warning — the row is offered as plainly ready, and
-   selecting it walks the user into ``native_terminal_start_failed``.
-
-## How this test stays a fail→pass target
-
-The host's ``configured_harnesses`` is NOT hand-stubbed (that would bake the
-expected daemon output into the test). It is computed by running the real
-``configured_harness_map()`` in a subprocess whose platform primitives are
-patched to report Windows (``omnigent._platform.IS_WINDOWS``,
-``platform.system``, and the readiness module's own ``IS_WINDOWS`` binding
-when one exists) and whose config home carries an Anthropic credential — the
-"installed and logged in" Windows machine from the report. The map then flows
-to the SPA through the real host tunnel and the real ``/v1/hosts`` route, so
-the assertion flips exactly when the daemon starts gating native harnesses on
-Windows.
-
-The async-in-a-fresh-thread shape is inherited from
-``test_windows_workspace_picker.py`` (pytest-asyncio can't start a loop on
-the main thread once a sync pytest-playwright test has run in the session).
-"""
+"""End-to-end Windows native-readiness coverage for the new-session picker."""
 
 from __future__ import annotations
 
@@ -90,15 +49,10 @@ _AGENT_ID = "ag_claude_native_e2e"
 _HARNESS = "claude-native"
 _WIN_WORKSPACE = "C:\\Users\\alice\\work"
 
-# Readiness values that mean the machine running this test could not stage the
-# reported precondition (claude CLI installed + credentialed), as opposed to a
-# platform gate. Seeing one of these from the simulated-Windows probe means the
-# environment — not the bug — produced the unavailability, so the test skips
-# rather than passing vacuously.
+# These values mean the local machine could not stage the test precondition.
 _BROKEN_PRECONDITION_REASONS = frozenset({"binary-missing", "needs-auth", "version-too-low"})
 
-# Runs in a subprocess so the platform simulation cannot leak into the pytest
-# process, and so the readiness module is imported fresh after the patches.
+# Import readiness in a subprocess so the Windows simulation cannot leak.
 _READINESS_PROBE_SOURCE = """
 import json, os
 import platform as platform_mod
@@ -131,18 +85,7 @@ _SCRUBBED_ENV_TOKENS = ("ANTHROPIC", "OPENAI", "CLAUDE", "CODEX")
 
 
 def _daemon_readiness_map(*, simulate_windows: bool, credentialed: bool) -> dict[str, Any]:
-    """Compute the real host daemon's ``configured_harnesses`` map.
-
-    :param simulate_windows: Patch the platform primitives to report Windows
-        before the readiness module imports, mirroring the daemon on a
-        Windows machine.
-    :param credentialed: Provide an omnigent config whose Anthropic provider
-        makes the claude family credentialed (the "installed and logged in"
-        machine from the report). When ``False`` the config home is empty, so
-        an installed claude CLI reads ``needs-auth``.
-    :returns: The JSON-decoded readiness map the daemon would send in its
-        hello frame.
-    """
+    """Compute an isolated readiness map using this checkout."""
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp) / "home"
         config_home = Path(tmp) / "config"
@@ -154,8 +97,7 @@ def _daemon_readiness_map(*, simulate_windows: bool, credentialed: bool) -> dict
             )
         script = Path(tmp) / "probe.py"
         script.write_text(_READINESS_PROBE_SOURCE, encoding="utf-8")
-        # Hermetic env: ambient API keys or CLI login state on the machine
-        # running the suite must not decide the probed readiness.
+        # Keep ambient credentials out of the readiness result.
         env = {
             key: value
             for key, value in os.environ.items()
@@ -164,10 +106,7 @@ def _daemon_readiness_map(*, simulate_windows: bool, credentialed: bool) -> dict
         }
         env["HOME"] = str(home)
         env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-        # The probe script lives outside the repo, so an omnigent install
-        # pointing elsewhere (e.g. an editable install of another checkout)
-        # would make the subprocess silently measure a different tree. Pin
-        # the import to the package this test process resolved.
+        # Force the subprocess to import this checkout rather than another editable install.
         repo_root = Path(omnigent.__file__).resolve().parent.parent
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (
@@ -199,8 +138,7 @@ async def _serve_host_frames(ws: Any) -> None:
         try:
             frame = decode_host_frame(raw)
         except ValueError:
-            # Tunnel keepalive: the server pings with the runner-tunnel
-            # encoding; answer with a pong the same way the real daemon does.
+            # The server sends keepalives with the runner-tunnel encoding.
             try:
                 runner_frame = decode_frame(raw)
             except ValueError:
@@ -241,14 +179,7 @@ async def _serve_host_frames(ws: Any) -> None:
 async def _fake_host(
     base_url: str, name: str, configured_harnesses: dict[str, Any]
 ) -> AsyncIterator[str]:
-    """Connect a fake host to the live server's real host tunnel.
-
-    :param base_url: The live server's base URL.
-    :param name: Unique host name for this connection.
-    :param configured_harnesses: The readiness map the host's hello carries —
-        computed by :func:`_daemon_readiness_map`, never hand-written.
-    :returns: Async context manager yielding the REST-reported host id.
-    """
+    """Connect a host with the computed readiness map to the real tunnel."""
     import websockets
 
     tunnel_host_id = uuid.uuid4().hex
@@ -285,8 +216,7 @@ async def _fake_host(
             yield rest_host_id
         finally:
             serve_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await serve_task
+            await asyncio.gather(serve_task, return_exceptions=True)
 
 
 def _agents_body() -> str:
@@ -314,8 +244,7 @@ async def _register_routes(page: Any) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_agents_body())
 
     async def handle_agent_scan(route: Route) -> None:
-        # Neutralize agent discovery so sessions other tests left behind can't
-        # leak extra agents into the picker.
+        # Keep agents from other tests out of this picker.
         await route.fulfill(
             status=200, content_type="application/json", body=json.dumps({"data": []})
         )
@@ -340,9 +269,7 @@ async def _open_picker_on_host(page: Any, base_url: str, host_id: str) -> None:
         timeout=15_000
     )
     await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
-    # Let the host dropdown finish its exit animation and unmount before
-    # opening the picker; its deferred unmount otherwise steals focus and
-    # closes the agent picker mid-test.
+    # Wait for the host menu to unmount so it cannot steal focus from the picker.
     await expect(page.locator('[data-slot="dropdown-menu-content"]')).to_have_count(0)
     await page.get_by_test_id("new-chat-landing-agent-select").click()
 
@@ -359,12 +286,7 @@ async def _reveal_claude_row(page: Any) -> Any:
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    Once a pytest-playwright sync test has run in the session, pytest-asyncio
-    can't start a loop on the main thread; a fresh thread sidesteps that.
-    Exceptions (assertion failures included) re-raise on the calling thread.
-    """
+    """Run after sync Playwright has occupied the main thread's event loop."""
     captured: dict[str, Exception] = {}
 
     def _worker() -> None:
@@ -381,14 +303,7 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
 
 
 def test_windows_host_native_agent_carries_warning_badge(live_server: str) -> None:
-    """A native-terminal agent on a Windows host must be badged, not offered.
-
-    The daemon map is computed by the real readiness code under a simulated
-    Windows platform with the claude CLI installed and credentialed. The
-    picker must flag the "Claude Code" row as unavailable on that host (the
-    amber warning). On the buggy build the daemon reports ``True``, no
-    warning renders, and this test fails — the reported bug.
-    """
+    """A native agent on a simulated Windows host carries a warning badge."""
     real_map = _daemon_readiness_map(simulate_windows=False, credentialed=True)
     if real_map.get(_HARNESS) is not True:
         pytest.skip(
@@ -408,8 +323,6 @@ async def _drive_windows_badge(base_url: str, windows_map: dict[str, Any]) -> No
     name = f"win11-e2e-{uuid.uuid4().hex[:8]}"
     async with _fake_host(base_url, name, windows_map) as host_id, async_playwright() as pw:
         browser = await pw.chromium.launch()
-        # Explicit context so a recorded video is finalized on context.close()
-        # even when the drive fails mid-way.
         context = await browser.new_context()
         page = await context.new_page()
         try:
@@ -417,7 +330,6 @@ async def _drive_windows_badge(base_url: str, windows_map: dict[str, Any]) -> No
             await _open_picker_on_host(page, base_url, host_id)
             row = await _reveal_claude_row(page)
             await row.hover()
-            # Dwell so the offered/badged state is visible in recordings.
             await page.wait_for_timeout(1_200)
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-warning-{_AGENT_ID}")
@@ -428,13 +340,7 @@ async def _drive_windows_badge(base_url: str, windows_map: dict[str, Any]) -> No
 
 
 def test_posix_host_ready_native_agent_stays_unbadged(live_server: str) -> None:
-    """Over-reach control: the Windows gate must not touch a ready POSIX host.
-
-    The same installed+credentialed CLI on the real (non-Windows) platform
-    still reads ready, and the picker must offer the row with no warning
-    badge — proving the fix gates on the platform, not on native harnesses
-    generally.
-    """
+    """A ready native agent on a POSIX host remains unbadged."""
     real_map = _daemon_readiness_map(simulate_windows=False, credentialed=True)
     if real_map.get(_HARNESS) is not True:
         pytest.skip(
@@ -465,14 +371,7 @@ async def _drive_posix_no_badge(base_url: str, posix_map: dict[str, Any]) -> Non
 
 
 def test_unready_native_harness_is_badged_at_the_point_of_choice(live_server: str) -> None:
-    """The picker's host-readiness join flags an unready native harness.
-
-    Companion guard: with a host whose daemon genuinely reports claude as not
-    ready (no credential staged), the same journey must show the warning.
-    This proves the badge machinery works when the daemon sends a non-``True``
-    value — so the sibling test's failure is specifically the daemon's
-    ``True`` on Windows, not a picker rendering gap.
-    """
+    """The picker warns when the selected host reports an unready harness."""
     bare_map = _daemon_readiness_map(simulate_windows=False, credentialed=False)
     if bare_map.get(_HARNESS) is True:
         pytest.skip(

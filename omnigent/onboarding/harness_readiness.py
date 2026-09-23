@@ -223,10 +223,7 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
     """
     canonical = _canonical_harness(harness)
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
-        # Every NATIVE_HARNESSES member is tmux/PTY-based and the runner refuses
-        # them all on Windows (``native_terminal_start_failed`` in
-        # omnigent/runner/native/orchestration.py), even with the vendor CLI
-        # installed. A member gaining a Windows path must be exempted here.
+        # Native harnesses require tmux/PTY, which the runner does not support on Windows.
         return False
     if canonical == "acp":
         # The generic ACP harness has no fixed binary — "configured" means at
@@ -483,9 +480,6 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
-        # Same Windows fail-closed gate as _harness_availability_core: auth-aware
-        # native harnesses route here directly, so short-circuit before any
-        # auth/binary probe (the runner refuses them all; see orchestration.py).
         return False
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
@@ -595,10 +589,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     cache_key_by_spelling: dict[str, tuple[str, ...]] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
-        # On Windows, native codex terminal harnesses (codex-native / native-codex)
-        # diverge from plain "codex": the Windows guard short-circuits them to False
-        # before the codex probe runs, so they must not share the "codex" cache
-        # bucket.  On non-Windows they share the bucket as before (one probe).
+        # Windows-native Codex must not share plain Codex's readiness cache entry.
         if _is_codex_family_harness(canonical) and not (
             IS_WINDOWS and canonical in NATIVE_HARNESSES
         ):
