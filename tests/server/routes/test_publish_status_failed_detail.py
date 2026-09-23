@@ -1,28 +1,4 @@
-"""Failed turns must log a usable, non-prose reason.
-
-Every server-originated ``failed`` turn funnels through one ERROR line in
-``_publish_status``::
-
-    session turn failed for <id> (origin=... code=... prev=...): <detail>
-
-In production ``<detail>`` degraded into three undebuggable shapes, each
-counted against the mid-session error KPI and none triageable by a human:
-
-1. the literal ``no detail`` -- the ``failed`` edge carried no error at all;
-2. ``turn setup failed:`` with an empty reason -- the runner built the message
-   from an exception whose ``str()`` was empty and the relay republished it;
-3. the assistant's *own successful* final message, verbatim, as the "error" --
-   a turn that produced output was labelled failed and the reason was
-   backfilled from that output.
-
-Each test drives the real wire path that reaches ``_publish_status`` -- the
-native-forwarder ``external_session_status`` POST (shapes 1 and 3) and the
-runner stream relay (shape 2) -- and captures the ERROR record from the
-``omnigent.server.routes.sessions`` logger. The assertions encode the desired
-behaviour (a non-empty, non-prose, diagnosable reason), so on the current build
-they FAIL, reproducing the bug; a fix that always populates a usable detail
-turns them green.
-"""
+"""Verify native and relayed failed turns log a usable reason."""
 
 from __future__ import annotations
 
@@ -50,11 +26,7 @@ _FAILED_PREFIX = "session turn failed for "
 
 
 def _failed_turn_details(caplog: pytest.LogCaptureFixture, session_id: str) -> list[str]:
-    """Return the ``<detail>`` from every ``session turn failed`` ERROR row.
-
-    The line is ``session turn failed for <id> (origin=... code=... prev=...):
-    <detail>``, so the detail is everything after the last ``): ``.
-    """
+    """Extract failure details from the structured session-turn ERROR rows."""
     marker = f"{_FAILED_PREFIX}{session_id}"
     details: list[str] = []
     for record in caplog.records:
@@ -167,8 +139,7 @@ async def test_relay_failed_status_drops_the_setup_failure_reason(
     sessions_module._session_status_cache[session_id] = "running"
 
     release = asyncio.Event()
-    # The runner's empty-reason setup failure, verbatim off the wire: the runner
-    # builds f"turn setup failed: {exc}" from an exception whose str() is empty.
+    # Reproduce an older runner's dropped exception reason.
     events: list[dict[str, Any]] = [
         {
             "type": "session.status",

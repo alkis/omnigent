@@ -5080,21 +5080,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A ``failed`` edge with no wire ``output`` carries the persisted error text.
-
-    claude-native's ``StopFailure`` edge posts no ``output``, but the
-    harness's own explanation (its last assistant message, e.g. "There's an
-    issue with the selected model (…)") is already persisted. The handler
-    must attach it so the parent inbox shows it instead of the generic
-    "Error: native sub-agent turn failed", and surface it as the session's
-    typed error under the harness-neutral ``native_turn_error`` code.
-
-    The typed error labels the backfilled text as the transcript's own
-    message rather than presenting it verbatim: the same backfill would
-    otherwise publish a successful turn's own reply as the failure reason.
-    The parent-inbox forward still carries the raw text.
-    """
+    """Attach persisted assistant text to the parent event while labeling it in the typed error."""
     from omnigent.server.routes import sessions as sessions_module
 
     detail = (
@@ -5105,12 +5091,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     published: list[tuple[str, dict[str, Any]]] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Capture forwarded runner events.
-
-        :param request: Request sent to the fake runner.
-        :returns: Accepted response.
-        """
+        """Capture forwarded runner events."""
         forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
         return httpx.Response(204)
 
@@ -5123,13 +5104,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
         session_id: str,
         runner_router: object,
     ) -> httpx.AsyncClient:
-        """
-        Resolve the session to the fake runner client.
-
-        :param session_id: Session id being routed.
-        :param runner_router: Real app runner router, unused here.
-        :returns: The fake runner client.
-        """
+        """Return the fake runner client for this session."""
         del session_id, runner_router
         return fake_runner
 
@@ -5188,8 +5163,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     assert error is not None
     assert error["code"] == "native_turn_error"
     assert "selected model" in error["message"]
-    # Store-enriched text is labelled, never republished as the error
-    # verbatim -- a successful reply must not read as the failure reason.
+    # Persisted assistant prose is labeled instead of reused verbatim.
     assert error["message"] != detail
     assert error["message"].startswith("The turn failed without a reported reason;")
 
@@ -5199,8 +5173,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     [
         # No wire output at all: harness-neutral fallback.
         ({}, "native_turn_error"),
-        # Whitespace-only wire output classifies as detail-less too, not as a
-        # codex-sent detail.
+        # Whitespace-only output is still detail-less.
         ({"output": "   "}, "native_turn_error"),
         # A detail-less reauth keeps its reauth code with the fallback message.
         ({"reauth_required": True}, "codex_reauth_required"),
@@ -5212,14 +5185,7 @@ async def test_post_external_session_status_failed_without_detail_still_carries_
     extra_data: dict[str, Any],
     expected_code: str,
 ) -> None:
-    """
-    A ``failed`` edge with no usable wire ``output`` and nothing persisted to
-    enrich from must still publish a typed error.
-
-    The web only appends an error block when the status edge carries one, so
-    an ``error: null`` failure flips the session to "failed" and leaves the
-    transcript with nothing explaining why.
-    """
+    """Require a typed fallback error when neither wire nor persisted detail exists."""
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions.routes_events import (
         _NATIVE_FAILURE_WITHOUT_DETAIL,
@@ -5228,12 +5194,7 @@ async def test_post_external_session_status_failed_without_detail_still_carries_
     published: list[tuple[str, dict[str, Any]]] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Accept whatever is forwarded to the fake runner.
-
-        :param request: Request sent to the fake runner.
-        :returns: Accepted response.
-        """
+        """Accept the forwarded runner event."""
         del request
         return httpx.Response(204)
 
@@ -5246,13 +5207,7 @@ async def test_post_external_session_status_failed_without_detail_still_carries_
         session_id: str,
         runner_router: object,
     ) -> httpx.AsyncClient:
-        """
-        Resolve the session to the fake runner client.
-
-        :param session_id: Session id being routed.
-        :param runner_router: Real app runner router, unused here.
-        :returns: The fake runner client.
-        """
+        """Return the fake runner client for this session."""
         del session_id, runner_router
         return fake_runner
 

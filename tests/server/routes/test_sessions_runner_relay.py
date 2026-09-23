@@ -1538,8 +1538,7 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
             "   ",
             "The turn failed but the runner reported no detail. See the runner log for details.",
         ),
-        # Reason dropped after the colon (str(exc) was empty runner-side):
-        # completed with a stand-in, keeping the recognizable prefix.
+        # Complete the recognizable prefix with a stand-in reason.
         (
             "turn setup failed: ",
             "turn setup failed: no reason reported (see the runner log for details)",
@@ -1550,15 +1549,7 @@ async def test_relay_repairs_failed_error_without_reason(
     relayed_message: str,
     expected_message: str,
 ) -> None:
-    """
-    A relayed ``failed`` error with no usable reason is repaired.
-
-    Old runners can relay ``{"code": "runner_error", "message": "turn setup
-    failed: "}`` (an exception whose ``str()`` was empty) or a blank message.
-    Republished verbatim, that detail reaches the broken-turn ERROR log and
-    ``last_task_error`` with nothing triageable in it -- the relay must
-    substitute or complete it with a stand-in pointing at the runner log.
-    """
+    """Repair blank and dropped-reason failure messages from older runners."""
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1585,8 +1576,7 @@ async def test_relay_repairs_failed_error_without_reason(
             conversation_store=store,  # type: ignore[arg-type]
         )
         assert handle is not None
-        # Subscribe BEFORE releasing the script so the published
-        # session.status event fans out to the collector.
+        # Subscribe before releasing the event producer.
         collector = await start_session_stream_collector(session_id)
         release.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)

@@ -1,43 +1,4 @@
-"""End-to-end: a codex-rejected reasoning effort must not fail the turn silently.
-
-Reported journey: set
-``reasoning_effort: minimal`` on a ``codex-native`` session pinned to
-``gpt-6-astra`` (a model whose advertised ladder has no ``minimal``): the
-session PATCH succeeds and a GET reports the effort back, but the first turn
-then ends ``status: failed`` with no output, no error item, and zero token
-usage. Nothing tells the user the model/effort pairing was rejected. The same
-brief at ``low`` works.
-
-Omnigent accepts the effort because ``CODEX_NATIVE_EFFORTS`` deliberately
-carries codex's full ladder (codex is the per-model authority,
-``omnigent/util/reasoning_effort.py``), and nothing re-checks the pairing
-against the model's ``model/list`` ``supportedReasoningEfforts``. When codex
-then ends the turn with a bare failed status and no ``TurnError`` payload,
-``_terminal_turn_status_edge`` (omnigent/harnesses/codex_native/forwarder.py)
-derives a ``failed`` edge with ``error=None`` and ``_post_turn_status_edge``
-publishes it with ``output=None`` -- a silent failed turn.
-
-This drives the real stack -- server subprocess, real ``omnigent.runner._entry``
-runner, the real codex-native bridge/executor/forwarder -- against a fake
-``codex`` CLI (an app-server speaking the same WebSocket JSON-RPC the real one
-does). The fake advertises ``gpt-6-astra`` without ``minimal`` in
-``supportedReasoningEfforts`` and, when a turn runs with an effort outside the
-model's advertised ladder, ends it with ``turn/failed`` carrying no error
-payload -- matching the report's "no provider error at all". The real codex CLI
-requires a live ChatGPT login and the real ``gpt-6-astra`` model, so this fake
-is a stand-in for the codex side; the omnigent side is fully real.
-
-While the bug is live, the ``minimal`` turn ends failed with no surfaced error
-anywhere (no error item, no failure output) and the test FAILS on that
-silence. It passes once an unsupported model/effort pairing surfaces a reason
-(a turn error naming the rejection) or is gated up front by the model's
-advertised levels -- either fix direction from the report.
-
-Run::
-
-    .venv/bin/python -m pytest \
-        tests/e2e/test_codex_native_unsupported_effort_silent_failure_e2e.py -v
-"""
+"""Verify rejected Codex efforts surface through the real stack and a fake app-server."""
 
 from __future__ import annotations
 
@@ -72,19 +33,15 @@ _POLL_INTERVAL_S = 2.0
 #: The model the report pins -- advertised by the fake WITHOUT ``minimal``.
 _ASTRA_MODEL = "gpt-6-astra"
 
-# Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
-# that must not intercept loopback requests to the spawned server.
+# Keep CI's egress proxy away from the spawned loopback server.
 _client = httpx.Client(trust_env=False)
 
-# Shared fixtures/helpers use ambient ``httpx`` calls that DO trust env, so
-# also exclude loopback from any forced proxy at import time.
+# Shared fixtures use clients that honor NO_PROXY.
 for _var in ("NO_PROXY", "no_proxy"):
     os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
 
 
-# The codex-native agent shape from the report, reduced to the fields that
-# pick the launch path under test. Sandbox none: the rig itself may already
-# run inside a container/bwrap where nested sandboxes cannot start.
+# Avoid nested sandbox startup in an already isolated test environment.
 _CODEX_NATIVE_AGENT_YAML = """\
 spec_version: 1
 name: codex-effort-repro
@@ -106,13 +63,7 @@ os_env:
     type: none
 """
 
-# A fake ``codex`` CLI: implements the app-server WebSocket JSON-RPC surface
-# the codex-native harness drives (initialize, model/list, hooks/list,
-# thread/resume, thread/settings/update, turn/start) plus ``--version`` and a
-# parked TUI mode for the tmux pane the runner opens. When a turn runs with a
-# reasoning effort outside the current model's advertised
-# ``supportedReasoningEfforts``, the turn ends with ``turn/failed`` and NO
-# error payload -- the report's observed silence ("no provider error at all").
+# Fake the Codex app-server and emit a bare turn/failed for unsupported efforts.
 _FAKE_CODEX_TEMPLATE = """#!{python}
 '''Fake codex CLI (app-server) for the unsupported-effort silent-failure e2e.'''
 import asyncio
@@ -290,12 +241,7 @@ def _free_port() -> int:
 
 
 def _no_proxy_env() -> dict[str, str]:
-    """Ambient env with loopback excluded from any forced HTTP(S) proxy.
-
-    Also drops any omnigent session/runner env leaked by the invoking
-    environment (data dir, runner identity, server URL): the rig must boot
-    its own isolated server and runner, not inherit a live session's.
-    """
+    """Return an isolated environment with loopback exempted from proxying."""
     env = {
         key: value
         for key, value in os.environ.items()
@@ -337,13 +283,7 @@ class _Rig:
 
 @pytest.fixture(scope="module")
 def fake_codex_rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
-    """Server + runner whose only codex CLI is the fake app-server above.
-
-    Isolated ``HOME`` / ``OMNIGENT_CONFIG_HOME`` / ``CODEX_HOME`` so the rig
-    sees no ambient providers; ``CODEX_HOME/auth.json`` carries a fake API key
-    so the codex launch router treats codex as logged in (``login_required``
-    false) instead of parking the session on the sign-in screen.
-    """
+    """Boot an isolated server and runner against the fake Codex app-server."""
     from omnigent.runner.identity import token_bound_runner_id
 
     work = tmp_path_factory.mktemp("codex_effort_silent_failure")
@@ -360,8 +300,7 @@ def fake_codex_rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
     fake_codex = bin_dir / "codex"
     fake_codex.write_text(_FAKE_CODEX_TEMPLATE.format(python=sys.executable))
     fake_codex.chmod(0o755)
-    # A stored codex login so resolve_native_codex_launch does not mark the
-    # launch login_required (which fails every chat turn fast by design).
+    # Keep launch routing on the authenticated Codex path.
     (codex_home / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": "sk-fake-e2e"}))
 
     port = _free_port()
@@ -465,13 +404,7 @@ def fake_codex_rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Rig]:
 
 
 def _create_pinned_session(rig: _Rig, *, reasoning_effort: str) -> str:
-    """Create a live codex-native session pinned to gpt-6-astra, then set the effort.
-
-    Mirrors the reported journey exactly: the session runs ``gpt-6-astra``
-    (explicit ``model_override``), and once the native thread is live the
-    ``reasoning_effort`` PATCH succeeds and a GET reports it back -- all
-    before the first turn.
-    """
+    """Create a live astra session and apply the requested effort after adoption."""
     create = _client.post(
         f"{rig.base_url}/v1/sessions",
         data={"metadata": json.dumps({"workspace": str(rig.workspace)})},
@@ -495,9 +428,7 @@ def _create_pinned_session(rig: _Rig, *, reasoning_effort: str) -> str:
     )
     bind.raise_for_status()
 
-    # Wait for the runner to adopt the native codex thread (terminal +
-    # app-server up), so the effort PATCH lands on a live session exactly as
-    # in the report.
+    # Apply the effort only after the native thread is live.
     deadline = time.monotonic() + _HEALTH_TIMEOUT_S
     thread_live = False
     while time.monotonic() < deadline:
@@ -508,8 +439,7 @@ def _create_pinned_session(rig: _Rig, *, reasoning_effort: str) -> str:
         time.sleep(1.0)
     assert thread_live, f"codex-native thread never came live for {session_id}\n{rig.log_tails()}"
 
-    # The report's PATCH: accepted by omnigent (CODEX_NATIVE_EFFORTS carries
-    # the full ladder) ...
+    # Omnigent accepts the full Codex effort ladder.
     effort_patch = _client.patch(
         f"{rig.base_url}/v1/sessions/{session_id}",
         json={"reasoning_effort": reasoning_effort},
@@ -519,7 +449,7 @@ def _create_pinned_session(rig: _Rig, *, reasoning_effort: str) -> str:
         f"reasoning_effort PATCH rejected: {effort_patch.status_code} {effort_patch.text}"
     )
 
-    # ... and a GET reports it back.
+    # Confirm both model and effort persisted.
     snapshot = _client.get(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
     snapshot.raise_for_status()
     body = snapshot.json()
@@ -594,11 +524,7 @@ def _wait_for_turn_outcome(rig: _Rig, session_id: str) -> _TurnOutcome:
 
 @pytest.mark.timeout(600)
 def test_supported_effort_low_turn_completes(fake_codex_rig: _Rig) -> None:
-    """Control: the same brief at ``low`` works (the report's working run).
-
-    Proves the rig itself is sound so the repro test below fails only on the
-    bug's silence, never on a broken fixture.
-    """
+    """Confirm the fake Codex rig completes an astra turn at low effort."""
     session_id = _create_pinned_session(fake_codex_rig, reasoning_effort="low")
     _send_user_message(fake_codex_rig, session_id, "Say hello.")
     outcome = _wait_for_turn_outcome(fake_codex_rig, session_id)
@@ -606,8 +532,6 @@ def test_supported_effort_low_turn_completes(fake_codex_rig: _Rig) -> None:
         f"low-effort control turn produced no assistant reply: {outcome}\n"
         f"{fake_codex_rig.log_tails()}"
     )
-    # The reply text proves the pinned model AND the patched effort reached
-    # codex through the real settings-update path -- rig fidelity, not luck.
     reply = " ".join(outcome.assistant_texts)
     assert "FAKE-CODEX-REPLY" in reply and "effort=low" in reply, reply
     assert not outcome.surfaced_errors(), (
@@ -618,30 +542,16 @@ def test_supported_effort_low_turn_completes(fake_codex_rig: _Rig) -> None:
 
 @pytest.mark.timeout(600)
 def test_unsupported_effort_minimal_failure_is_surfaced(fake_codex_rig: _Rig) -> None:
-    """An effort the model doesn't offer must not kill the turn silently.
-
-    Journey (the report's): pin ``gpt-6-astra`` + ``reasoning_effort:
-    minimal`` on a codex-native session (PATCH succeeds, GET reports it
-    back), send the first message, wait for the turn to end.
-
-    While the bug is live the turn ends ``status: failed`` with no output and
-    no error item -- pure silence -- and this test FAILS on the missing
-    explanation. After a fix the turn must either surface an error naming the
-    rejected model/effort pairing, or complete because the effort was gated
-    to the model's advertised levels.
-    """
+    """Require a visible reason when astra rejects minimal effort."""
     session_id = _create_pinned_session(fake_codex_rig, reasoning_effort="minimal")
     _send_user_message(fake_codex_rig, session_id, "Say hello.")
     outcome = _wait_for_turn_outcome(fake_codex_rig, session_id)
 
     if outcome.assistant_texts and outcome.session_status != "failed":
-        # Fix direction 2: the effort was gated/clamped to the model's
-        # advertised ladder and the turn completed -- not silent, acceptable.
+        # Up-front gating is also an acceptable non-silent outcome.
         return
 
-    # The turn failed: the failure must carry a user-visible reason -- an
-    # error item, or a failure output persisted as the session's
-    # last_task_error (what a failed edge with output produces).
+    # A failed outcome must surface through an item or last_task_error.
     assert outcome.surfaced_errors(), (
         "codex-native turn with an effort the model doesn't offer "
         f"(model={_ASTRA_MODEL!r}, effort='minimal') ended "

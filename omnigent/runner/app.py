@@ -2610,19 +2610,7 @@ def _session_status_to_task_status(status: object) -> str | None:
 
 
 def _exception_detail(exc: BaseException) -> str:
-    """
-    Return exception text for a failure message, never empty.
-
-    Some exceptions stringify to ``""`` (e.g. a bare ``CancelledError``
-    or ``RuntimeError()``), which turns a message like
-    ``f"turn setup failed: {exc}"`` into a prefix with the cause
-    dropped. Fall back to the class name so the published detail always
-    carries something diagnosable.
-
-    :param exc: The caught exception.
-    :returns: ``str(exc)``, or the exception class name when that is
-        blank, e.g. ``"CancelledError"``.
-    """
+    """Return exception text, falling back to its class name when blank."""
     text = str(exc).strip()
     return text or type(exc).__name__
 
