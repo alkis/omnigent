@@ -1,47 +1,7 @@
-"""Regression tests for the sessions namespace pagination metadata contract.
+"""Session listing metadata and cursor forwarding through httpx.MockTransport.
 
-``list_items`` and ``child_sessions`` in :class:`SessionsNamespace`
-return a bare ``list`` and silently discard ``has_more``, ``first_id``,
-and ``last_id`` from the server response.  A caller that reads a session
-transcript beyond ``limit`` rows has no way to know its view is a
-prefix.  ``child_sessions`` also accepts no ``after`` parameter, so
-a listing past ``limit`` children is unreachable, not merely unobservable.
-
-A secondary issue (also from the report) is that ``resolve_agent``
-terminates quietly when the server reports ``has_more`` but supplies no
-``last_id``: the agent is silently reported as missing even though it
-exists on an unreached page.
-
-What each test claims to prove and what a failure means
--------------------------------------------------------
-
-* ``test_list_items_returns_pagination_metadata``: ``list_items`` must
-  surface ``has_more`` / ``first_id`` / ``last_id`` from the server
-  response.  Failure means callers cannot detect a truncated listing.
-
-* ``test_list_items_pagination_with_cursor``: ``list_items`` must accept
-  an ``after`` cursor and forward it to the server, so a caller can
-  walk page 2.  Failure means the paging contract is broken on the
-  request side.
-
-* ``test_child_sessions_returns_pagination_metadata``: ``child_sessions``
-  must surface ``has_more`` / ``first_id`` / ``last_id``.  Failure means
-  callers cannot detect truncated child listings.
-
-* ``test_child_sessions_accepts_after_cursor``: ``child_sessions`` must
-  accept an ``after`` parameter and forward it to the server.  Failure
-  means a listing past ``limit`` children is entirely unreachable.
-
-* ``test_resolve_agent_raises_on_has_more_without_cursor``: when the
-  server reports ``has_more=True`` but omits ``last_id`` (preventing
-  cursor advance), ``resolve_agent`` must raise rather than silently
-  return ``LookupError`` for an agent that might exist on the next page.
-  Failure means a pagination-stall is indistinguishable from
-  "agent does not exist".
-
-Mocks at the HTTP transport boundary via :class:`httpx.MockTransport`;
-no live server required.
-"""
+Listings expose has_more, first_id and last_id; resolve_agent distinguishes
+a stalled cursor from an exhausted listing."""
 
 from __future__ import annotations
 
@@ -78,17 +38,7 @@ def _make_namespace(
 
 @pytest.mark.asyncio
 async def test_list_items_returns_pagination_metadata() -> None:
-    """``list_items`` must expose ``has_more``, ``first_id``, and ``last_id``.
-
-    The server always returns these fields (``paginate_in_memory`` in
-    ``omnigent/entities/pagination.py`` computes them for every listing).
-    Silently dropping them prevents the caller from knowing that the
-    returned list is a prefix of the full conversation — a session with
-    more than ``limit`` items (default 100) is silently truncated.
-
-    Failure means the return type is a bare ``list`` with no pagination
-    metadata, confirming the regression.
-    """
+    """Item pages expose has_more, first_id and last_id."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert "/items" in request.url.path
@@ -129,14 +79,7 @@ async def test_list_items_returns_pagination_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_list_items_pagination_with_cursor() -> None:
-    """``list_items`` forwards the ``after`` cursor to the server.
-
-    A caller that receives ``has_more=True`` and a ``last_id`` must be
-    able to fetch the next page by passing ``after=last_id``.  This test
-    confirms that the client sends ``?after=<id>`` in the query string.
-    Failure means the cursor is silently dropped and second-page fetches
-    always return from the start.
-    """
+    """Forward after=last_id so callers can fetch the next item page."""
     received_after: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -169,16 +112,7 @@ async def test_list_items_pagination_with_cursor() -> None:
 
 @pytest.mark.asyncio
 async def test_child_sessions_returns_pagination_metadata() -> None:
-    """``child_sessions`` must expose ``has_more``, ``first_id``, and ``last_id``.
-
-    When a parent session has more children than ``limit`` (default 100),
-    silently dropping ``has_more`` from the response means the caller
-    cannot detect that the child listing is incomplete — the sub-agent
-    tree shown in the CLI and web Agents rail may be silently truncated.
-
-    Failure means the return type is a bare ``list`` with no pagination
-    metadata, confirming the regression.
-    """
+    """Child-session pages expose has_more, first_id and last_id."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert "child_sessions" in request.url.path
@@ -210,17 +144,7 @@ async def test_child_sessions_returns_pagination_metadata() -> None:
 
 @pytest.mark.asyncio
 async def test_child_sessions_accepts_after_cursor() -> None:
-    """``child_sessions`` must accept an ``after`` cursor parameter.
-
-    Without ``after``, a listing past the first ``limit`` children is
-    entirely unreachable — there is no way to fetch page 2 at all,
-    regardless of whether ``has_more`` is surfaced.  This test confirms
-    that the method signature includes ``after`` and that the value is
-    forwarded to the server query string.
-
-    Failure means the parameter does not exist on the method, confirming
-    the second regression.
-    """
+    """Forward the child-session after cursor to make later pages reachable."""
     import inspect
 
     ns, client = _make_namespace(
@@ -264,18 +188,7 @@ async def test_child_sessions_accepts_after_cursor() -> None:
 
 @pytest.mark.asyncio
 async def test_resolve_agent_raises_on_has_more_without_cursor() -> None:
-    """``resolve_agent`` must raise when ``has_more=True`` but no cursor is supplied.
-
-    If the server reports ``has_more=True`` but omits ``last_id``
-    (preventing cursor advance), the current code silently stops and
-    returns ``LookupError("No agent named …")`` — which is wrong when
-    the agent exists on an unreached page.  The fix must raise a
-    descriptive error (not ``LookupError``) to distinguish "pagination
-    stalled" from "agent genuinely not found".
-
-    Failure (the bug) looks like: ``LookupError`` is raised and only one
-    request is made — the agent on page 2 is never fetched.
-    """
+    """A missing cursor with has_more=True must raise a pagination error."""
     request_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:

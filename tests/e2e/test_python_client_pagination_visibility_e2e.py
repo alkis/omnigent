@@ -1,33 +1,7 @@
-"""The python-client's listing methods must not hide pagination.
+"""SDK session listings must expose pagination and reject stalled cursor walks.
 
-``GET /v1/sessions/{id}/items`` and ``GET /v1/sessions/{id}/child_sessions``
-both return the documented paginated envelope (``data`` + ``first_id`` /
-``last_id`` / ``has_more`` — see ``routes_items.py``), and the child listing
-accepts an ``after`` cursor. The Python client's public wrappers drop all of
-it:
-
-* ``SessionsNamespace.list_items`` returns the bare ``data`` rows, so a caller
-  who received exactly ``limit`` rows cannot learn whether more exist — a
-  truncated transcript is indistinguishable from a complete one.
-* ``SessionsNamespace.child_sessions`` does the same AND exposes no ``after``
-  parameter, so children past the first page are unreachable through the
-  client at all.
-* ``SessionsNamespace.resolve_agent`` is the one cursor-following walk, and it
-  treats a stalled cursor (a page reporting ``has_more`` without a ``last_id``)
-  as a clean end of the listing — answering "no agent named X" for an agent
-  that lives on a page it never fetched.
-
-The first two tests drive the real client against a LIVE server,
-deterministically (no LLM turns: items are seeded via ``POST /v1/imports``,
-children via ``POST /v1/sessions`` with ``parent_session_id``). The
-stalled-cursor walk needs a degenerate listing page the real server never
-emits (``paginate_in_memory`` always stamps ``last_id`` on a non-empty page),
-so that test speaks real HTTP to a local stub serving the injected fault.
-
-The assertions accept any honest fix shape — pagination metadata carried on
-the return, or a client that follows the cursor itself and returns everything
-— and fail on the silent-prefix behavior of a client that drops the metadata.
-"""
+Item and child-session tests use a real local server with seeded data and no
+model turns. A local HTTP stub supplies the malformed cursor page."""
 
 from __future__ import annotations
 
