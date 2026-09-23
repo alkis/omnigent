@@ -11,14 +11,7 @@ def _normalized(path: Path) -> str:
 
 
 def test_recording_mandate_treats_a_reproduction_owned_server_as_filmable() -> None:
-    """A reproduction's own running server must be attempted as a recording target.
-
-    We assert the *behavioural contract*, not any particular sentence: the agent
-    instructions must (a) tell the agent to point the recorder at the server the
-    reproduction already runs, via the real ``--ui-base-url`` mechanism, and
-    (b) forbid skipping the lane on the stock fixture's limits alone — a skip is
-    only justified by an attach that was attempted and failed.
-    """
+    """The recorder must try the reproduction’s own server before declaring it blocked."""
     instructions = _normalized(_REPRO_AGENT_INSTRUCTIONS)
 
     # (a) the reproduction-owned server is a recording target, driven by --ui-base-url
@@ -31,11 +24,7 @@ def test_recording_mandate_treats_a_reproduction_owned_server_as_filmable() -> N
 
 
 def test_recording_lanes_document_how_to_film_against_a_running_server() -> None:
-    """The lane doc must carry the durable mechanics for a caller-owned server.
-
-    These are stable identifiers (flags / env vars / field names), not prose, so
-    the doc can be reworded freely without breaking the contract this guards.
-    """
+    """The guide documents the external-server recording flags and failure field."""
     lanes = _normalized(_RECORDING_LANES)
 
     assert "--ui-base-url" in lanes
@@ -49,13 +38,7 @@ def test_recording_lanes_document_how_to_film_against_a_running_server() -> None
 
 
 def test_static_text_escape_excludes_transient_error_moments() -> None:
-    """An error appearing mid-journey is watchable, not static text.
-
-    The static-text escape covers outcomes where nothing on the surface moves; a
-    mid-turn error surfacing in a live session is a temporal moment both docs must
-    classify as filmable. We check the concept (a mid-journey/mid-turn error that
-    the escape does not cover) rather than a fixed sentence.
-    """
+    """A mid-turn error is a visible response that should be recorded."""
     for path in (_REPRO_AGENT_INSTRUCTIONS, _RECORDING_LANES):
         text = _normalized(path)
         assert "static text" in text, path

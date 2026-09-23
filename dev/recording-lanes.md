@@ -15,53 +15,51 @@ Everything else below — which surface to drive, how to stand the recorder up, 
 the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
 which clip `kind` it produces and where it goes; this file is the how.
 
-## What is expected to yield a recording
+## When to record
 
-A `web` / `mobile` / `terminal` / `cli` / `desktop` facet is expected to yield a recording:
-drive it on that surface and film it. A facet legitimately has no recording when
-its outcome is not something a user *watches* — an `api` failure no user observes
-on any surface (a wrong value in a response, an internal state a pytest asserts),
-or a facet whose whole user-visible outcome is a static piece of text (an error
-string, a value, a log line) with nothing that moves on screen. For those,
-`recordings: []` is correct and not a gap: state the observed text and how you
-confirmed it in your prose/evidence instead. Tests may drive and verify the
-journey, but the clip itself must show the product surface and user-visible
-outcome, never the test process, pytest output, assertions, logs, or a synthetic
-evidence-summary slide.
+Record the user action and the product's response:
 
-**A valid clip shows a live action producing the outcome — not static text
-asserting it.** A recording earns its place only when there is something to
-*watch*: a user action drives the surface and the product visibly responds — a
-terminal command executing and printing its result, a screen changing, a value
-updating, an error appearing in response to input. That is why filming a
-`terminal`/`cli` command is legitimate: the pane is live, the command runs, the
-output is the product's own behavior. What is **never** a recording is a clip
-whose content is just text sitting on screen — a summary slide, a narrated page,
-the reproduction test's own console output, or a hand-typed sentence "claiming"
-the bug reproduces. Those film your *assertion*, not the product, and a viewer
-learns nothing a written line wouldn't tell them better; describe the outcome in
-prose instead of manufacturing a video of it. Conversely, an error *appearing*
-during a live journey — a status pill flashing mid-turn, a stream dying and the
-session recovering — is a screen changing, not static text: the moment is
-temporal and filmable, and the static-text escape does not apply just because
-the error's *text* is a fixed string.
+- **Web, mobile, or desktop:** show the user interacting with the product and
+  the result on screen.
+- **CLI or terminal output:** record the real command and its output, even if the
+  output is only an error message, hint, or status line.
+- **Internal/API-only results:** written evidence is enough when no user
+  interface shows the result. Set `recordings: []`, describe what you observed,
+  and explain how you checked it.
 
-**One verdict-appropriate clip per facet — nothing else.** Every recording must
-correspond to a facet, and its `kind` must match that facet's verdict. Do **not**
-add a "contrast"/"control" clip of a *different*, working journey next to a
-reproduced facet — an unrequested extra video with no facet behind it only
-confuses the reader.
+Record an error appearing mid-turn; it is a visible response, not static text
+asserting the bug.
 
-Recording is **best-effort**: if the tooling below is missing, or a user-facing
-facet's state is genuinely unreachable in this harness, keep `recordings: []` for
-that facet and **name the specific blocker** in `recording_unavailable_reason` —
-an empty recordings list on a `web`/`mobile`/`terminal`/`cli`/`desktop` facet must
-always come with a concrete reason, never a silent skip. A limit of the stock
-recording fixture is never that blocker by itself when the reproduction already
-runs its own live server — attempt the attach described below first. Never let
-recording block or distort the work itself, and never fabricate a hollow
-journey that doesn't reach the failure just to produce a video. Missing or
-rejected footage never blocks the verdict, fix, or PR.
+For example, if `omnigent host` prints the wrong error after login expires,
+record running that command with an expired login and showing its output. See
+the `cli` section below for setup steps.
+
+## What the clip must show
+
+- Show the actual product behavior. Tests may drive the interaction and verify
+  the result, but the clip must show the product itself.
+- Do not substitute a video of pytest output, assertions, test source, debug
+  logs, or a slide describing what happened. Do not invent a different journey
+  just to produce a video.
+- Record one clip per facet, with a `kind` that matches its verdict. Do not add
+  unrelated working examples as extra clips.
+
+## If recording is blocked
+
+Recording is **best-effort**:
+
+- If a required tool is missing or the product cannot reach the state you need
+  to show, set `recordings: []` for that facet. Name the specific blocker in
+  `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
+  that cannot start.
+- If the reproduction runs its own live server, attempt the recorder attach
+  described below before citing the stock fixture as a blocker.
+- Text-only CLI output is not a reason to skip recording. A missing recording
+  from an earlier run is not a reason either.
+- Do not block the verdict, fix, or PR because footage is missing or rejected.
+  Explain the gap and continue with the available evidence.
+
+## File names and capture modes
 
 Every declared recording includes `capture_mode`, which records how the product
 surface was filmed. Use `playwright_ui` for browser-page capture, `electron` for
@@ -93,22 +91,28 @@ bundle exists the SPA is live on your stack's own URL. Then run the recorder
 against that URL:
 
 ```bash
+OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
 OMNIGENT_E2E_RECORD_DIR="$PWD/recordings/<slug>/raw" \
   pytest <test_path> --ui-base-url http://127.0.0.1:<port> \
-  --screenshot on --output recordings/<slug>
+  --video on --screenshot on --output recordings/<slug>
 ```
 
-`--ui-base-url` skips the fixture's own SPA build and server spawn and drives
-the URL you give it. Its safety check refuses only the well-known dev ports
-(6767, 8000, 5173) unless `OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1`, so a stand-in
-stack on a random port passes as-is, and the suite spawns its own runner
-tunneled into your server for the runner-bound fixtures. If the authored test
-leans on fixtures that only exist against the fixture-owned server (direct DB
-peeks), fall back to a bare Playwright context pointed at your server's URL —
-`OMNIGENT_E2E_RECORD_DIR` films every context the test opens either way. Only
-an attach you actually attempted and that failed justifies skipping the lane:
-quote the failing command and its error in `recording_unavailable_reason`,
-never the stock fixture's limits.
+`--ui-base-url` skips the SPA build and server spawn. Use an isolated loopback
+server on a random port. The safety check rejects loopback, local/private
+addresses and known development ports (6767, 8000, 5173). The command opts in
+with `OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1` for this reproduction-owned server. Runner-bound fixtures start a runner against
+the supplied server.
+
+Tests that depend on the fixture-owned database cannot use an external server.
+For those journeys, drive the reproduction's server with a separate Playwright
+context and pass `record_video_dir` explicitly. Within `tests/e2e_ui/`,
+`OMNIGENT_E2E_RECORD_DIR` enables direct async contexts; `--video on` covers the
+pytest-playwright page fixture. Direct synchronous contexts need an explicit
+`record_video_dir`. Close the context to finish the WebM.
+
+If the attach fails, include the command and error in
+`recording_unavailable_reason`. A stock fixture limitation alone does not
+establish that the running server cannot be recorded.
 
 ## Build the SPA up front — before you run the recorder, not during it
 
