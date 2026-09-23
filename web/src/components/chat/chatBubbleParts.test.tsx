@@ -286,19 +286,36 @@ describe("UserBubble delivery footer", () => {
     content: [{ type: "input_text", text: "Can you add jitter and re-run just that test?" }],
   });
 
-  it("shows only the spinner while a fresh send is in flight", () => {
-    render(
-      <BubbleView
-        bubble={pendingBubble({ posted: false, stalled: false })}
-        isLastAssistant={false}
-      />,
-    );
+  it("shows nothing for a fresh send, then only the spinner once it is slow", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <BubbleView
+          bubble={pendingBubble({ posted: false, stalled: false })}
+          isLastAssistant={false}
+        />,
+      );
+      // A send that confirms within two seconds never shows a footer at all.
+      expect(screen.queryByTestId("send-delivery")).not.toBeInTheDocument();
 
-    const footer = screen.getByTestId("send-delivery");
-    expect(footer).toHaveAttribute("data-state", "sending");
-    expect(footer).toHaveTextContent("Sending");
-    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(2_000);
+      });
+      const footer = screen.getByTestId("send-delivery");
+      expect(footer).toHaveAttribute("data-state", "sending");
+      expect(footer).toHaveTextContent("Sending");
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+
+      // Elapsed time alone never offers Retry: a slow but healthy POST is not
+      // a failure, and Retry could not do anything for it anyway.
+      act(() => {
+        vi.advanceTimersByTime(30_000);
+      });
+      expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("offers Retry and Cancel for a stalled send and wires them to the store", () => {

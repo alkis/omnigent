@@ -683,15 +683,18 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
-/** Retry and Cancel appear once a send has been pending this long without an answer. */
-const SEND_CONTROLS_DELAY_MS = 4_000;
+/** A send unconfirmed this long shows its spinner; most sends confirm sooner. */
+const SEND_SPINNER_DELAY_MS = 2_000;
 
 /**
- * Delivery footer under an optimistic user bubble. While sending it shows a
- * spinner only; Retry and Cancel appear after a few seconds, when the send
- * stalls, or when the server refused it. A thrown fetch is never shown as a
- * failure — it says nothing about whether the server took the message, and
- * the store keeps re-sending the same stable id until it gets an answer.
+ * Delivery footer under an optimistic user bubble. Nothing shows for the
+ * first two seconds; past that a spinner says the send is still unconfirmed.
+ * Retry and Cancel appear only on evidence the send is not progressing on
+ * its own — parked after the automatic retries, or refused by the server —
+ * never on elapsed time alone, so a slow but healthy POST does not look
+ * like a failure. A thrown fetch is never shown as one either: it says
+ * nothing about whether the server took the message, and the store keeps
+ * re-sending the same stable id until it gets an answer.
  */
 function PendingDeliveryFooter({
   tempId,
@@ -701,15 +704,16 @@ function PendingDeliveryFooter({
   delivery: PendingDelivery;
 }) {
   const accepted = delivery.posted && delivery.error === undefined;
-  const [waitedLong, setWaitedLong] = useState(false);
+  const [slow, setSlow] = useState(false);
   useEffect(() => {
     if (accepted) return;
-    const timer = setTimeout(() => setWaitedLong(true), SEND_CONTROLS_DELAY_MS);
+    const timer = setTimeout(() => setSlow(true), SEND_SPINNER_DELAY_MS);
     return () => clearTimeout(timer);
   }, [accepted]);
   if (accepted) return null;
   const refused = delivery.error !== undefined;
-  const showControls = refused || delivery.stalled || waitedLong;
+  const showControls = refused || delivery.stalled;
+  if (!slow && !showControls) return null;
   const actionClass =
     "rounded-sm font-medium text-foreground underline decoration-foreground/30 underline-offset-[3px] hover:decoration-foreground focus-visible:outline-2 focus-visible:outline-ring";
   return (
