@@ -1,8 +1,4 @@
-// Behaviour tests for the desktop peek card's geometry: the floating card must
-// clear the chat header so the open-sidebar toggle that armed it stays exposed
-// and clickable. When the card covered the header, the click aimed at the
-// toggle landed on the card's brand/home link instead — navigating to "/" and
-// losing the open session rather than pinning the sidebar open.
+// Keep the hover-preview clear of the header toggle’s click target.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -10,6 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -97,11 +94,13 @@ function renderPeekingSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={false} peek onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={false} peek onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -120,10 +119,6 @@ describe("desktop peek card", () => {
     renderPeekingSidebar();
 
     const card = screen.getByRole("complementary", { name: "Conversations" });
-    // Top edge clears the md:h-12 chat header: the pointer that armed the
-    // peek is resting on the header's open-sidebar toggle, and a card that
-    // covers it (as full-viewport inset-2 did) steals the click — it lands on
-    // the card's brand link and navigates home instead of pinning the sidebar.
     expect(card).toHaveClass("is-peek", "md:top-12");
     expect(card).not.toHaveClass("md:inset-2");
   });

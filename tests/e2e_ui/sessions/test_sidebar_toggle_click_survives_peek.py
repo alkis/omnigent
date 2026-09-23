@@ -1,38 +1,6 @@
-"""E2E: clicking the sidebar toggle must open the sidebar even when the
-hover-preview (peek card) has appeared under the pointer.
+"""A raw pointer click on the sidebar toggle still pins it open during hover-preview.
 
-With the Conversations sidebar collapsed, dwelling on the
-chat header's "Open sidebar" toggle for 400ms arms dwell-to-peek
-(``web/src/shell/ChatHeader.tsx``), which mounts the sidebar as a floating
-peek card (``web/src/shell/Sidebar.tsx``). If that card covers the toggle
-the pointer is resting on, the card surface at the toggle's coordinates is
-the sidebar's brand/home link, and a click aimed at the toggle hits the
-brand link instead: the app navigates to ``/`` (losing the open session)
-and the sidebar is never pinned open — once the pointer wanders off, the
-peek card self-dismisses back to collapsed. The card must therefore float
-clear of the chat header, leaving the toggle exposed and clickable.
-
-The user journey this encodes (from the report: clicking the toggle "before
-the hover-preview appears" fails intermittently — the preview has actually
-just mounted and is still fading in, so the click lands on it):
-
-1. open a session with the sidebar collapsed
-2. move the pointer onto the top-left sidebar toggle
-3. the hover-preview (peek card) appears under the pointer
-4. click — aiming at the toggle
-5. expected: the sidebar pins open and the session stays put;
-   actual: the app navigates to ``/`` and the sidebar ends collapsed
-
-The click is a raw ``page.mouse`` press at the toggle's coordinates — the
-user's physical gesture — not ``locator.click()``, whose actionability checks
-would refuse to press a covered button and mask the bug. Waiting for the
-``is-peek`` class before pressing makes the race deterministic: any click
-landing after the card mounts reproduces the failure every time.
-
-Pure client-side layout/pointer behaviour, so no LLM turn is needed (and none
-of the nightly/real-agent markers the approval suites carry). Desktop-only:
-peek is a desktop hover affordance (mobile taps never arm it).
-"""
+The real SPA must keep the session URL and leave the sidebar open after the pointer moves."""
 
 from __future__ import annotations
 
@@ -56,15 +24,17 @@ def test_sidebar_toggle_opens_after_peek_appears(
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
-    # Session page settled: the composer is the stable ready signal (never
-    # wait for networkidle here — the page keeps an SSE stream open).
+    # Use the composer as readiness signal; the SSE stream prevents network idle.
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
 
     conversations = page.locator(_CONVERSATIONS)
-    # The sidebar defaults open on the desktop viewport; collapse it with the
-    # standard hotkey so the header toggle appears.
+    # Collapse the desktop sidebar to expose the header toggle.
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
-    page.keyboard.press(_LEFT_CHORD)
+    page.keyboard.press(
+        "Meta+Alt+BracketLeft"
+        if page.evaluate("navigator.platform.includes('Mac')")
+        else _LEFT_CHORD
+    )
     expect(conversations).to_have_attribute("data-collapsed", "true")
 
     toggle = page.locator(_TOGGLE)
@@ -74,24 +44,16 @@ def test_sidebar_toggle_opens_after_peek_appears(
     cx = box["x"] + box["width"] / 2
     cy = box["y"] + box["height"] / 2
 
-    # Step 2-3 of the journey: rest the pointer on the toggle until the
-    # hover-preview mounts under it. Waiting on the is-peek class (rather
-    # than sleeping 400ms) pins the race deterministically at its earliest
-    # failing point — the card has mounted and is still fading in.
+    # Wait for the hover-preview before clicking the original pointer target.
     page.mouse.move(cx, cy)
     expect(conversations).to_have_class(_PEEK_CLASS, timeout=5_000)
 
-    # Step 4: the user clicks the toggle they aimed at.
     page.mouse.down()
     page.mouse.up()
 
-    # Step 5 (expected behaviour): the click must act as the sidebar toggle —
-    # staying on the session, never hijacked into a navigation by whatever
-    # the peek card slid under the pointer.
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
 
-    # ... and the sidebar must end up genuinely pinned open (docked, not a
-    # transient peek that self-dismisses when the pointer wanders off).
+    # The sidebar must remain docked after the pointer leaves.
     expect(conversations).not_to_have_class(_PEEK_CLASS)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     page.mouse.move(640, 420)
