@@ -816,6 +816,92 @@ async def test_relay_holds_mid_turn_session_across_slow_tunnel_reconnect(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+async def test_relay_hold_ends_quietly_when_the_session_settles_mid_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A settled session ends the mid-turn hold without a second failure.
+
+    The hold re-checks the session's state on every retry, so another path
+    settling the session during the outage — a crash report failing it, a
+    Stop idling it — must end the hold early and publish nothing: the
+    settled state already tells the user what happened, and a disconnect
+    failure on top would overwrite it.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_TURN_RESUME_WINDOW_S",
+        30.0,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._RELAY_RETRY_INTERVAL_S",
+        0.05,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    # Never set: the endpoint stays down for the relay's whole lifetime.
+    back_online = asyncio.Event()
+    fake_runner = _RecycledTunnelRunnerClient([], back_online)
+    store = _RecordingLabelStore(live_status="running")
+    session_id = "1f2e3d4c5b6a798887a6b5c4d3e2f1a0"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_recycled_tunnel",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        relay_task = handle.task
+        collector = await start_session_stream_collector(session_id)
+
+        # The hold is live: reconnect attempts are being rejected.
+        async def _holding() -> None:
+            while fake_runner.rejected_attempts < 3:
+                assert not relay_task.done(), "relay task ended before the hold was observed"
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_holding(), timeout=_TASK_TIMEOUT_S)
+
+        # A crash report settles the session during the hold (the crash path
+        # publishes its own failure and flips the relay-fed cache).
+        sessions_module._session_status_cache[session_id] = "failed"
+
+        # The next retry's state re-check ends the hold; the relay exits
+        # without publishing a disconnect failure over the settled state.
+        await asyncio.wait_for(relay_task, timeout=_TASK_TIMEOUT_S)
+
+        assert store.labels.get(session_id) is None, (
+            "the ended hold stamped disconnect labels over the settled session"
+        )
+        while not collector.queue.empty():
+            event = collector.queue.get_nowait()
+            assert not (
+                event.get("type") == "session.status" and event.get("status") == "failed"
+            ), f"the ended hold published a second failure: {event!r}"
+    finally:
+        back_online.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 

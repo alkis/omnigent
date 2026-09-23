@@ -333,11 +333,24 @@ def _wait_runner_online(
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "release_during_outage",
+    [False, True],
+    ids=["output_after_reconnect", "output_during_outage"],
+)
 def test_mid_turn_tunnel_recycle_resumes_rather_than_aborts(
     tmp_path: Path,
     mock_llm_server_url: str,
+    release_during_outage: bool,
 ) -> None:
-    """Reconnect after a mid-turn tunnel recycle without publishing a failed turn."""
+    """Reconnect after a mid-turn tunnel recycle without publishing a failed turn.
+
+    ``output_after_reconnect`` holds the turn's output until the runner is back,
+    proving the hold itself. ``output_during_outage`` lets the turn finish while
+    the tunnel is down, proving the events it emitted with no subscriber attached
+    are delivered exactly once after the reconnect (neither lost nor duplicated
+    by the runner's snapshot replay).
+    """
     if mock_llm_server_url is None:
         pytest.skip("requires the mock LLM server (mock mode)")
 
@@ -444,13 +457,18 @@ def test_mid_turn_tunnel_recycle_resumes_rather_than_aborts(
         # runner's "retrying in ~0.5s" cadence keeps trying throughout. --
         proxy.recycle(block_new=True)
         _wait_runner_online(client, runner_id, online=False, timeout=15.0)
+        if release_during_outage:
+            # The turn finishes on the runner while the tunnel is down: its
+            # output events are queued runner-side with no subscriber attached.
+            release_mock_gate(mock_llm_server_url)
         time.sleep(RUNNER_DISCONNECT_GRACE_S + 3.0)
         proxy.resume()
         _wait_runner_online(client, runner_id, online=True, timeout=45.0)
 
-        # Runner is back with the same id and its turn is still running. Let the
-        # LLM finish so the turn can complete across the reconnect.
-        release_mock_gate(mock_llm_server_url)
+        if not release_during_outage:
+            # Runner is back with the same id and its turn is still running. Let
+            # the LLM finish so the turn can complete across the reconnect.
+            release_mock_gate(mock_llm_server_url)
 
         # Drive the snapshot poll too (the turn does eventually resume + complete
         # server-side even in the buggy case, so this alone would not catch the
@@ -492,6 +510,23 @@ def test_mid_turn_tunnel_recycle_resumes_rather_than_aborts(
             f"Final snapshot status={body['status']!r} "
             f"error={body.get('error')!r}.\nServer log tail:\n"
             f"{server_log.read_text()[-4000:]}"
+        )
+        # Exactly once: the answer survives the outage in the durable transcript
+        # without being duplicated by the reconnect replay.
+        assert body["status"] == "completed", (
+            f"Turn ended {body['status']!r} (error={body.get('error')!r}) "
+            "instead of completing across the reconnect."
+        )
+        assistant_text = "\n".join(
+            block.get("text") or ""
+            for item in body["output"]
+            if item.get("type") == "message"
+            for block in item.get("content", [])
+        )
+        assert assistant_text.count(marker) == 1, (
+            f"Expected the turn's answer exactly once in the transcript, found "
+            f"{assistant_text.count(marker)} occurrences of {marker!r}:\n"
+            f"{assistant_text}"
         )
     finally:
         if viewer is not None:
