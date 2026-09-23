@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import itertools
 import logging
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -1676,6 +1674,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     keeps the ERROR and its traceback.
     """
     bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
@@ -1686,7 +1685,9 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
-        claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
@@ -1700,6 +1701,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
         ]
 
     # The turn still fails: the pane is gone either way.
+    assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
 
@@ -1904,16 +1906,9 @@ async def test_prompt_timeout_reap_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    A slow tmux kill after a delivery timeout must not stall the loop.
-
-    ``kill_session`` blocks on a subprocess bounded by the bridge's 10s
-    send timeout, so cleanup must run off the event loop: heartbeats
-    sharing the loop keep ticking while the kill waits, and the kill
-    still completes before the turn's error is yielded.
-    """
-    # Well below the bridge's subprocess timeout, far above loop jitter.
-    slow_kill_s = 0.5
+    """The event loop must run while cleanup waits, before the turn error is yielded."""
+    kill_started = threading.Event()
+    release_kill = threading.Event()
     killed = threading.Event()
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
@@ -1922,23 +1917,16 @@ async def test_prompt_timeout_reap_keeps_event_loop_responsive(
 
     def slow_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
         del bridge_dir_arg, timeout_s
-        time.sleep(slow_kill_s)
+        kill_started.set()
+        release_kill.wait(10)
         killed.set()
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", slow_kill)
-
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
-    ticks: list[float] = []
 
-    async def heartbeat() -> None:
-        while True:
-            ticks.append(time.monotonic())
-            await asyncio.sleep(0.01)
-
-    beat = asyncio.create_task(heartbeat())
-    try:
-        events = [
+    async def collect() -> list:
+        return [
             event
             async for event in executor.run_turn(
                 messages=[{"role": "user", "content": "hi"}],
@@ -1946,20 +1934,25 @@ async def test_prompt_timeout_reap_keeps_event_loop_responsive(
                 system_prompt="",
             )
         ]
+
+    turn = asyncio.create_task(collect())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(kill_started.wait, 10), 15)
+        # A synchronous kill blocks this coroutine until its wait has already ended.
+        assert not killed.is_set(), "cleanup blocked the event loop"
+        assert not turn.done(), "turn finished before cleanup completed"
+        release_kill.set()
+        events = await asyncio.wait_for(turn, 10)
     finally:
-        beat.cancel()
+        release_kill.set()
+        if not turn.done():
+            turn.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await beat
+            await turn
 
     assert killed.is_set(), "cleanup skipped or orphaned the kill"
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert len(ticks) >= 2
-    max_gap = max(later - earlier for earlier, later in itertools.pairwise(ticks))
-    assert max_gap < slow_kill_s / 2, (
-        f"event loop stalled for {max_gap:.2f}s while cleanup waited on a "
-        f"slow tmux kill-session ({slow_kill_s:.1f}s)"
-    )
 
 
 @pytest.mark.asyncio
