@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
+    _READINESS_PROBE_MAX_WORKERS,
     configured_harness_map,
     harness_is_configured,
 )
@@ -375,9 +378,7 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
-        # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
-        # binary of its own. Per-slug ``acp:<slug>`` keys are config-derived, so
-        # none appear here (the fixture's config home is empty).
+        # Generic ACP is config-gated; the empty fixture has no slug keys.
         "acp",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
         # row never needs to touch this list.
@@ -505,10 +506,7 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
-    # The generic ACP harness is config-gated (≥1 registered agent), not
-    # CLI-gated — satisfy it so it isn't the lone unconfigured entry here. A
-    # real entry (not a bare object) so the map's per-slug enumeration also
-    # runs, adding an all-true ``acp:<slug>`` key.
+    # Supply a real entry so generic and per-slug ACP readiness are true.
     from omnigent.onboarding.acp_auth import AcpAgentEntry
 
     monkeypatch.setattr(
@@ -522,14 +520,7 @@ def test_configured_harness_map_all_true_with_clis(
 def test_configured_harness_map_enumerates_configured_acp_slugs(
     tmp_path: Path,
 ) -> None:
-    """Every configured ``acp:<slug>`` agent gets its own available map key.
-
-    The picker seeds one row per configured generic-ACP agent and filters it
-    against this map, where a missing key on a non-empty map reads as
-    unconfigured — so a map without the slug keys badges a launchable agent
-    "needs setup" (the false negative this pins). Colliding names keep their
-    ``-2`` suffix so every row's key matches the slug the agent registers under.
-    """
+    """Expose every configured ACP slug, including collision suffixes."""
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump(
             {
@@ -553,13 +544,7 @@ def test_configured_harness_map_enumerates_configured_acp_slugs(
 def test_configured_harness_map_omits_acp_slugs_without_configured_agents(
     tmp_path: Path,
 ) -> None:
-    """No ``acp:`` block → no slug keys, and a malformed block never raises.
-
-    An empty config must not invent slug keys, and a block that makes
-    ``acp_agents()`` raise degrades to the generic ``acp`` entry reading
-    not-configured — readiness feeds the daemon's hello frame and must never
-    crash the refresh.
-    """
+    """Omit slug keys for empty or malformed ACP configuration."""
     result = configured_harness_map()
     assert not [key for key in result if key.startswith("acp:")]
 
@@ -592,6 +577,49 @@ def test_configured_harness_map_probes_codex_readiness_once(
     result = configured_harness_map()
 
     assert calls == 1
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
+
+
+def test_configured_harness_map_runs_independent_probes_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent readiness probes overlap without duplicating aliases."""
+    lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    max_active = 0
+    calls: Counter[str] = Counter()
+
+    def _availability(canonical: str) -> bool | str:
+        nonlocal active, max_active
+        with lock:
+            calls[canonical] += 1
+            active += 1
+            max_active = max(max_active, active)
+            if active >= _READINESS_PROBE_MAX_WORKERS:
+                release.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("readiness probes did not overlap")
+        with lock:
+            active -= 1
+        if "codex" in canonical:
+            return "needs-auth"
+        return canonical != "claude-native"
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._harness_availability",
+        _availability,
+    )
+
+    result = configured_harness_map()
+
+    assert result
+    assert max_active == _READINESS_PROBE_MAX_WORKERS
+    assert all(count == 1 for count in calls.values())
+    assert result["claude-native"] is False
+    assert result["native-claude"] is True
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"

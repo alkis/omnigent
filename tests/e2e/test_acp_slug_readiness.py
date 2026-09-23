@@ -1,29 +1,4 @@
-"""E2E: a configured ``acp:<slug>`` agent must read as configured on its host.
-
-Guards against a keyspace drift in the daemon's readiness map
-(``omnigent.onboarding.harness_readiness.configured_harness_map``): when the
-map is built only from fixed harness spellings plus the generic ``acp`` key --
-without enumerating the user-configured ``acp:<slug>`` slugs -- it carries
-``acp: True`` but no ``acp:traex`` key. The picker seeds one agent row per
-configured slug and filters that row against the host's ``configured_harnesses``
-map, where an undefined key on a non-empty map reads as "unconfigured", so a
-launchable agent (an ``acp:`` config block, e.g. TraeX -> ``acp:traex``) is
-wrongly badged "needs setup" in the New Chat picker.
-
-This drives the reported precondition for real, end to end:
-
-1. configure a generic-ACP agent (``acp:`` block naming TraeX) under an isolated
-   ``OMNIGENT_CONFIG_HOME``,
-2. start an ``omnigent host`` daemon under that environment,
-3. inspect the host through ``GET /v1/hosts/{host_id}``,
-4. assert the readiness map exposes the ``acp:traex`` slug as available -- not
-   absent, which is what hides it behind a false "needs setup" badge.
-
-The contradiction is the bug: the launch gate for the same slug
-(``harness_is_configured`` -> canonical ``acp`` -> ``bool(acp_agents())``) is
-``True`` on the same config, so the agent genuinely launches; only the readiness
-map omits the slug key, so the badge is a false negative.
-"""
+"""Verify a host advertises configured ``acp:<slug>`` agents."""
 
 from __future__ import annotations
 
@@ -42,8 +17,6 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The exact acp: config from the bug report: one user-configured generic-ACP
-# agent whose display name slugifies to ``traex`` (harness id ``acp:traex``).
 _ACP_CONFIG_YAML = """\
 acp:
   agents:
@@ -51,8 +24,6 @@ acp:
       command: traex acp serve
 """
 
-# The slug the report's agent registers under, and the readiness-map key that
-# the picker filters the seeded row against.
 _ACP_SLUG = "traex"
 _ACP_HARNESS_KEY = f"acp:{_ACP_SLUG}"
 
@@ -63,31 +34,18 @@ def _acp_host_daemon(
     tmp_path: Path,
     live_server: str,
 ) -> Iterator[Path]:
-    """Spawn an ``omnigent host`` daemon whose config declares an ``acp:`` agent.
-
-    The daemon runs with an isolated ``OMNIGENT_CONFIG_HOME`` (so the test never
-    touches the developer's real host identity) holding the report's ``acp:``
-    block -- i.e. exactly the machine state the bug describes.
-
-    :param tmp_path: Per-test temp dir for the config home and daemon log.
-    :param live_server: Test server URL the daemon registers with.
-    :returns: The ``OMNIGENT_CONFIG_HOME`` path so the test can read the same
-        config the daemon's readiness probe used.
-    """
+    """Run a host daemon with an isolated ACP configuration."""
     config_home = tmp_path / "omnigent-home"
     config_home.mkdir()
     (config_home / "config.yaml").write_text(_ACP_CONFIG_YAML)
 
     env = {**os.environ}
-    # Drop any ambient runner/host identity (present when this test itself runs
-    # inside a server-spawned runner) so the daemon starts clean.
+    # Keep the daemon independent from a parent runner or host.
     for var in list(env):
         if var.startswith(("OMNIGENT_RUNNER", "OMNIGENT_HOST", "OMNIGENT_ZYGOTE")):
             env.pop(var)
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
-    # Import the branch's source (and its in-repo SDK packages) rather than
-    # whatever omnigent is installed in the venv -- same reasoning as the
-    # live_server fixture's PYTHONPATH.
+    # Import this worktree and its in-repo SDK packages.
     pythonpath = [
         str(_REPO_ROOT),
         str(_REPO_ROOT / "sdks" / "python-client"),
@@ -118,13 +76,7 @@ def _acp_host_daemon(
 
 
 def _online_host_id(client: httpx.Client, timeout: float = 60.0) -> str:
-    """Poll ``GET /v1/hosts`` until a host is online; return its id.
-
-    :param client: HTTP client bound to the live server.
-    :param timeout: Max seconds to wait for the daemon to register.
-    :returns: The online host's ``host_id``.
-    :raises AssertionError: If no host comes online within *timeout*.
-    """
+    """Wait for the host daemon to register."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         resp = client.get("/v1/hosts")
@@ -142,16 +94,7 @@ def test_configured_acp_slug_reads_configured_on_host(
     http_client: httpx.Client,
     tmp_path: Path,
 ) -> None:
-    """A configured ``acp:<slug>`` must appear (available) in the readiness map.
-
-    The daemon reports readiness through ``configured_harness_map()``. With an
-    ``acp:`` block declaring TraeX, the generic ``acp`` key is available (there
-    is a configured agent), and the *launch gate* for ``acp:traex`` is also
-    ``True`` -- so the agent genuinely launches. The map must therefore also
-    carry the ``acp:traex`` slug key as available; when it is absent the picker
-    (``harnessUnavailableReasonOnHost``) badges the seeded row "needs setup" on a
-    non-empty map, the false negative under test.
-    """
+    """Expose a launchable ACP slug in the host readiness map."""
     with _acp_host_daemon(tmp_path=tmp_path, live_server=live_server) as config_home:
         host_id = _online_host_id(http_client)
 
@@ -165,10 +108,7 @@ def test_configured_acp_slug_reads_configured_on_host(
             "probe failed; check the daemon log"
         )
 
-        # The launch gate accepts the slug on this exact config, so the agent
-        # launches -- proving any "unconfigured" verdict from the readiness map
-        # is a false negative. Read it under the daemon's config home so it
-        # sees the same acp: block.
+        # Evaluate the launch gate with the daemon's configuration.
         prev_home = os.environ.get("OMNIGENT_CONFIG_HOME")
         os.environ["OMNIGENT_CONFIG_HOME"] = str(config_home)
         try:
@@ -188,8 +128,6 @@ def test_configured_acp_slug_reads_configured_on_host(
             else:
                 os.environ["OMNIGENT_CONFIG_HOME"] = prev_home
 
-        # Generic acp is ready (there is a configured agent), so the specific
-        # slug the picker filters on must be present and available too.
         assert configured.get("acp"), (
             "generic 'acp' readiness should be available with a configured agent; "
             f"got {configured.get('acp')!r}"
