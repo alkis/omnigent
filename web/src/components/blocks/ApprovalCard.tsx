@@ -32,9 +32,11 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import { useContext } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
+  ClockIcon,
   ExternalLinkIcon,
   InfoIcon,
   MessageCircleQuestionMark,
@@ -55,6 +57,7 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import {
   type ElicitationAnswers,
@@ -63,8 +66,6 @@ import {
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
 
-// Hover detail for the neutral "Resolved elsewhere" pill: the prompt was
-// answered outside this view, so the UI never saw the verdict.
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view — for example in the " +
   "agent's own terminal, another tab, or the approve page — so the " +
@@ -121,6 +122,8 @@ interface ApprovalCardProps {
   status: "pending" | "responded";
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /** Why an `auto_resolved` card has no verdict; see `ElicitationBlock`. */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
   } | null;
@@ -151,7 +154,7 @@ interface ApprovalCardProps {
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the binary
-   * approve/reject card grows a third "Accept & allow all edits"
+   * approve/reject card also offers an "Accept & allow all edits"
    * button. Accepting through it asks the server to switch the
    * session into Claude Code's ``acceptEdits`` mode (the web
    * equivalent of the native shift+tab toggle). Absent/false for
@@ -160,8 +163,15 @@ interface ApprovalCardProps {
    */
   allowAllEdits?: boolean;
   /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button — accept plus a session-scoped
+   * ``setMode(auto)``, so Claude reviews this session's later permissions
+   * automatically. Absent/false where the switch was never offered.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: when set, the binary
-   * approve/reject card grows a third "Approve & don't ask again for
+   * approve/reject card also offers an "Approve & don't ask again for
    * <host|tool>" button. Accepting through it asks the server to
    * install a session-scoped allow rule for the tool (scoped to
    * ``host`` for WebFetch, tool-wide otherwise) — the web equivalent
@@ -197,15 +207,24 @@ export function ApprovalCard({
   exitPlanMode,
   codexCommand,
   allowAllEdits,
+  allowAutoMode,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
   onSubmit,
 }: ApprovalCardProps) {
+  // In a side-chat pane this resolves to the child id, so the verdict targets
+  // the child's elicitation rather than the main conversation's. null (the main
+  // transcript) leaves submitApproval on its active-conversation default.
+  const scopedConversationId = useContext(ConversationScopeContext);
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
       const store = useChatStore.getState();
-      if (meta === undefined) {
+      // Keep the exact call shape for the main chat (no scope); pass the child
+      // id only when scoped so a side-chat verdict targets the child.
+      if (scopedConversationId) {
+        void store.submitApproval(id, action, content, meta, scopedConversationId);
+      } else if (meta === undefined) {
         void store.submitApproval(id, action, content);
       } else {
         void store.submitApproval(id, action, content, meta);
@@ -230,6 +249,9 @@ export function ApprovalCard({
   };
   const submitExecPolicyAmendment = (amendment: string[]) => {
     submit(elicitationId, "accept", { execpolicy_amendment: amendment });
+  };
+  const submitAutoMode = () => {
+    submit(elicitationId, "accept", { allow_auto_mode: true });
   };
   const submitAllowAllEdits = () => {
     // Accept AND ask the server to switch the session's permission
@@ -323,6 +345,8 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const acceptedAutoMode =
+    response?.action === "accept" && response.content?.allow_auto_mode === true;
   const acceptedRemember = response?.content?.remember === true;
   const acceptedCodexPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
@@ -363,6 +387,18 @@ export function ApprovalCard({
         >
           <CheckIcon className="mr-1 size-3.5" />
           Always allow
+        </Button>
+      )}
+      {allowAutoMode && (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={submitAutoMode}
+          title="Approve this request and let Claude review future tool permissions automatically for this session"
+          componentId="approval.approve_auto_mode"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve &amp; switch to auto mode
         </Button>
       )}
       {allowAllEdits && (
@@ -430,6 +466,7 @@ export function ApprovalCard({
 
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
+    const promptExpired = autoResolved && response.reason === "unanswered";
     const accepted = response.action === "accept";
 
     // Distinguish three responded sub-states:
@@ -461,11 +498,15 @@ export function ApprovalCard({
 
     let icon = <XIcon className="size-4 text-destructive" />;
     let label = isExitPlanMode ? "Plan rejected" : "Rejected";
-    if (autoResolved) {
-      // Card was cleared without a UI verdict — the prompt was answered
-      // outside this view (the harness's own TUI, another tab, or the
-      // approve page). We can't know the actual verdict, so render a
-      // neutral pill; the ⓘ tooltip explains what the state means.
+    if (promptExpired) {
+      // The server cleared the prompt because the hook stopped waiting
+      // before anyone answered (a severed poll never re-parked, the ask
+      // timed out). Nothing was decided, so say so and tell the user how
+      // to get the agent moving again instead of implying an answer.
+      icon = <ClockIcon className="size-4 text-muted-foreground" />;
+      label = "Prompt expired";
+    } else if (autoResolved) {
+      // The verdict is unknown in this view, so explain the neutral status.
       icon = (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -477,6 +518,10 @@ export function ApprovalCard({
         </Tooltip>
       );
       label = "Resolved elsewhere";
+    } else if (response.action === "cancel") {
+      // Dismissed without deciding — neither approved nor rejected.
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = "Cancelled";
     } else if (submittedAnswers !== null) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Submitted";
@@ -486,6 +531,9 @@ export function ApprovalCard({
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
+    } else if (acceptedAutoMode) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · auto mode";
     } else if (acceptedAllEdits) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
@@ -516,7 +564,8 @@ export function ApprovalCard({
       showGatingMessage ||
       isCodexCommandApproval ||
       submittedAnswers !== null ||
-      planRejectionFeedback !== null;
+      planRejectionFeedback !== null ||
+      promptExpired;
 
     return (
       <Alert
@@ -564,6 +613,11 @@ export function ApprovalCard({
             {planRejectionFeedback !== null && (
               <span className="italic" data-testid="plan-rejection-feedback">
                 “{planRejectionFeedback}”
+              </span>
+            )}
+            {promptExpired && (
+              <span className="text-muted-foreground" data-testid="prompt-expired-hint">
+                Nobody answered before the agent stopped waiting. Send a message to continue.
               </span>
             )}
           </AlertDescription>
@@ -710,6 +764,7 @@ export function ElicitationCard({
       exitPlanMode={item.exitPlanMode}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
+      allowAutoMode={item.allowAutoMode}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
       onSubmit={onSubmit}
