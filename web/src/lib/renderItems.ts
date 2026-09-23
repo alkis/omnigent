@@ -1839,6 +1839,12 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      // The delivery footer is driven by these; a stalled or refused send
+      // must re-render even though the message content is unchanged.
+      a.delivery?.posted !== b.delivery?.posted ||
+      a.delivery?.stalled !== b.delivery?.stalled ||
+      a.delivery?.error?.message !== b.delivery?.error?.message ||
+      a.delivery?.error?.code !== b.delivery?.error?.code ||
       a.content.length !== b.content.length
     )
       return false;
