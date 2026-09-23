@@ -1,34 +1,7 @@
-"""E2E: a non-JSON runner reply must not fail session requests with HTTP 500.
+"""A terminal proxy must return 502 when its runner responds with non-JSON.
 
-A user opens a session bound to a runner and then opens/creates a terminal
-(shell) in it. The server proxies the create-terminal POST to the runner via
-``_proxy_post_to_runner``. When the runner -- or an intermediary between the
-server and the runner (e.g. a Databricks Apps relay) -- answers with a
-**non-JSON body** (an empty body, or an HTML ``502 Bad Gateway`` page), an
-unguarded ``resp.json()`` raises ``json.JSONDecodeError`` uncaught. It bubbles
-to ``omnigent.server.app._handle_unhandled_exception``, which logs
-``Unhandled exception: Expecting value: line 1 column 1 (char 0)`` and returns
-HTTP 500. The sibling GET proxy already maps that reply to a graceful
-``HTTPException(502, "runner resource endpoint returned invalid JSON")``.
-
-Reproduction strategy: drive the **real** ``create_session_terminal`` route
-(``POST /v1/sessions/{id}/resources/terminals``) through the real
-``create_sessions_router``, with the runner boundary fault-injected -- a runner
-client that returns a non-JSON body, standing in for the failing intermediary.
-The fault lives below the browser layer, so this is exercised at the API
-surface. A production-faithful catch-all mirroring
-``_handle_unhandled_exception`` is installed so the observable outcome (HTTP 500
-plus the ``Unhandled exception: ...`` log) matches production exactly.
-
-Fail -> pass contract:
-
-* **Before the fix (RED):** the unguarded ``resp.json()`` raises, the catch-all
-  fires -> HTTP 500 ``internal_error`` and an ``Unhandled exception: Expecting
-  value: line 1 column 1 (char 0)`` log record.
-* **After the fix (GREEN):** the POST proxy handles the non-JSON reply the same
-  way the GET proxy already does -> a graceful HTTP 502, no unhandled-exception
-  log.
-"""
+Exercise the real sessions router over ASGI with a fake runner client. Install
+an exception handler so an uncaught decode failure would surface as HTTP 500."""
 
 from __future__ import annotations
 
@@ -81,27 +54,12 @@ class _ConversationStore:
         }
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
-        """Return the canned conversation, or ``None``.
-
-        :param conversation_id: Conversation/session id.
-        :returns: The conversation row, or ``None`` when unknown.
-        """
+        """Return the requested canned conversation, or None."""
         return self._conversations.get(conversation_id)
 
 
 class _NonJsonRunnerClient:
-    """Fake runner ``httpx.AsyncClient`` returning a non-JSON body.
-
-    Stands in for the runner -- or an intermediary relay -- that answers the
-    terminal-create proxy with a body that is not JSON. Every HTTP verb
-    returns the same canned non-JSON
-    response so the reproduction does not depend on which verb the route uses.
-
-    :param body: Raw response body text (e.g. ``""`` for an empty body, or an
-        HTML error page).
-    :param status_code: HTTP status the runner/intermediary returned.
-    :param content_type: ``Content-Type`` header for the canned response.
-    """
+    """Fake runner client that records calls and returns a non-JSON response."""
 
     def __init__(self, *, body: str, status_code: int, content_type: str) -> None:
         self._body = body
@@ -110,12 +68,7 @@ class _NonJsonRunnerClient:
         self.calls: list[tuple[str, str]] = []
 
     def _response(self, method: str, url: str) -> httpx.Response:
-        """Record the call and build the canned non-JSON response.
-
-        :param method: HTTP method, e.g. ``"POST"``.
-        :param url: Request URL path.
-        :returns: The canned non-JSON ``httpx.Response``.
-        """
+        """Record the request and return the non-JSON response."""
         self.calls.append((method, url))
         return httpx.Response(
             status_code=self._status_code,
@@ -175,21 +128,12 @@ class _FakeRunnerRouter:
     def client_for_session_resources(
         self, session_id: str, *, conversation: Conversation | None = None
     ) -> _RoutedRunner:
-        """Resolve the runner client for resource access.
-
-        :param session_id: Conversation/session id.
-        :param conversation: Pre-loaded conversation (ignored by the stub).
-        :returns: The routed non-JSON runner.
-        """
+        """Return the routed runner client for resource access."""
         del session_id, conversation
         return _RoutedRunner(self.client)
 
     def client_for_existing_conversation(self, session_id: str) -> _RoutedRunner:
-        """Resolve the pinned runner for an existing conversation.
-
-        :param session_id: Conversation/session id.
-        :returns: The routed non-JSON runner.
-        """
+        """Return the runner client pinned to the existing conversation."""
         del session_id
         return _RoutedRunner(self.client)
 
@@ -211,17 +155,7 @@ def runner_globals_reset() -> Iterator[None]:
 
 @pytest.fixture
 def app(runner_globals_reset: None) -> FastAPI:
-    """Build the real sessions router app with a production-faithful catch-all.
-
-    The ``Exception`` handler mirrors
-    ``omnigent.server.app._handle_unhandled_exception`` (same logger name,
-    same ``"Unhandled exception: %s"`` message, same 500 ``internal_error``
-    envelope) so an unguarded ``resp.json()`` surfaces as the same HTTP 500 +
-    log line production emits, rather than a bare re-raise.
-
-    :param runner_globals_reset: Ensures a clean runner-globals slate.
-    :returns: The configured FastAPI app.
-    """
+    """Build the sessions router with the catch-all exception response under test."""
     del runner_globals_reset
     application = FastAPI()
     conversation_store = _ConversationStore()
@@ -271,15 +205,7 @@ def app(runner_globals_reset: None) -> FastAPI:
 
 @pytest.fixture
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    """Yield an httpx client bound to the app.
-
-    ``raise_app_exceptions=False`` lets the installed catch-all convert an
-    unhandled exception into the observed HTTP 500 (as the ASGI server does in
-    production) instead of re-raising into the test.
-
-    :param app: The configured FastAPI app.
-    :yields: An ``httpx.AsyncClient`` for driving requests.
-    """
+    """Use ASGI transport with exception propagation disabled to observe HTTP errors."""
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://server") as http_client:
         yield http_client
@@ -301,23 +227,7 @@ async def test_terminal_create_non_json_runner_reply_is_handled(
     content_type: str,
     scenario: str,
 ) -> None:
-    """A non-JSON runner reply to the terminal-create proxy must be handled.
-
-    Drives the real ``create_session_terminal`` route with a runner client that
-    replies with a non-JSON body. Broken behavior: the unguarded
-    ``resp.json()`` in ``_proxy_post_to_runner`` raises ``JSONDecodeError``,
-    surfacing as HTTP 500 plus an ``Unhandled exception: Expecting value: ...``
-    log. Fixed behavior: the route maps the non-JSON reply to a graceful HTTP
-    502 (mirroring ``_proxy_get_to_runner``, which already returns 502 "runner
-    resource endpoint returned invalid JSON") with no unhandled-exception log.
-
-    :param client: httpx client bound to the real sessions router app.
-    :param caplog: Pytest log capture fixture.
-    :param body: Non-JSON runner response body.
-    :param content_type: ``Content-Type`` of the runner response.
-    :param scenario: Human-readable variant label.
-    :returns: None.
-    """
+    """Terminal creation must map an invalid runner body to HTTP 502."""
     runner = _NonJsonRunnerClient(body=body, status_code=502, content_type=content_type)
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     set_runner_client(runner)  # type: ignore[arg-type]
