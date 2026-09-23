@@ -270,7 +270,7 @@ def clipboard_browser(page: Page, live_server: str) -> Iterator[_ClipboardBrowse
     [(1280, 844), (390, 844), (390, 480), (320, 400)],
     ids=["desktop", "mobile", "short-mobile", "narrow-short-mobile"],
 )
-def test_terminal_clipboard_popup_floats_bottom_right_without_resizing_or_stealing_focus(
+def test_terminal_clipboard_popup_floats_top_center_without_resizing_or_stealing_focus(
     clipboard_browser: _ClipboardBrowser, width: int, height: int
 ) -> None:
     ui = clipboard_browser
@@ -305,8 +305,9 @@ def test_terminal_clipboard_popup_floats_bottom_right_without_resizing_or_steali
     assert bounds is not None and screen_bounds is not None
     assert 0 <= bounds["x"] < bounds["x"] + bounds["width"] <= width + 1
     assert 0 <= bounds["y"] < bounds["y"] + bounds["height"] <= height
-    assert 0 <= width - bounds["x"] - bounds["width"] <= 32
-    assert 0 <= height - bounds["y"] - bounds["height"] <= 32
+    # Pinned top-center: floats near the top edge (horizontal stays within the
+    # viewport, asserted above).
+    assert 0 <= bounds["y"] <= 48
     if width >= 768:
         assert 440 <= bounds["width"] <= 520
     else:

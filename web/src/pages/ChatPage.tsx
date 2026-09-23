@@ -538,9 +538,11 @@ export function ChatPage() {
   // `pendingUserMessages`, `interruptedResponseIds`) are NOT subscribed here:
   // they live in <Transcript>, so an SSE frame re-renders that subtree alone
   // and this root (and the composer/chrome it feeds) bails out. See
-  // `hasPendingElicitation` below for the one blocks-derived value the root
-  // still needs, read through an edge-stable boolean selector.
+  // the edge-stable boolean selectors for pending initial input and elicitations.
   const status = useChatStore((s) => s.status);
+  const hasPendingInitialMessage = useChatStore((s) =>
+    s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
+  );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // True while the session's managed-sandbox launch is still running
   // (a failed launch is NOT "launching" — it gets normal unreachable
@@ -732,7 +734,8 @@ export function ChatPage() {
 
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
-  const isWorking = computeIsWorking(sessionStatus);
+  const isWorking =
+    computeIsWorking(sessionStatus) || status === "streaming" || hasPendingInitialMessage;
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -2445,6 +2448,9 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  const hasPendingInitialMessage = useChatStore((s) =>
+    s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
+  );
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -2925,7 +2931,12 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton = isWorking && (!hasDraft || hasPendingElicitation);
+  const showInterruptButton =
+    isWorking &&
+    (!hasDraft ||
+      hasPendingElicitation ||
+      isTempConvId(conversationId) ||
+      hasPendingInitialMessage);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
@@ -3682,12 +3693,6 @@ function ComposerImpl(
               "rounded-t-none border-t-0 border-border/50 pl-2.5 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
           )}
         >
-          <ComposerPrLink
-            state={composerGit.githubState}
-            prCount={composerGit.prCount}
-            prNumber={composerGit.prNumber}
-            onOpen={openComposerGithubTab}
-          />
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
             worktreePath={composerGit.worktreePath}
@@ -3696,6 +3701,12 @@ function ComposerImpl(
             branchState={composerGit.branchState}
             creationBranch={composerGit.creationBranch}
             showWorktree={composerGit.isWorktree === true}
+          />
+          <ComposerPrLink
+            state={composerGit.githubState}
+            prCount={composerGit.prCount}
+            prNumber={composerGit.prNumber}
+            onOpen={openComposerGithubTab}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
             <div

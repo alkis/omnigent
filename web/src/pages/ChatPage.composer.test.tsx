@@ -374,6 +374,87 @@ describe("Composer session drafts", () => {
   });
 });
 
+describe("Composer starting-session cancellation", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    setComposerState({
+      conversationId: "temp:cancel_initial",
+      blocks: [],
+      failedSendDraft: null,
+      pendingUserMessages: [],
+      queuedMessages: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    setComposerState({ pendingUserMessages: [] });
+  });
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available with a typed draft and cancels using %s",
+    (trigger) => {
+      const props = composerProps({
+        status: "streaming",
+        isWorking: true,
+        disabled: true,
+        unreachable: true,
+        permissionLevel: 1,
+        sendDisabledReason: "Starting the session…",
+      });
+      render(<Composer {...props} />);
+
+      fireEvent.change(textarea(), { target: { value: "a correction while choosing a model" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(props.onStop).not.toHaveBeenCalled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("a correction while choosing a model");
+    },
+  );
+
+  it.each(["button", "Escape"])(
+    "keeps Interrupt available after real-ID promotion with a typed draft using %s",
+    (trigger) => {
+      setComposerState({
+        conversationId: "conv_initial_model_pending",
+        sessionStatus: "idle",
+        pendingUserMessages: [
+          {
+            tempId: "pend_initial",
+            content: [{ type: "input_text", text: "original task" }],
+            initialDraft: { text: "original task", files: [] },
+          },
+        ],
+      });
+      const props = composerProps({ status: "idle", isWorking: true });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "corrected task" } });
+      expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+
+      if (trigger === "button") {
+        fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      } else {
+        fireEvent.keyDown(textarea(), { key: "Escape" });
+      }
+
+      expect(props.onStop).toHaveBeenCalledOnce();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("corrected task");
+    },
+  );
+});
+
 describe("Composer growth layout", () => {
   afterEach(() => {
     cleanup();
@@ -2167,7 +2248,7 @@ describe("Composer shared visible controls", () => {
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
   });
 
-  it("keeps the PR to the left of the confirmed worktree status", () => {
+  it("keeps the PR to the right of the confirmed worktree status", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
       branchState: "branch",
@@ -2181,7 +2262,7 @@ describe("Composer shared visible controls", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     const pr = screen.getByTestId("composer-pr-link");
     const worktree = screen.getByTestId("composer-git-branch");
-    expect(pr.compareDocumentPosition(worktree) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(worktree.compareDocumentPosition(pr) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   });
 
   it("mounts task indicators before the context ring with sub-agent navigation", () => {

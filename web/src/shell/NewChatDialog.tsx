@@ -129,6 +129,7 @@ import {
 } from "@/components/SlashCommandMenu";
 import {
   beginLocalConversation,
+  hasPendingLocalMessage,
   hydrateLocalConversation,
   removeLocalConversation,
   setPendingInitialPrompt,
@@ -1685,10 +1686,13 @@ export function AgentHarnessPicker({
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
       const readiness = harnessReadinessOnHost(agent.harness, host);
-      if (!selected && hideUnconfigured && !readiness.selectable && readiness.fallbackRelevant)
-        continue;
+      const unavailable = !readiness.selectable && readiness.fallbackRelevant;
+      if (!selected && hideUnconfigured && unavailable) continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      if (primaryOrder.includes(key) || agent.id === promotedHarnessId) {
+      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      // Unavailable primaries demote to "Other..." — the main list stays
+      // launch-ready; the selected harness always keeps its slot.
+      if (primary && (selected || !unavailable)) {
         ready.push(agent);
       } else more.push(agent);
     }
@@ -1954,7 +1958,7 @@ export function AgentHarnessPicker({
                     }}
                     className="items-center"
                   >
-                    <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                    <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
                   </DropdownMenuItem>
                 ) : (
@@ -1974,7 +1978,7 @@ export function AgentHarnessPicker({
                         }
                       }}
                     >
-                      <span className="flex-1 text-left">{otherHarnessLabel}</span>
+                      <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
                     </DropdownMenuSubTrigger>
                     <HarnessPickerSubContent
                       sideOffset={-4}
@@ -2006,7 +2010,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <span className="flex-1 text-left">Other...</span>
+                <span className="flex-1 pl-6 text-left">Custom agents...</span>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2016,7 +2020,7 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <span className="flex-1 text-left">Other...</span>
+                  <span className="flex-1 pl-6 text-left">Custom agents...</span>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}
@@ -5159,7 +5163,11 @@ export function NewChatLandingScreen() {
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
-    const returnedDraft = recoverFailedSessionDraft(draftRef.current, temporaryConversationId);
+    const originalDraft =
+      temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
+        ? { ...draftRef.current, message: "", files: [] }
+        : draftRef.current;
+    const returnedDraft = recoverFailedSessionDraft(originalDraft, temporaryConversationId);
     if (onScreenRef.current) {
       setMessage(returnedDraft.message);
       setFiles(returnedDraft.files);

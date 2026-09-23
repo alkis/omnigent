@@ -41,6 +41,7 @@ import type { ReactNode } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -63,6 +64,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const navigateMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
+const hasPendingLocalMessageMock = vi.fn();
 const hydrateLocalConversationMock = vi.fn();
 const removeLocalConversationMock = vi.fn();
 let searchParams = new URLSearchParams();
@@ -89,6 +91,7 @@ vi.mock("@/lib/routing", () => ({
 // (keyed by conversation id), not router state — assert on that call.
 vi.mock("@/store/chatStore", () => ({
   beginLocalConversation: (...args: unknown[]) => beginLocalConversationMock(...args),
+  hasPendingLocalMessage: (...args: unknown[]) => hasPendingLocalMessageMock(...args),
   hydrateLocalConversation: (...args: unknown[]) => hydrateLocalConversationMock(...args),
   removeLocalConversation: (...args: unknown[]) => removeLocalConversationMock(...args),
   setPendingInitialPrompt: (...args: unknown[]) => setPendingInitialPromptMock(...args),
@@ -391,6 +394,8 @@ beforeEach(() => {
   setPendingInitialPromptMock.mockReset();
   beginLocalConversationMock.mockReset();
   beginLocalConversationMock.mockReturnValue(null);
+  hasPendingLocalMessageMock.mockReset();
+  hasPendingLocalMessageMock.mockReturnValue(true);
   hydrateLocalConversationMock.mockReset();
   removeLocalConversationMock.mockReset();
   removeLocalConversationMock.mockReturnValue(false);
@@ -401,6 +406,7 @@ beforeEach(() => {
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
   clearOptimisticTitles();
+  clearSessionDrafts();
   localStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
@@ -655,6 +661,45 @@ describe("NewChatLandingScreen create flow", () => {
     );
     expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
   });
+
+  it.each(["original task", "corrected task", ""])(
+    "returns only the canceled draft after creation fails: %j",
+    async (corrected) => {
+      const tempConvId = "temp:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      let resolveCreate!: (response: Response) => void;
+      vi.mocked(authenticatedFetch).mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      );
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId,
+        pendingMsgTempId: "pend_cancel",
+        createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      });
+      renderLanding();
+      await waitForWorkspaceSeed();
+      typeMessage("original task");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+      cleanup();
+
+      hasPendingLocalMessageMock.mockReturnValue(false);
+      setSessionDraft(tempConvId, { text: corrected, files: [] });
+      await act(async () => {
+        resolveCreate({
+          ok: false,
+          status: 503,
+          json: async () => ({ detail: "host unavailable" }),
+        } as unknown as Response);
+      });
+      await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(corrected);
+      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("keeps a failed create's restored draft when a newer create succeeds", async () => {
     let resolveFirst!: (response: Response) => void;
