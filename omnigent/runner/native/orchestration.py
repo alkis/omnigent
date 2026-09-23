@@ -5252,10 +5252,11 @@ async def _auto_create_codex_terminal(
             )
 
     # Resolve the freshly launched TUI terminal instance for pane-death
-    # detection during thread discovery.
+    # detection during thread discovery.  Best-effort: a registry that
+    # doesn't expose terminal_registry (e.g. a test fake) yields None.
     _codex_tui_terminal: TerminalInstance | None = None
     if launch_config.external_session_id is None:
-        _tr = resource_registry.terminal_registry
+        _tr = getattr(resource_registry, "terminal_registry", None)
         if _tr is not None:
             _codex_tui_terminal = _tr.get(session_id, "codex", "main")
 
