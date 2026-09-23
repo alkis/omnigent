@@ -1,68 +1,52 @@
 """Clipboard pastes must remain drafts until an explicit send gesture.
 
-These browser journeys exercise the real clipboard in the chat composer
-and the embedded Claude terminal, including bracketed-paste handling."""
+These browser journeys exercise the real clipboard in the chat composer and
+the embedded Claude terminal. The TUI journey asserts through the chat
+transcript — a TUI submission mirrors into it as a user message — so the
+check needs no direct access to the runner's tmux socket."""
 
 from __future__ import annotations
 
-import re
 import shutil
 import sys
-import time
 import uuid
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import Page, Request, expect
+from playwright.sync_api import Locator, Page, Request, expect
 
 from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.messages.test_message_render_parity import (
+    _USER,
+    _WORKING,
+    _ensure_chat_view,
+    _select_view_mode,
+)
 from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _CLAUDE_MOCK_MODEL,
     _TERMINAL_VIEW,
     _XTERM_INPUT,
     _open_terminal_view,
-    _pane_text,
     _wait_terminal_connected,
 )
 
 _COMPOSER_LABEL = "Message the agent"
 
-# A pane row is an input-box border when it carries a long run of box-drawing
-# dashes; the idle TUI composer is the region between the last two such rows.
-_BORDER_RUN = re.compile("─{10,}")
-
-# How long the paste gets to surface in the TUI pane (browser -> WebSocket ->
-# tmux -> Claude Code repaint), and how long after that a premature submission
-# would have repainted the pane.
-_PASTE_SURFACE_TIMEOUT_S = 20.0
-_SUBMIT_SETTLE_S = 3.0
+# Budget for a TUI submission to mirror into the chat transcript (browser ->
+# WebSocket -> tmux -> Claude Code -> bridge -> chat) with the mock LLM
+# replying instantly.
+_MIRROR_TIMEOUT_MS = 60_000
+# How long a wrongly auto-submitted paste gets to run its turn and mirror
+# into the transcript before the no-send judgment.
+_SUBMIT_SETTLE_MS = 10_000
 
 
-def _pane_lines(pane: str) -> list[str]:
-    """Split a pane capture into rows, dropping trailing blank padding."""
-    lines = pane.splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return lines
-
-
-def _input_box_region(pane: str) -> tuple[list[str], list[str]] | None:
-    """Split a Claude pane around the final two input-box border rows.
-
-    :param pane: Visible pane text.
-    :returns: Transcript and input rows, or None during an incomplete repaint."""
-    lines = _pane_lines(pane)
-    borders = [i for i, line in enumerate(lines) if _BORDER_RUN.search(line)]
-    if len(borders) < 2:
-        return None
-    top, bottom = borders[-2], borders[-1]
-    return lines[:top], lines[top + 1 : bottom]
-
-
-def _paste_visible(rows: list[str], markers: tuple[str, ...]) -> bool:
-    """Recognize literal pasted lines or Claude's collapsed pasted-text placeholder."""
-    joined = "\n".join(rows)
-    return all(marker in joined for marker in markers) or "Pasted text" in joined
+def _focus_tui_input(page: Page) -> Locator:
+    """Focus the embedded xterm's hidden helper textarea and return it."""
+    xterm_input = page.locator(_TERMINAL_VIEW).last.locator(_XTERM_INPUT)
+    expect(xterm_input).to_be_attached(timeout=30_000)
+    xterm_input.focus()
+    return xterm_input
 
 
 @pytest.mark.nightly
@@ -83,69 +67,60 @@ def test_tui_multiline_paste_stays_unsubmitted(
     _wait_terminal_connected(page)
 
     # A wrongly-submitted turn should resolve fast against the mock LLM rather
-    # than leave the TUI mid-request while the pane is inspected.
+    # than leave the TUI mid-request while the transcript is inspected.
     reset_mock_llm(mock_llm_server_url)
     set_fallback_mock_llm(mock_llm_server_url, "default", "paste-turn-token")
     set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, "paste-turn-token")
 
-    xterm_input = page.locator(_TERMINAL_VIEW).last.locator(_XTERM_INPUT)
-    expect(xterm_input).to_be_attached(timeout=30_000)
-    xterm_input.focus()
+    _focus_tui_input(page)
     page.wait_for_timeout(2_000)
 
-    # Prove keystrokes reach the TUI composer before trusting the paste result;
-    # a paste that never lands would otherwise pass vacuously.
+    # Prove the keystroke -> TUI -> chat-mirror path works before trusting the
+    # paste result; a paste that never lands would otherwise pass vacuously.
     nonce = uuid.uuid4().hex[:6]
-    sanity = f"sanity{nonce}"
+    sanity = f"sanity-{nonce}"
     page.keyboard.type(sanity, delay=30)
-    deadline = time.monotonic() + _PASTE_SURFACE_TIMEOUT_S
-    while sanity not in _pane_text(base_url, session_id):
-        assert time.monotonic() < deadline, "typed keys never reached the TUI pane"
-        page.wait_for_timeout(500)
-    for _ in range(len(sanity)):
-        page.keyboard.press("Backspace")
-    page.wait_for_timeout(500)
+    page.keyboard.press("Enter")
+    _ensure_chat_view(page)
+    expect(page.locator(_USER, has_text=sanity).first).to_be_visible(timeout=_MIRROR_TIMEOUT_MS)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_MIRROR_TIMEOUT_MS)
 
     # The real user journey: put a two-line block on the clipboard and paste it
     # with the browser's paste gesture (plain Ctrl+V is the terminal's literal
     # ^V byte, so terminals paste via Ctrl+Shift+V / Cmd+V).
+    _select_view_mode(page, "Terminal")
+    _wait_terminal_connected(page)
+    tui_input = _focus_tui_input(page)
+    page.wait_for_timeout(1_000)
     first = f"pasteblock-first-{nonce}"
     second = f"pasteblock-second-{nonce}"
     page.context.grant_permissions(["clipboard-read", "clipboard-write"])
     page.evaluate("([a, b]) => navigator.clipboard.writeText(a + '\\n' + b)", [first, second])
-    xterm_input.press("Meta+V" if sys.platform == "darwin" else "Control+Shift+V")
+    tui_input.press("Meta+V" if sys.platform == "darwin" else "Control+Shift+V")
 
-    # Wait for the paste to surface in the pane at all, then give a premature
-    # submission time to repaint before judging.
-    deadline = time.monotonic() + _PASTE_SURFACE_TIMEOUT_S
-    while not _paste_visible(_pane_lines(_pane_text(base_url, session_id)), (first, second)):
-        assert time.monotonic() < deadline, "the paste never surfaced in the TUI pane"
-        page.wait_for_timeout(500)
-    page.wait_for_timeout(int(_SUBMIT_SETTLE_S * 1000))
+    # Give a premature submission time to run its turn and mirror into chat.
+    page.wait_for_timeout(_SUBMIT_SETTLE_MS)
+    _ensure_chat_view(page)
 
-    pane = _pane_text(base_url, session_id)
-    region = _input_box_region(pane)
-    deadline = time.monotonic() + _PASTE_SURFACE_TIMEOUT_S
-    while region is None:
-        assert time.monotonic() < deadline, f"no input box found in pane:\n{pane}"
-        page.wait_for_timeout(500)
-        pane = _pane_text(base_url, session_id)
-        region = _input_box_region(pane)
-    above, inside = region
+    # The regression: with the paste treated as raw keystrokes, Claude Code
+    # submits the first line immediately — it mirrors into the transcript as
+    # a sent user message although Enter was never pressed.
+    assert page.locator(_USER, has_text=first).count() == 0, (
+        "pasting a multi-line block submitted its first line to the agent without Enter"
+    )
 
-    # The regression: with the paste treated as raw newlines, Claude Code
-    # submits the first line immediately — it shows up echoed above the input
-    # box as a sent prompt, with only the second line left in the box.
-    assert not any(first in line for line in above), (
-        "pasting a multi-line block submitted its first line to the agent "
-        f"without Enter; pane:\n{pane}"
-    )
-    assert _paste_visible(inside, (first,)), (
-        f"pasted first line is not in the TUI input box; pane:\n{pane}"
-    )
-    assert _paste_visible(inside, (second,)), (
-        f"pasted second line is not in the TUI input box; pane:\n{pane}"
-    )
+    # An explicit Enter must send the whole block as ONE message; this also
+    # proves the paste really landed in the TUI composer (had the first line
+    # auto-submitted, the message sent here would carry only the second).
+    _select_view_mode(page, "Terminal")
+    _wait_terminal_connected(page)
+    _focus_tui_input(page)
+    page.wait_for_timeout(500)
+    page.keyboard.press("Enter")
+    _ensure_chat_view(page)
+    block_message = page.locator(_USER, has_text=second).first
+    expect(block_message).to_be_visible(timeout=_MIRROR_TIMEOUT_MS)
+    expect(block_message).to_contain_text(first)
 
 
 def test_composer_multiline_paste_stays_in_composer(

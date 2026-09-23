@@ -283,6 +283,9 @@ async def _paste_via_tmux_buffer(
     :param buffer_name: Temporary omnigent-paste-* buffer.
     :param data: Raw clipboard bytes.
     :returns: Whether tmux accepted the paste."""
+    # paste-buffer rewrites only LF to CR, so an unnormalized CRLF would
+    # reach the pane as CR CR — a stray Enter / blank line per line ending.
+    data = data.replace(b"\r\n", b"\n")
     try:
         proc = await asyncio.create_subprocess_exec(
             tmux,
@@ -869,6 +872,9 @@ async def bridge_tmux_control_to_websocket(
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                         continue
                     paste = _decode_paste_message(ctl)
+                    # Unlike keystrokes (also guarded by the control client's -r
+                    # attach), this app-layer gate is the ONLY read-only guard
+                    # for pastes: the paste-buffer subprocess carries no -r.
                     if paste is not None and not read_only:
                         last_client_input_at = _monotonic()
                         if not await _paste_via_tmux_buffer(

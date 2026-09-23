@@ -1159,6 +1159,33 @@ async def test_paste_frame_plain_for_non_requesting_pane(tmp_path: Path) -> None
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_paste_frame_normalizes_crlf_line_endings(tmp_path: Path) -> None:
+    """A CRLF paste must reach the pane with single CR line breaks, not CR CR.
+
+    ``paste-buffer`` rewrites only LF to CR, so an unnormalized CRLF payload
+    would deliver a doubled CR — a stray Enter into a non-bracketed pane."""
+    sink = tmp_path / "sink"
+    sock, target = await _new_private_tmux(
+        f"stty raw -echo; printf '\\033[?2004h'; exec cat > {sink}"
+    )
+    await asyncio.sleep(0.5)
+
+    ws = _FakeWebSocket(inbound=[_paste_frame(b"alpha\r\nbeta")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        expected = b"\x1b[200~alpha\rbeta\x1b[201~"
+        got = await _wait_file_bytes(sink, expected)
+        assert got == expected, f"pane received {got!r}, not single-CR line breaks"
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_control_bridge_read_only_drops_paste_frames(tmp_path: Path) -> None:
     """read_only=True must not paste browser text into the pane."""
     sink = tmp_path / "sink"
