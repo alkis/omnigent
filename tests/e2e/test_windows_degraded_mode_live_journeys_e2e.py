@@ -1,45 +1,4 @@
-"""E2E reproduction: the two Windows degraded-mode defects still live on main.
-
-On native Windows the documented degraded-mode subset (server, web UI, SDK
-harnesses) breaks along a chain of defects. Three of the five reported links
-are fixed on main; these tests pin the two that still reproduce, using the
-smallest possible POSIX stand-in for the Windows-only platform facts:
-
-1. ``test_host_daemon_tunnel_survives_windows_ansi_stdio`` — the background
-   host daemon's "connected" success print contains glyphs (``✓`` / ``↑``)
-   and runs inside the tunnel handler. A default-locale Windows console hands
-   the daemon cp1252 stdio, so the print raises ``UnicodeEncodeError``, the
-   success message itself tears down the freshly-established tunnel, and the
-   daemon loops "Host tunnel disconnected: 'charmap' codec can't encode
-   character ... Reconnecting" forever while ``omnigent run`` times out
-   waiting for it. The CLI hardens its own stdio in ``main()``, but the
-   daemon entry (``python -m omnigent.host._daemon_entry``) never passes
-   through it. The test spawns the real daemon entry against the live e2e
-   server with the daemon env built by the real production builder
-   (``_build_host_daemon_env``), emulating Windows-ANSI stdio with Windows'
-   own precedence rules: cp1252 streams UNLESS the daemon env carries
-   ``PYTHONUTF8=1`` / ``PYTHONIOENCODING`` (so an env-default fix passes) and
-   applied BEFORE the entry point runs (so a daemon-side runtime stdio
-   hardening also passes, by winning afterwards).
-
-2. ``test_os_tools_start_under_windows_config_delivery_without_sandbox`` —
-   on Windows the OS-tool helper client delivers its config via a file in the
-   helper's private scratch tmpdir (``--config-file``), but that tmpdir is
-   only created under ``if sandbox.active:`` — and Windows never has an
-   active sandbox. ``_start_locked`` asserts a precondition the platform can
-   never meet, the helper can never start, and every ``sys_os_shell`` /
-   ``sys_os_read`` call a session makes returns an error payload (the web
-   UI's Working folder 502s for the same reason). The test drives the real
-   environment factory and helper round-trip with the sandbox genuinely
-   inactive (the only state Windows ever has) and only the ``IS_WINDOWS``
-   flag patched in the client process; the helper subprocess imports the
-   module fresh and runs the real POSIX ops, so a fixed client makes the
-   whole journey complete.
-
-Both run against the mock LLM server — no real credentials needed::
-
-    pytest tests/e2e/test_windows_degraded_mode_live_journeys_e2e.py -v
-"""
+"""Real-process regressions for Windows degraded-mode startup."""
 
 from __future__ import annotations
 
@@ -72,15 +31,9 @@ pytestmark = pytest.mark.skipif(
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The daemon-killing failure signature: str(UnicodeEncodeError) for any glyph
-# on a legacy codepage stream ("'charmap' codec can't encode character ...").
 _ENCODE_CRASH_MARKER = "can't encode"
 
-# Runs as ``python -c`` around the real daemon entry point. Recreates the
-# stdio-encoding decision a default-locale Windows console makes: legacy ANSI
-# (cp1252) streams unless UTF-8 mode or an explicit PYTHONIOENCODING is set.
-# Applied before the entry point so a daemon that hardens its own stdio at
-# startup reconfigures afterwards and wins — exactly as it would on Windows.
+# Emulate Windows' stdio choice before entering the real daemon process.
 _WINDOWS_ANSI_STDIO_BOOTSTRAP = """\
 import os, sys
 
@@ -144,25 +97,15 @@ def test_host_daemon_tunnel_survives_windows_ansi_stdio(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The auto-spawned host daemon must keep its tunnel on legacy-ANSI stdio.
-
-    Journey: ``omnigent run`` spawns the background daemon → the daemon
-    connects and registers → the "connected" status print hits the console.
-    On a cp1252 console that print must not tear down the tunnel: the host
-    stays online and the daemon log never records the encode crash that
-    previously drove the infinite reconnect loop and the client-side
-    "connect daemon did not come online within 30s" timeout.
-    """
-    # Isolated identity/state under tmp: the daemon derives its config, data
-    # dir, and lifecycle locks from HOME.
+    """The real host daemon must keep its tunnel with cp1252 stdio."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
-    # The user set nothing UTF-8-related — the reported default-console state.
     monkeypatch.delenv("PYTHONUTF8", raising=False)
     monkeypatch.delenv("PYTHONIOENCODING", raising=False)
 
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(omni_dir))
     host_id = uuid.uuid4().hex
     host_name = f"e2e-cp1252-tunnel-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
@@ -173,16 +116,13 @@ def test_host_daemon_tunnel_survives_windows_ansi_stdio(
         )
     )
 
-    # Build the daemon env through the real production builder, so a fix that
-    # ships UTF-8 mode in the daemon env is exercised end to end.
     from omnigent.cli import _build_host_daemon_env
 
     env = _build_host_daemon_env(server_url=live_server)
+    env["PATH"] = os.pathsep.join((str(Path(runner_executable()).parent), "/usr/bin", "/bin"))
     daemon_log = tmp_path / "host-daemon.log"
     env[PROCESS_LOG_FILE_ENV_VAR] = str(daemon_log)
-    # Test-only isolation and worktree imports; not part of the env contract
-    # under test. The ambient PYTHONPATH may carry entries relative to the
-    # worktree (e.g. ``sdks/ui``); the daemon runs from tmp, so absolutize.
+    # The daemon runs from tmp, so make worktree-relative import paths absolute.
     env["OMNIGENT_DATA_DIR"] = str(tmp_path / "omnigent-data")
     ambient_pythonpath = os.environ.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(
@@ -213,9 +153,7 @@ def test_host_daemon_tunnel_survives_windows_ansi_stdio(
 
     try:
         deadline = time.monotonic() + 90.0
-        # Once online, the tunnel must then SURVIVE its own success print:
-        # the crash lands within a second of registration, so a short grace
-        # window separates "registered then died" from "registered and held".
+        # Keep observing after registration so the success print has run.
         survival_deadline: float | None = None
         while time.monotonic() < deadline:
             crash = _crash_lines(_read_text(daemon_log), _read_text(stdio_log))
@@ -256,20 +194,7 @@ def test_os_tools_start_under_windows_config_delivery_without_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OS tools must work when config is delivered the Windows way, sandboxless.
-
-    Journey: a session's runner builds its OS environment (no active sandbox —
-    the only state Windows ever has), the agent runs one shell command through
-    it, and the command's real output comes back. Today the helper client's
-    Windows config-delivery branch asserts a scratch tmpdir that only an
-    active sandbox creates, so the helper never starts and every OS tool call
-    fails before doing any work.
-
-    ``IS_WINDOWS`` is patched only in this (client) process — the helper
-    subprocess imports the module fresh and serves the ops the real POSIX
-    way, so the assertion exercises the client's spawn path, not a simulated
-    helper.
-    """
+    """OS tools must start through Windows config delivery without a sandbox."""
     monkeypatch.setattr(os_env_module, "IS_WINDOWS", True)
 
     spec = OSEnvSpec(
@@ -298,9 +223,6 @@ def test_os_tools_start_under_windows_config_delivery_without_sandbox(
     assert marker in (shell_result.get("stdout") or ""), (
         f"command output missing: {shell_result!r}"
     )
-    # The read op must reach the helper too: a missing file is a normal
-    # per-op error, not the helper-startup failure ("os_env helper failed"
-    # / an AssertionError escaping before any op runs).
     assert isinstance(read_result, dict)
     assert "os_env helper failed" not in (read_result.get("error") or ""), (
         f"helper never started for the read op: {read_result!r}"

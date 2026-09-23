@@ -285,13 +285,7 @@ def test_host_daemon_env_defaults_pythonutf8_on(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
 ) -> None:
-    """Both daemon modes force UTF-8 mode so status glyphs can't kill stdio.
-
-    The daemon logs to a file, where Python picks the locale encoding
-    (cp1252 on Windows); a non-Latin-1 status glyph then raises
-    ``UnicodeEncodeError`` inside the serve loop and flaps the tunnel.
-    """
-    # Given: the user set nothing (a stock Windows shell).
+    """The host daemon defaults to UTF-8 for status output."""
     monkeypatch.delenv("PYTHONUTF8", raising=False)
 
     env = _build_host_daemon_env(server_url=server_url)
@@ -304,8 +298,7 @@ def test_host_daemon_env_keeps_explicit_pythonutf8(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
 ) -> None:
-    """An explicit user PYTHONUTF8 value stays authoritative over the default."""
-    # Given
+    """An explicit UTF-8 mode remains authoritative."""
     monkeypatch.setenv("PYTHONUTF8", "0")
 
     env = _build_host_daemon_env(server_url=server_url)

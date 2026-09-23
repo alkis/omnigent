@@ -551,9 +551,7 @@ class _HelperProcessClient:
         r_fd: int | None = None
         if IS_WINDOWS:
             if self._tmpdir is None:
-                # Only an active sandbox creates the scratch tmpdir, but this
-                # branch needs one even without a sandbox (native Windows never
-                # has an active one). The stop paths clean it up either way.
+                # Native Windows has no active sandbox to create this directory.
                 self._tmpdir = create_private_tmpdir()
             config_file = self._tmpdir / "helper-config.json"
             config_file.write_bytes(config_bytes)
