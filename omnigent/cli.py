@@ -8779,11 +8779,33 @@ def _background_host_log_detail(log_path: str | None) -> str:
 
 
 def _registration_target_display(record: _HostDaemonRecord) -> str:
-    """Return the user-facing URL of the server a daemon must register with."""
+    """Return the user-facing URL of the server a daemon must register with.
+
+    The result reaches terminal output and persistent exception text, and a
+    configured server URL may carry basic-auth userinfo
+    (``https://user:token@host``) that daemon-target normalization preserves.
+    Strip the userinfo the same way ``omnigent.cli_auth._safe_log_url`` does,
+    so registration diagnostics never echo embedded credentials. The query is
+    kept: ``ServerUrl`` strips arbitrary queries from the API base, and the
+    display form only re-adds the non-secret ``?o=<workspace>`` selector.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
     from omnigent.util.server_url import display_server_url
 
     base_url = _daemon_base_url(record)
-    return display_server_url(base_url) if base_url else "the configured server"
+    if not base_url:
+        return "the configured server"
+    display = display_server_url(base_url)
+    try:
+        parts = urlsplit(display)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "the configured server"
+    if not parts.scheme or not host:
+        return "the configured server"
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
 
 
 def _background_registration_timeout(
@@ -8845,11 +8867,14 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
             return
         if not announced:
             # Not registered on the first probe: name what the otherwise
-            # silent wait is for before polling out the grace period.
+            # silent wait is for before polling out the grace period. On
+            # stderr, like the nearby progress output, so scripts capturing
+            # the command's result never receive the waiting line.
             click.echo(
                 "Waiting for the host daemon to register with "
                 f"{_registration_target_display(record)} "
-                f"(up to {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s)..."
+                f"(up to {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s)...",
+                err=True,
             )
             announced = True
         if time.monotonic() >= deadline:

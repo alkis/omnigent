@@ -955,8 +955,11 @@ def test_registration_wait_names_server_while_waiting(
     with pytest.raises(click.ClickException):
         cli._confirm_background_host_registered(_server_record())
 
-    out = capsys.readouterr().out
-    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in out
+    captured = capsys.readouterr()
+    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+    # Progress goes to stderr so scripts capturing the command's stdout
+    # result never receive the waiting line.
+    assert captured.out == ""
 
 
 def test_registration_wait_prints_nothing_when_immediately_online(
@@ -969,7 +972,9 @@ def test_registration_wait_prints_nothing_when_immediately_online(
 
     cli._confirm_background_host_registered(_server_record())
 
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint(
@@ -998,6 +1003,71 @@ def test_registration_timeout_names_unreachable_server_and_skips_stale_host_hint
     assert "127.0.0.1:59999" in message
     assert "Connection refused" in message
     assert suppresses_recovery_hint(excinfo.value) is True
+
+
+def test_registration_diagnostics_never_expose_url_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configured server URL carrying userinfo is redacted in diagnostics.
+
+    Server configuration and daemon URL normalization both preserve URL
+    userinfo (``http://user:token@host``), so the waiting line and the
+    timeout error would otherwise echo credentials into the terminal and
+    persistent CLI diagnostics.
+    """
+    _patch_registration_wait(
+        monkeypatch,
+        cli._HostHttpResult(
+            status_code=0,
+            body="ConnectError: [Errno 111] Connection refused",
+            unreachable=True,
+        ),
+    )
+    record = _server_record("http://synthetic-user:synthetic-secret@127.0.0.1:59999")
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(record)
+
+    message = str(excinfo.value)
+    captured = capsys.readouterr()
+    for text in (message, captured.out, captured.err):
+        assert "synthetic-secret" not in text
+        assert "synthetic-user" not in text
+    # The server is still identified, just without its userinfo.
+    assert "http://127.0.0.1:59999" in message
+    assert "Waiting for the host daemon to register with http://127.0.0.1:59999" in captured.err
+
+
+def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that answered once and then became unreachable keeps the hint.
+
+    ``server_responded`` must stick across later transport failures: a
+    server that ever answered can genuinely have a stale host process, so
+    the generic registration timeout — with its recovery hint — applies,
+    not the unreachable-server wording.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    responses = iter([cli._HostHttpResult(status_code=200, body={"status": "offline"})])
+    refused = cli._HostHttpResult(
+        status_code=0,
+        body="ConnectError: [Errno 111] Connection refused",
+        unreachable=True,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_REGISTRATION_GRACE_S", 0.5)
+    monkeypatch.setattr(
+        cli, "_daemon_host_status_probe", lambda record, **_kw: next(responses, refused)
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record())
+
+    message = str(excinfo.value)
+    assert "did not register with the server at http://127.0.0.1:59999" in message
+    assert suppresses_recovery_hint(excinfo.value) is False
 
 
 def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
