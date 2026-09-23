@@ -204,10 +204,7 @@ class ProxyMcpManager:
 
         :param spec: The agent spec.  When ``spec.mcp_servers`` is empty,
             returns an empty result immediately without hitting the network.
-        :param sync_when_empty: Issue the ``tools/list`` even when
-            ``spec.mcp_servers`` is empty, so the server-side proxy observes
-            the now-empty config and folds any retained startup failures to
-            ready. Default keeps the no-network fast path.
+        :param sync_when_empty: Sync an empty config to clear retained failures.
         :returns: :class:`McpSchemasResult` containing schemas, tool name
             set, and per-server failure messages.
         """
@@ -299,9 +296,6 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        # The proxy reports degraded listings in MCP result metadata (see
-        # the server's tools/list handler); surface them so the caller can
-        # retry next turn rather than latching a partial schema set.
         meta = _json_object(result.get("_meta"))
         failures: dict[str, str] = {}
         if meta is not None:

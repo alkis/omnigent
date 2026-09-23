@@ -84,11 +84,9 @@ export function agentDisplayLabel(name: string): string {
   return nativeAgent?.displayName ?? capitalizeAgentName(baseName);
 }
 
-/** Pill styling for a server whose startup failed — the warning treatment. */
 const MCP_PILL_FAILED_CLASSES =
   "border-yellow-600/40 bg-yellow-500/10 text-yellow-700 dark:text-yellow-400";
 
-/** Pill styling for a healthy (or unknown-state) server. */
 const MCP_PILL_DEFAULT_CLASSES = "border-border bg-muted text-muted-foreground";
 
 /** Compact pill row listing MCP servers attached to an agent. */
@@ -99,7 +97,6 @@ export function McpServerList({
 }: {
   servers: McpServerSummary[];
   onDelete?: (name: string) => void;
-  /** Startup failures by server name — matching pills get the warning treatment. */
   failures?: Record<string, string> | null;
 }) {
   return (
@@ -1115,9 +1112,6 @@ function McpServersSection({
       }),
     [deleteServer, setMcpDirty],
   );
-  // Startup failures live in the chat store (fed by `session.mcp_startup`),
-  // keyed by server name. Shown here — the diagnostics surface — because
-  // they are deliberately kept out of the conversation viewport.
   const startupFailures = useChatStore((s) => s.mcpStartupFailures);
   const failedNames = startupFailures ? Object.keys(startupFailures).sort() : [];
   const showSection = servers.length > 0 || canEdit || failedNames.length > 0;
@@ -1168,9 +1162,7 @@ function McpServersSection({
           failures={startupFailures}
         />
       ) : (
-        // A failed server may be absent from the configured list (the SDK
-        // bare-agent case); don't contradict its failure block with a
-        // "No MCP servers" fallback.
+        // SDK failures may not have a matching configured-server pill.
         failedNames.length === 0 && <p className="text-sm text-muted-foreground">No MCP servers</p>
       )}
       {canEdit && (
@@ -1507,9 +1499,6 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   const [open, setOpen] = useState(false);
   const [mcpDirty, setMcpDirty] = useState(false);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  // MCP startup failures tint the trigger and swap its icon so the failure
-  // is noticeable from the header without polluting the conversation
-  // viewport; the popover's Tools section carries the per-server detail.
   const mcpStartupFailures = useChatStore((s) => s.mcpStartupFailures);
   const hasMcpFailures = mcpStartupFailures !== null && Object.keys(mcpStartupFailures).length > 0;
   const subdialogOpenRef = useRef(false);

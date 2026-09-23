@@ -83,17 +83,10 @@ async def test_mcp_tools_list_runner_failure_is_genericized(
 
 
 class _StubRunnerClient:
-    """Runner HTTP client stub returning a fixed ``tools/list`` result."""
-
     def __init__(self, failures: dict[str, str]) -> None:
         self._failures = failures
 
     async def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
-        """Return a canned ``tools/list`` result carrying *failures*.
-
-        :returns: An ``httpx.Response`` whose JSON body mirrors the
-            runner's ``/mcp/execute`` response shape.
-        """
         return httpx.Response(
             200,
             json={
@@ -108,17 +101,10 @@ class _StubRunnerClient:
 
 
 class _StubRunnerRouter:
-    """RunnerRouter stub that hands back a client with a canned response."""
-
     def __init__(self, failures: dict[str, str]) -> None:
         self._failures = failures
 
     def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
-        """Return a routed runner whose client returns canned failures.
-
-        :param conversation_id: Ignored session id.
-        :returns: A :class:`RoutedRunner` wrapping the stub client.
-        """
         del conversation_id
         return RoutedRunner(
             runner_id="runner_test",
@@ -130,15 +116,6 @@ class _StubRunnerRouter:
 async def test_mcp_tools_list_failure_publishes_startup_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A runner ``tools/list`` failure is published as a ``session.mcp_startup``
-    event, not just logged.
-
-    This is the runner/SDK-harness-path counterpart to the native-harness
-    ``external_mcp_startup`` publish: without this wiring, a bad MCP token
-    fails every turn with nothing but a server log line, and the web UI's
-    MCP diagnostics surface never learns about it. A failure here means
-    that regressed back to log-only.
-    """
     published: list[dict[str, object]] = []
 
     class _RecordingStream:
@@ -156,9 +133,6 @@ async def test_mcp_tools_list_failure_publishes_startup_event(
         runner_router=_StubRunnerRouter({"pipeshub": "401 Unauthorized"}),  # type: ignore[arg-type]
     )
 
-    # The JSON-RPC result carries the tools plus degraded-listing metadata
-    # (MCP-legal ``_meta``) so the runner re-issues tools/list next turn;
-    # failure visibility for the UI rides the SSE event below.
     payload = json.loads(bytes(response.body))
     assert payload["result"]["tools"] == []
     assert payload["result"]["_meta"]["omnigent/mcpFailures"] == {"pipeshub": "401 Unauthorized"}
@@ -169,8 +143,6 @@ async def test_mcp_tools_list_failure_publishes_startup_event(
     assert event["type"] == "session.mcp_startup"
     assert event["servers"]["pipeshub"]["status"] == "failed"
     assert event["servers"]["pipeshub"]["error"] == "401 Unauthorized"
-    # The snapshot cache retains the failure so a client reloading the
-    # session seeds the diagnostics surface from the snapshot.
     assert session_id in _helpers_mod._session_mcp_startup_cache
 
 
@@ -178,9 +150,6 @@ async def test_mcp_tools_list_failure_publishes_startup_event(
 async def test_mcp_tools_list_recovery_clears_startup_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server that stops failing is republished as ``ready``, so a token
-    refresh clears the web UI's diagnostics surface instead of leaving a
-    stale error."""
     published: list[dict[str, object]] = []
 
     class _RecordingStream:
@@ -214,8 +183,6 @@ async def test_mcp_tools_list_recovery_clears_startup_event(
 async def test_mcp_tools_list_all_healthy_publishes_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A healthy ``tools/list`` round with no prior failure publishes no
-    startup event — the common case must not spam the session stream."""
     published: list[dict[str, object]] = []
 
     class _RecordingStream:
@@ -233,7 +200,6 @@ async def test_mcp_tools_list_all_healthy_publishes_nothing(
     )
 
     assert published == []
-    # A clean listing carries no degraded-listing metadata.
     payload = json.loads(bytes(response.body))
     assert "_meta" not in payload["result"]
 
@@ -242,14 +208,6 @@ async def test_mcp_tools_list_all_healthy_publishes_nothing(
 async def test_mcp_tools_list_native_session_skips_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A native-harness session's ``tools/list`` must NOT publish startup state.
-
-    Native forwarders own the session's startup-cache entry (via
-    ``external_mcp_startup``); a runner-path publish for the same session
-    could fold a native ``"starting"`` server to ``"ready"``. A failure
-    here means the single-publisher invariant is no longer enforced in
-    code.
-    """
     published: list[dict[str, object]] = []
 
     class _RecordingStream:
@@ -266,11 +224,6 @@ async def test_mcp_tools_list_native_session_skips_publish(
 
     class _StubConversationStore:
         def get_conversation(self, conversation_id: str) -> object:
-            """Return a placeholder conversation row.
-
-            :param conversation_id: Ignored session id.
-            :returns: An opaque object; harness resolution is patched.
-            """
             del conversation_id
             return object()
 
@@ -282,10 +235,7 @@ async def test_mcp_tools_list_native_session_skips_publish(
     )
 
     payload = json.loads(bytes(response.body))
-    # The response still carries the tools and degraded-listing metadata...
     assert payload["result"]["tools"] == []
     assert payload["result"]["_meta"]["omnigent/mcpFailures"] == {"pipeshub": "401 Unauthorized"}
-    # ...but nothing is published — the native forwarder owns this
-    # session's startup snapshot.
     assert published == []
     assert "conv_native_mcp" not in _helpers_mod._session_mcp_startup_cache

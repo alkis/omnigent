@@ -1017,8 +1017,6 @@ describe("MCP startup failure diagnostics", () => {
   });
 
   it("shows the failure block even when the agent record lists no MCP servers", () => {
-    // An SDK session can fail on a server the bound-agent record doesn't
-    // carry a pill for; the diagnostics must not depend on a matching pill.
     useChatStore.setState({ mcpStartupFailures: { pipeshub: "401 Unauthorized" } });
     const bareAgent: Agent = { id: "agent_bare", name: "hello_world" };
     const qc = new QueryClient({
@@ -1034,7 +1032,6 @@ describe("MCP startup failure diagnostics", () => {
     const block = screen.getByTestId("mcp-startup-failures");
     expect(block.textContent).toContain("pipeshub");
     expect(block.textContent).toContain("401 Unauthorized");
-    // The empty-list fallback must not contradict the failure block.
     expect(screen.queryByText("No MCP servers")).toBeNull();
   });
 

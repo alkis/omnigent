@@ -175,10 +175,7 @@ async def test_partial_failure_surfaces_healthy_servers(
 async def test_connect_failure_strips_url_credentials_from_failures(
     patch_connection: dict[str, Any],
 ) -> None:
-    """A connect error that embeds the request URL must not leak a
-    query-string credential into ``failures`` — the message is forwarded
-    to the browser via the session's MCP startup events.
-    """
+    """Errors forwarded to the browser must not expose URL credentials."""
     patch_connection["__raise_for__"]["bad"] = RuntimeError(
         "Client error '401 Unauthorized' for url "
         "'https://mcp.example.com/sse?api_key=sk-live-abc123'"
@@ -196,13 +193,6 @@ async def test_connect_failure_strips_url_credentials_from_failures(
 
 
 class TestDescribeConnectError:
-    """Unit tests for the redaction helper in isolation from the pool.
-
-    The helper is imported inside the tests (not at module top) so this
-    module still collects — and the behavioral leak test above still
-    fails on the leak, not on an ImportError — on a tree without the fix.
-    """
-
     def test_strips_query_string_from_url(self) -> None:
         from omnigent.runner.mcp_manager import _describe_connect_error
 
