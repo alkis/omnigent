@@ -2140,3 +2140,47 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+def test_interrupt_treats_no_active_turn_to_interrupt_as_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """(c) 'no active turn to interrupt' clears the recorded turn and returns True.
+
+    The capacity-retry backoff keeps the failed turn id as active_turn_id so
+    interrupt_session can reach it. When Stop arrives, Codex rejects with
+    'no active turn to interrupt' (turn already finished). The executor must
+    treat this exactly like the stale-steer/mismatch case: clear the record
+    and return True (Stop succeeded).
+    """
+
+    class _InterruptFinishedTurnClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            if method == "turn/interrupt" and params.get("turnId"):
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to interrupt"}
+                )
+            return {"result": {}}
+
+    _InterruptFinishedTurnClient.requests = []
+    _InterruptFinishedTurnClient.created = []
+    _InterruptFinishedTurnClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _InterruptFinishedTurnClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_capacity_failed")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    interrupted = asyncio.run(executor.interrupt_session("key"))
+
+    assert interrupted is True
+    assert _InterruptFinishedTurnClient.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_capacity_failed"}),
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None, (
+        f"finished-turn record must be cleared; bridge={state!r}"
+    )

@@ -250,8 +250,16 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
     "api key",
 )
 _CODEX_ERROR_KIND_AUTH = "auth"
+_CODEX_ERROR_KIND_CAPACITY = "capacity"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
+# Normalized (lowercase, underscores stripped) codexErrorInfo variants that mean
+# the provider returned a server-overloaded / at-capacity response.
+_CODEX_CAPACITY_ERROR_INFO_NORMALIZED = frozenset({"serveroverloaded"})
+_CODEX_CAPACITY_ERROR_FRAGMENT = "selected model is at capacity"
+# Backoff seconds for each capacity retry attempt (first, second).
+_CAPACITY_RETRY_BACKOFFS_S = (5.0, 20.0)
+_CAPACITY_RETRY_MAX_ATTEMPTS = len(_CAPACITY_RETRY_BACKOFFS_S)
 
 
 @dataclass
@@ -472,6 +480,13 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
+    # Capacity-retry chain: maps any retry turn_id to its chain state so the
+    # next error handler can link back to the original turn and attempt number.
+    capacity_retry_by_turn: dict[str, _CapacityRetryState] = field(default_factory=dict)
+    # Turn ids whose turn/completed should be suppressed while a retry is pending.
+    capacity_retry_suppressed_turns: set[str] = field(default_factory=set)
+    # Active capacity-retry tasks — strong references prevent GC; cancelled on shutdown.
+    capacity_retry_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -933,7 +948,8 @@ class _CodexTerminalError:
 
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
-    :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param kind: Classification, one of ``"auth"``, ``"capacity"``, or
+        ``"generic"``.
     """
 
     message: str
@@ -944,6 +960,11 @@ class _CodexTerminalError:
         """:returns: ``True`` when the error was classified as auth-related."""
         return self.kind == _CODEX_ERROR_KIND_AUTH
 
+    @property
+    def is_capacity(self) -> bool:
+        """:returns: ``True`` when the provider returned a capacity / overloaded error."""
+        return self.kind == _CODEX_ERROR_KIND_CAPACITY
+
 
 def _classify_codex_error(error: _JsonObject, message: str) -> str:
     """
@@ -952,12 +973,14 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
     case-insensitive, or an httpStatusCode of 401/403); falls back to substring
     matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
-    that omit it.
+    that omit it. A ``server_overloaded`` / ``serverOverloaded`` variant (or
+    the message fragment ``"selected model is at capacity"``) maps to
+    :data:`_CODEX_ERROR_KIND_CAPACITY`.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
-    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
-        :data:`_CODEX_ERROR_KIND_GENERIC`.
+    :returns: :data:`_CODEX_ERROR_KIND_AUTH`, :data:`_CODEX_ERROR_KIND_CAPACITY`,
+        or :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     info = error.get("codexErrorInfo")
     variant: str | None = None
@@ -970,9 +993,16 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
     if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
+    if (
+        variant is not None
+        and variant.lower().replace("_", "") in _CODEX_CAPACITY_ERROR_INFO_NORMALIZED
+    ):
+        return _CODEX_ERROR_KIND_CAPACITY
     lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
         return _CODEX_ERROR_KIND_AUTH
+    if _CODEX_CAPACITY_ERROR_FRAGMENT in lowered:
+        return _CODEX_ERROR_KIND_CAPACITY
     return _CODEX_ERROR_KIND_GENERIC
 
 
@@ -1086,6 +1116,22 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+@dataclass(frozen=True)
+class _CapacityRetryState:
+    """
+    Retry-chain bookkeeping for a Codex capacity-error turn.
+
+    :param original_turn_id: Turn id that first received the capacity error.
+    :param original_error: Error from that first failure, surfaced if the
+        budget is exhausted.
+    :param attempt: Retry attempt number this entry represents (1 or 2).
+    """
+
+    original_turn_id: str
+    original_error: _CodexTerminalError
+    attempt: int
 
 
 @dataclass(frozen=True)
@@ -2011,6 +2057,16 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+async def _capacity_retry_sleep(seconds: float) -> None:
+    """
+    Stubbable sleep for capacity-retry backoffs.
+
+    :param seconds: Backoff duration in seconds.
+    :returns: None.
+    """
+    await asyncio.sleep(seconds)
+
+
 async def supervise_forwarder(
     *,
     base_url: str,
@@ -2180,6 +2236,10 @@ async def supervise_forwarder(
             await target.delta_coalescer.close()
             await target.usage_coalescer.close()
             await target.elicitation_tracker.close()
+            for _retry_task in list(forwarder_state.capacity_retry_tasks):
+                _retry_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await _retry_task
             subscribe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
@@ -3533,6 +3593,81 @@ async def _maybe_handle_turn_event(
                 _logger.warning("Codex forwarder ignored malformed error notification")
                 return True
             turn_id = _turn_id_from_payload(params)
+            thread_id = _thread_id_from_params(params)
+            # Capacity errors: the provider returned server_overloaded. Codex
+            # never retries these at the turn level, but the thread stays usable;
+            # re-sample with an empty turn while budget allows.
+            if (
+                error.is_capacity
+                and turn_id is not None
+                and thread_id is not None
+                and codex_client is not None
+                and forwarder_state is not None
+            ):
+                retry_state = forwarder_state.capacity_retry_by_turn.get(turn_id)
+                if retry_state is not None:
+                    prior_attempt = retry_state.attempt
+                    original_turn_id = retry_state.original_turn_id
+                    original_error = retry_state.original_error
+                else:
+                    prior_attempt = 0
+                    original_turn_id = turn_id
+                    original_error = error
+                if prior_attempt < _CAPACITY_RETRY_MAX_ATTEMPTS:
+                    forwarder_state.capacity_retry_suppressed_turns.add(turn_id)
+                    # Keep the failed turn id as active so interrupt_session can Stop it.
+                    backoff = _CAPACITY_RETRY_BACKOFFS_S[prior_attempt]
+                    next_attempt = prior_attempt + 1
+                    _logger.info(
+                        "Codex forwarder scheduling capacity retry: "
+                        "original_turn_id=%s failed_turn_id=%s attempt=%d backoff=%.0fs",
+                        original_turn_id,
+                        turn_id,
+                        next_attempt,
+                        backoff,
+                    )
+                    task: asyncio.Task[None] = asyncio.create_task(
+                        _run_capacity_retry_turn(
+                            codex_client,
+                            client,
+                            session_id=session_id,
+                            bridge_dir=bridge_dir,
+                            thread_id=thread_id,
+                            failed_turn_id=turn_id,
+                            original_turn_id=original_turn_id,
+                            original_error=original_error,
+                            attempt=next_attempt,
+                            backoff=backoff,
+                            forwarder_state=forwarder_state,
+                        ),
+                        name=f"codex-capacity-retry-{original_turn_id}-{next_attempt}",
+                    )
+                    forwarder_state.capacity_retry_tasks.add(task)
+                    task.add_done_callback(forwarder_state.capacity_retry_tasks.discard)
+                    await usage_coalescer.flush()
+                    return True
+                # Budget exhausted — surface the original failure once.
+                _logger.warning(
+                    "Codex forwarder capacity retry budget exhausted: "
+                    "original_turn_id=%s failed_turn_id=%s attempt=%d; surfacing failure",
+                    original_turn_id,
+                    turn_id,
+                    prior_attempt,
+                )
+                forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+                clear_active_turn_id_if_matches(bridge_dir, turn_id)
+                await _post_turn_status_edge(
+                    client,
+                    session_id,
+                    _CodexTurnStatusEdge(
+                        status="failed",
+                        turn_id=original_turn_id,
+                        source="error",
+                        error=original_error,
+                    ),
+                )
+                await usage_coalescer.flush()
+                return True
             if forwarder_state is not None and turn_id is not None:
                 if turn_id in forwarder_state.surfaced_terminal_error_turns:
                     _logger.info(
@@ -4611,6 +4746,162 @@ def _selected_plan_implementation_answer(result: _JsonObject | None) -> str | No
     return selected if isinstance(selected, str) and selected else None
 
 
+async def _run_capacity_retry_turn(
+    codex_client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    failed_turn_id: str,
+    original_turn_id: str,
+    original_error: _CodexTerminalError,
+    attempt: int,
+    backoff: float,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Codex does not retry a provider capacity error, but the thread stays usable;
+    re-sample it with an empty turn after a short backoff.
+
+    :param codex_client: Connected Codex app-server client.
+    :param ap_client: HTTP client for Omnigent status posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id of the failed turn.
+    :param failed_turn_id: The capacity-failed turn id kept as the active id
+        during the backoff so ``interrupt_session`` can detect a Stop.
+    :param original_turn_id: Turn id of the first capacity failure in the chain.
+    :param original_error: Error from the first failure, surfaced on budget exhaustion.
+    :param attempt: Attempt number (1 = first retry, 2 = second retry).
+    :param backoff: Seconds to sleep before issuing the retry.
+    :param forwarder_state: Mutable forwarder state for retry-chain tracking.
+    :returns: None.
+    """
+    try:
+        await _capacity_retry_sleep(backoff)
+    except asyncio.CancelledError:
+        # Forwarder shutting down during the backoff — best-effort surface the failure
+        # so the session does not stay "running" with nothing posted.
+        clear_active_turn_id_if_matches(bridge_dir, failed_turn_id)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                _post_turn_status_edge(
+                    ap_client,
+                    session_id,
+                    _CodexTurnStatusEdge(
+                        status="failed",
+                        turn_id=original_turn_id,
+                        source="error",
+                        error=original_error,
+                    ),
+                ),
+                timeout=2.0,
+            )
+        raise
+    # Retry only while the failed turn is still recorded: a Stop clears it (publish
+    # idle), a new user turn replaces it (skip silently).
+    bridge_state = read_bridge_state(bridge_dir)
+    if bridge_state is None or bridge_state.active_turn_id != failed_turn_id:
+        active_now = bridge_state.active_turn_id if bridge_state is not None else None
+        if active_now is None:
+            # Stop cleared the active turn; publish idle so the session stops "running".
+            _logger.info(
+                "Codex capacity retry: Stop cleared active turn, publishing idle: "
+                "original_turn_id=%s attempt=%d",
+                original_turn_id,
+                attempt,
+            )
+            await _post_turn_status_edge(
+                ap_client,
+                session_id,
+                _CodexTurnStatusEdge(
+                    status="idle",
+                    turn_id=original_turn_id,
+                    source="capacity_retry:stopped",
+                ),
+            )
+        else:
+            _logger.info(
+                "Codex capacity retry skipped: user turn superseded: "
+                "original_turn_id=%s attempt=%d active=%s",
+                original_turn_id,
+                attempt,
+                active_now,
+            )
+        return
+    # Atomically claim idle state before issuing turn/start.
+    if not clear_active_turn_id_if_matches(bridge_dir, failed_turn_id):
+        _logger.info(
+            "Codex capacity retry skipped: active turn changed concurrently: "
+            "original_turn_id=%s attempt=%d",
+            original_turn_id,
+            attempt,
+        )
+        return
+    _logger.info(
+        "Codex capacity retry executing turn/start: original_turn_id=%s attempt=%d thread_id=%s",
+        original_turn_id,
+        attempt,
+        thread_id,
+    )
+    try:
+        response = await codex_client.request(
+            "turn/start",
+            {"threadId": thread_id, "input": []},
+        )
+        result = response.get("result")
+        turn = result.get("turn") if isinstance(result, dict) else None
+        new_turn_id = turn.get("id") if isinstance(turn, dict) else None
+        if isinstance(new_turn_id, str) and new_turn_id:
+            update_active_turn_id(bridge_dir, new_turn_id)
+            forwarder_state.capacity_retry_by_turn[new_turn_id] = _CapacityRetryState(
+                original_turn_id=original_turn_id,
+                original_error=original_error,
+                attempt=attempt,
+            )
+            _logger.info(
+                "Codex capacity retry started: original_turn_id=%s retry_turn_id=%s attempt=%d",
+                original_turn_id,
+                new_turn_id,
+                attempt,
+            )
+        else:
+            _logger.warning(
+                "Codex capacity retry turn/start returned no turn id: "
+                "original_turn_id=%s attempt=%d; surfacing failure",
+                original_turn_id,
+                attempt,
+            )
+            await _post_turn_status_edge(
+                ap_client,
+                session_id,
+                _CodexTurnStatusEdge(
+                    status="failed",
+                    turn_id=original_turn_id,
+                    source="error",
+                    error=original_error,
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "Codex capacity retry failed to start turn: original_turn_id=%s attempt=%d: %s",
+            original_turn_id,
+            attempt,
+            exc,
+        )
+        await _post_turn_status_edge(
+            ap_client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=original_turn_id,
+                source="error",
+                error=original_error,
+            ),
+        )
+
+
 async def _start_plan_implementation_turn(
     codex_client: CodexAppServerClient,
     *,
@@ -4776,19 +5067,25 @@ def _prepare_terminal_turn_event(
     :returns: Whether the event was handled and its optional status edge.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
-    if (
-        forwarder_state is not None
-        and terminal_turn_id is not None
-        and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
-    ):
-        clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
-        _logger.info(
-            "Codex forwarder suppressed terminal boundary after standalone error: "
-            "method=%s turn_id=%s",
-            method,
-            terminal_turn_id,
-        )
-        return _PreparedTerminalTurn(handled=True, edge=None)
+    if forwarder_state is not None and terminal_turn_id is not None:
+        if terminal_turn_id in forwarder_state.surfaced_terminal_error_turns:
+            clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
+            _logger.info(
+                "Codex forwarder suppressed terminal boundary after standalone error: "
+                "method=%s turn_id=%s",
+                method,
+                terminal_turn_id,
+            )
+            return _PreparedTerminalTurn(handled=True, edge=None)
+        if terminal_turn_id in forwarder_state.capacity_retry_suppressed_turns:
+            # Keep the active turn id — the retry task uses it as a Stop sentinel.
+            _logger.info(
+                "Codex forwarder suppressed terminal boundary pending capacity retry: "
+                "method=%s turn_id=%s",
+                method,
+                terminal_turn_id,
+            )
+            return _PreparedTerminalTurn(handled=True, edge=None)
     edge = _terminal_turn_status_edge(bridge_dir, method, params)
     if edge is None:
         _logger.info(

@@ -69,6 +69,7 @@ _logger = logging.getLogger(__name__)
 
 _NO_ACTIVE_TURN_ERROR_CODE = -32600
 _NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
+_NO_ACTIVE_TURN_INTERRUPT_MESSAGE = "no active turn to interrupt"
 _ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
 _LEGACY_BRIDGE_STATE_POLL_COUNT = 60
 
@@ -93,6 +94,15 @@ def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
     )
 
 
+def _is_no_active_turn_to_interrupt(error: CodexAppServerResponseError) -> bool:
+    """Return whether Codex rejected a turn/interrupt because the turn already ended."""
+    return (
+        error.code == _NO_ACTIVE_TURN_ERROR_CODE
+        and error.message is not None
+        and error.message.strip().casefold() == _NO_ACTIVE_TURN_INTERRUPT_MESSAGE
+    )
+
+
 def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
     """Return whether a newer turn replaced the one we recorded.
 
@@ -110,11 +120,14 @@ def _is_active_turn_mismatch(error: CodexAppServerResponseError) -> bool:
 def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
     """Return whether our recorded active turn is no longer the thread's active one.
 
-    Covers both -32600 shapes: the turn ended ("no active turn to steer") and a
-    newer turn replaced it ("expected active turn id X but found Y"). Both call
-    for the same recovery — re-read bridge state and retarget the live turn.
+    Covers steer ("no active turn to steer"), interrupt ("no active turn to
+    interrupt"), and mismatch ("expected active turn id X but found Y") shapes.
     """
-    return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
+    return (
+        _is_no_active_turn_to_steer(error)
+        or _is_no_active_turn_to_interrupt(error)
+        or _is_active_turn_mismatch(error)
+    )
 
 
 async def _start_codex_turn(

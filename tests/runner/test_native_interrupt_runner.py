@@ -337,3 +337,198 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
     assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+
+
+# ---------------------------------------------------------------------------
+# Codex interrupt: finished-turn handling (capacity-retry sentinel)
+# ---------------------------------------------------------------------------
+
+
+def _make_codex_bridge_state(
+    *,
+    active_turn_id: str | None,
+    socket_path: str = "ws://127.0.0.1:43210",
+    thread_id: str = "thread_cx",
+) -> Any:
+    """Build a minimal fake CodexNativeBridgeState."""
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+
+    return CodexNativeBridgeState(
+        session_id="conv_cx",
+        socket_path=socket_path,
+        thread_id=thread_id,
+        codex_home="/tmp/codex-home",
+        active_turn_id=active_turn_id,
+    )
+
+
+def _patch_codex_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    codex_requests: list[Any],
+    interrupt_raises: BaseException | None = None,
+    cleared: list[str],
+) -> None:
+    """
+    Patch the codex bridge and app-server module attributes used by ``_codex_interrupt``.
+
+    :param codex_requests: Receives ``(method, params)`` pairs.
+    :param interrupt_raises: If set, the fake client raises this on ``turn/interrupt``.
+    :param cleared: Receives turn ids passed to ``clear_active_turn_id_if_matches``.
+    :returns: None.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_app_server
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    class _FakeCodexClient:
+        async def connect(self) -> None:
+            pass
+
+        async def request(self, method: str, params: dict) -> dict:
+            codex_requests.append((method, params))
+            if method == "turn/interrupt" and interrupt_raises is not None:
+                raise interrupt_raises
+            return {"result": {}}
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        codex_app_server, "client_for_transport", lambda *a, **kw: _FakeCodexClient()
+    )
+    monkeypatch.setattr(codex_bridge, "bridge_dir_for_bridge_id", lambda bid: f"/bridge/{bid}")
+    monkeypatch.setattr(codex_bridge, "cancel_pending_mcp_startup", lambda _: [])
+    monkeypatch.setattr(
+        codex_bridge,
+        "clear_active_turn_id_if_matches",
+        lambda _dir, turn_id: cleared.append(turn_id) or True,
+    )
+
+    # _session_labels_for_runner_spawn is imported at module level in interrupt.py;
+    # patch the interrupt module's bound name directly.
+    async def _fake_labels(*, server_client: Any, session_id: str) -> dict:
+        return {}
+
+    monkeypatch.setattr(interrupt_mod, "_session_labels_for_runner_spawn", _fake_labels)
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_finished_turn_returns_204_clears_id_and_publishes_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) 'no active turn to interrupt' → 204, stale id cleared, idle published.
+
+    The capacity-retry backoff keeps the failed turn id as bridge's active_turn_id.
+    When Stop arrives, Codex rejects the interrupt (turn already ended); the runner
+    must clear the stale record, publish idle so the session stops "running", and
+    return 204.
+    """
+    import json
+
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+
+    requests: list[Any] = []
+    cleared: list[Any] = []
+
+    async def _bridge_state(conv_id: str, *, action: str, **_kw: Any) -> Any:
+        return _make_codex_bridge_state(active_turn_id="turn_cx")
+
+    _patch_codex_modules(
+        monkeypatch,
+        codex_requests=requests,
+        interrupt_raises=CodexAppServerResponseError(
+            {"code": -32600, "message": "no active turn to interrupt"}
+        ),
+        cleared=cleared,
+    )
+    runner, captured = _make_runner(codex_bridge_state_for_session=_bridge_state)
+
+    resp = await runner.interrupt("codex-native", "conv_cx")
+
+    assert resp is not None and resp.status_code == 204, (
+        f"expected 204, got {resp.status_code}: "
+        f"{json.loads(bytes(resp.body)) if resp.status_code != 204 else ''}"
+    )
+    # The stale turn id was cleared from bridge state.
+    assert "turn_cx" in cleared
+    # turn/interrupt was attempted.
+    assert any(m == "turn/interrupt" and p.get("turnId") == "turn_cx" for m, p in requests)
+    # Idle was published so the session stops "running".
+    assert any(e.get("status") == "idle" for _, e in captured["published"])
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_other_error_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) Any other CodexAppServerResponseError is still surfaced as 503."""
+    import json
+
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+
+    requests: list[Any] = []
+    cleared: list[Any] = []
+
+    async def _bridge_state(conv_id: str, *, action: str, **_kw: Any) -> Any:
+        return _make_codex_bridge_state(active_turn_id="turn_cx")
+
+    _patch_codex_modules(
+        monkeypatch,
+        codex_requests=requests,
+        interrupt_raises=CodexAppServerResponseError(
+            {"code": -32600, "message": "thread not found"}
+        ),
+        cleared=cleared,
+    )
+    runner, captured = _make_runner(codex_bridge_state_for_session=_bridge_state)
+
+    resp = await runner.interrupt("codex-native", "conv_cx")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "codex_native_interrupt_failed"
+    # Nothing was cleared, no idle published.
+    assert cleared == []
+    assert not any(e.get("status") == "idle" for _, e in captured["published"])
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_active_turn_mismatch_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active-turn mismatch ('expected … but found …') still returns 503.
+
+    A mismatch means a newer turn is live and was not interrupted; reporting
+    success would hide a failed Stop. Only 'no active turn to interrupt' gets
+    the finished-turn treatment.
+    """
+    import json
+
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+
+    requests: list[Any] = []
+    cleared: list[Any] = []
+
+    async def _bridge_state(conv_id: str, *, action: str, **_kw: Any) -> Any:
+        return _make_codex_bridge_state(active_turn_id="turn_cx")
+
+    _patch_codex_modules(
+        monkeypatch,
+        codex_requests=requests,
+        interrupt_raises=CodexAppServerResponseError(
+            {
+                "code": -32600,
+                "message": "expected active turn id `turn_cx` but found `turn_new`",
+            }
+        ),
+        cleared=cleared,
+    )
+    runner, captured = _make_runner(codex_bridge_state_for_session=_bridge_state)
+
+    resp = await runner.interrupt("codex-native", "conv_cx")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "codex_native_interrupt_failed"
+    # Nothing cleared; no idle published.
+    assert cleared == []
+    assert not any(e.get("status") == "idle" for _, e in captured["published"])

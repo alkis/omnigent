@@ -4455,3 +4455,755 @@ def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
     """Event with params but no thread is not ephemeral."""
     event = {"method": "thread/started", "params": {}}
     assert fwd._thread_started_is_ephemeral(event) is False
+
+
+# ---------------------------------------------------------------------------
+# Capacity retry (_maybe_handle_turn_event + _run_capacity_retry_turn)
+# ---------------------------------------------------------------------------
+
+
+def _capacity_error_params(turn_id: str, thread_id: str = "thread_123") -> dict:
+    """
+    Build a non-retrying capacity error notification.
+
+    :param turn_id: Codex turn id of the failing turn.
+    :param thread_id: Codex thread id.
+    :returns: Params dict for an ``error`` notification.
+    """
+    return {
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "willRetry": False,
+        "error": {
+            "message": "Selected model is at capacity. Please try a different model.",
+            "codexErrorInfo": "server_overloaded",
+        },
+    }
+
+
+def _seed_bridge(bridge_dir: Path, turn_id: str, thread_id: str = "thread_123") -> None:
+    """
+    Write bridge state with an active turn for capacity retry tests.
+
+    :param bridge_dir: The test tmp_path.
+    :param turn_id: Active turn id to record.
+    :param thread_id: Thread id to record.
+    :returns: None.
+    """
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id=thread_id,
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=turn_id,
+        ),
+    )
+
+
+def test_classify_capacity_error_structured_info() -> None:
+    """Structured codexErrorInfo detects server_overloaded / serverOverloaded variants."""
+    cap = fwd._CODEX_ERROR_KIND_CAPACITY
+    assert fwd._classify_codex_error({"codexErrorInfo": "server_overloaded"}, "nope") == cap
+    assert fwd._classify_codex_error({"codexErrorInfo": "ServerOverloaded"}, "nope") == cap
+    assert fwd._classify_codex_error({"codexErrorInfo": "serverOverloaded"}, "nope") == cap
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"type": "server_overloaded"}}, "nope") == cap
+    )
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": {"type": "ServerOverloaded"}}, "nope") == cap
+    )
+
+
+def test_classify_capacity_error_message_fallback() -> None:
+    """Message fallback matches 'selected model is at capacity' case-insensitively."""
+    cap = fwd._CODEX_ERROR_KIND_CAPACITY
+    assert (
+        fwd._classify_codex_error(
+            {},
+            "Selected model is at capacity. Please try a different model.",
+        )
+        == cap
+    )
+    # Auth still takes priority over the message fallback.
+    assert fwd._classify_codex_error({}, "disk full or something") == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+def test_classify_capacity_auth_priority_over_capacity_message() -> None:
+    """Auth codexErrorInfo classification is not affected by the capacity additions."""
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": "unauthorized"}, "nope")
+        == fwd._CODEX_ERROR_KIND_AUTH
+    )
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_schedules_retry_no_failed_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) A capacity error defers the failure; after the instant backoff turn/start fires.
+
+    The retry turn's turn/completed success then publishes idle. The original
+    failed turn's turn/completed is suppressed while the retry is pending.
+    """
+    monkeypatch.setattr(fwd, "_capacity_retry_sleep", AsyncMock())
+
+    _seed_bridge(tmp_path, "turn_123")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+
+    class _FakeTurnStartClient:
+        """Fake Codex client returning a new turn id from turn/start."""
+
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict]] = []
+
+        async def request(self, method: str, params: dict) -> dict:
+            self.requests.append((method, params))
+            return {"result": {"turn": {"id": "turn_456"}}}
+
+    codex_client = _FakeTurnStartClient()
+    try:
+        # Capacity error arrives.
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_123"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=codex_client,  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        # No failed edge yet.
+        assert client.posts == []
+
+        # Allow background task to run (sleep is instant, so one yield suffices).
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # turn/start was issued with input:[] on the same thread.
+        assert codex_client.requests == [("turn/start", {"threadId": "thread_123", "input": []})]
+
+        # Bridge state updated to the retry turn.
+        bridge = read_bridge_state(tmp_path)
+        assert bridge is not None
+        assert bridge.active_turn_id == "turn_456"
+
+        # Retry turn is registered in the chain.
+        assert "turn_456" in state.capacity_retry_by_turn
+        assert state.capacity_retry_by_turn["turn_456"].original_turn_id == "turn_123"
+        assert state.capacity_retry_by_turn["turn_456"].attempt == 1
+
+        # Original turn's turn/completed is suppressed (retry pending).
+        assert "turn_123" in state.capacity_retry_suppressed_turns
+
+        # Retry turn starts: turn/started publishes "running" and must not disturb suppression.
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread_123",
+                    "turn": {"id": "turn_456"},
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=state,
+        )
+        # The original turn is still suppressed; the retry turn is now active.
+        assert "turn_123" in state.capacity_retry_suppressed_turns
+        bridge_after_started = read_bridge_state(tmp_path)
+        assert bridge_after_started is not None
+        assert bridge_after_started.active_turn_id == "turn_456"
+
+        # Retry turn completes successfully.
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread_123",
+                    "turn": {
+                        "id": "turn_456",
+                        "status": "completed",
+                        "items": [{"type": "agentMessage", "text": "done"}],
+                    },
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # Two posts: running (turn/started) then idle (turn/completed).
+    assert len(client.posts) == 2
+    assert client.posts[0][1]["data"]["status"] == "running"
+    assert client.posts[0][1]["data"].get("response_id") == "codex_turn_456"
+    assert client.posts[1][1]["data"]["status"] == "idle"
+    assert client.posts[1][1]["data"].get("response_id") == "codex_turn_456"
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_twice_then_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) Two capacity failures → two retries; a third → original failure surfaced once."""
+    monkeypatch.setattr(fwd, "_capacity_retry_sleep", AsyncMock())
+    _seed_bridge(tmp_path, "turn_1")
+
+    turn_counter = {"n": 2}  # turn_1 already failed; next turns are turn_2, turn_3, …
+
+    class _SequentialTurnClient:
+        """Returns sequential turn ids from turn/start."""
+
+        async def request(self, method: str, params: dict) -> dict:
+            tid = f"turn_{turn_counter['n']}"
+            turn_counter["n"] += 1
+            return {"result": {"turn": {"id": tid}}}
+
+    codex_client = _SequentialTurnClient()
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        # First capacity error: schedules retry 1.
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_1"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=codex_client,  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        assert client.posts == []
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # Retry 1 started turn_2.
+        assert "turn_2" in state.capacity_retry_by_turn
+        assert state.capacity_retry_by_turn["turn_2"].attempt == 1
+
+        # Simulate bridge active turn advancing to turn_2.
+        write_bridge_state(
+            tmp_path,
+            CodexNativeBridgeState(
+                session_id="conv_x",
+                socket_path=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                codex_home=str(tmp_path / "codex-home"),
+                active_turn_id="turn_2",
+            ),
+        )
+
+        # Second capacity error on turn_2: schedules retry 2.
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_2"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=codex_client,  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        assert client.posts == []
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # Retry 2 started turn_3.
+        assert "turn_3" in state.capacity_retry_by_turn
+        assert state.capacity_retry_by_turn["turn_3"].attempt == 2
+
+        # Simulate bridge active turn advancing to turn_3.
+        write_bridge_state(
+            tmp_path,
+            CodexNativeBridgeState(
+                session_id="conv_x",
+                socket_path=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                codex_home=str(tmp_path / "codex-home"),
+                active_turn_id="turn_3",
+            ),
+        )
+
+        # Third capacity error on turn_3: budget exhausted → original failure surfaced.
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_3"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=codex_client,  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # Exactly one failure post, carrying the ORIGINAL turn's response_id.
+    assert len(client.posts) == 1
+    post_data = client.posts[0][1]["data"]
+    assert post_data["status"] == "failed"
+    assert post_data["response_id"] == "codex_turn_1"
+    assert "capacity" in post_data["output"].lower()
+
+
+@pytest.mark.asyncio
+async def test_non_capacity_error_surfaced_immediately(
+    tmp_path: Path,
+) -> None:
+    """(c) Non-capacity errors are surfaced immediately without scheduling a retry."""
+
+    class _NoCallCodexClient:
+        """Fails the test if request() is ever called."""
+
+        async def request(self, method: str, params: dict) -> dict:
+            raise AssertionError(
+                f"turn/start must not be called for non-capacity errors: {method}"
+            )
+
+    _seed_bridge(tmp_path, "turn_123")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params={
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": {"message": "Context window exceeded."},
+            },
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=_NoCallCodexClient(),  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"]["status"] == "failed"
+    assert state.capacity_retry_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_capacity_retry_superseded_by_new_user_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(d) A new user turn replacing the failed turn id during the backoff supersedes the retry.
+
+    The failed turn id is kept as the bridge's active_turn_id during the backoff
+    so interrupt_session can reach it. When _inject_codex_turn clears the stale
+    id and starts a new user turn, the active_turn_id changes to the new user turn.
+    The retry task checks active_turn_id == failed_turn_id after the backoff; if
+    they differ it skips silently without calling turn/start.
+    """
+    started_event = asyncio.Event()
+    allow_proceed = asyncio.Event()
+
+    async def _blocking_sleep(seconds: float) -> None:
+        started_event.set()
+        await allow_proceed.wait()
+
+    monkeypatch.setattr(fwd, "_capacity_retry_sleep", _blocking_sleep)
+    _seed_bridge(tmp_path, "turn_123")
+
+    turn_start_called = False
+
+    class _WatchdogCodexClient:
+        async def request(self, method: str, params: dict) -> dict:
+            nonlocal turn_start_called
+            turn_start_called = True
+            return {"result": {"turn": {"id": "turn_999"}}}
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_123"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=_WatchdogCodexClient(),  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        # The failed turn id must still be the active turn during the backoff.
+        assert read_bridge_state(tmp_path).active_turn_id == "turn_123"  # type: ignore[union-attr]
+        # Wait until the retry task is sleeping.
+        await asyncio.wait_for(started_event.wait(), timeout=5.0)
+        # Simulate _inject_codex_turn's stale-steer recovery: it cleared the failed
+        # turn id and replaced it with the user's new turn id.
+        write_bridge_state(
+            tmp_path,
+            CodexNativeBridgeState(
+                session_id="conv_x",
+                socket_path=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                codex_home=str(tmp_path / "codex-home"),
+                active_turn_id="turn_new_user",
+            ),
+        )
+        # Let the retry task wake up.
+        allow_proceed.set()
+        # Drain the task.
+        tasks = list(state.capacity_retry_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # No turn/start was issued; no failure was surfaced (superseded).
+    assert turn_start_called is False
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_capacity_retry_skipped_when_stop_clears_failed_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(g) Stop during the backoff clears the failed turn id; the retry publishes idle.
+
+    interrupt_session issues turn/interrupt with the recorded failed turn id;
+    Codex responds with a stale-turn error; interrupt_session then calls
+    clear_active_turn_id_if_matches, setting active_turn_id to None. After the
+    backoff the retry task sees active_turn_id is None, publishes idle (so the
+    session stops "running"), and returns without calling turn/start.
+    """
+    started_event = asyncio.Event()
+    allow_proceed = asyncio.Event()
+
+    async def _blocking_sleep(seconds: float) -> None:
+        started_event.set()
+        await allow_proceed.wait()
+
+    monkeypatch.setattr(fwd, "_capacity_retry_sleep", _blocking_sleep)
+    _seed_bridge(tmp_path, "turn_123")
+
+    turn_start_called = False
+
+    class _WatchdogCodexClient:
+        async def request(self, method: str, params: dict) -> dict:
+            nonlocal turn_start_called
+            turn_start_called = True
+            return {"result": {"turn": {"id": "turn_999"}}}
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_123"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=_WatchdogCodexClient(),  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        # Failed turn id is still recorded as active during the backoff.
+        assert read_bridge_state(tmp_path).active_turn_id == "turn_123"  # type: ignore[union-attr]
+        await asyncio.wait_for(started_event.wait(), timeout=5.0)
+        # Simulate interrupt_session's stale-turn path: it cleared the active id.
+        write_bridge_state(
+            tmp_path,
+            CodexNativeBridgeState(
+                session_id="conv_x",
+                socket_path=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                codex_home=str(tmp_path / "codex-home"),
+                active_turn_id=None,
+            ),
+        )
+        allow_proceed.set()
+        tasks = list(state.capacity_retry_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # No turn/start; exactly one idle post (not a failure).
+    assert turn_start_called is False
+    assert len(client.posts) == 1
+    post_data = client.posts[0][1]["data"]
+    assert post_data["status"] == "idle"
+    assert post_data.get("response_id") == "codex_turn_123"
+
+
+@pytest.mark.asyncio
+async def test_capacity_retry_cancelled_during_backoff_posts_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forwarder shutdown during the backoff posts the original failure and re-raises.
+
+    When supervise_forwarder cancels the retry task (shutdown/reconnect), the
+    CancelledError handler makes a bounded best-effort post of the original error
+    so the session surfaces the failure rather than staying stuck "running", then
+    re-raises so the task completes as cancelled.
+    """
+    sleep_started = asyncio.Event()
+
+    async def _blocking_sleep(seconds: float) -> None:
+        sleep_started.set()
+        await asyncio.sleep(3600)  # blocks until cancelled
+
+    monkeypatch.setattr(fwd, "_capacity_retry_sleep", _blocking_sleep)
+    _seed_bridge(tmp_path, "turn_123")
+
+    class _NeverCalledCodexClient:
+        async def request(self, method: str, params: dict) -> dict:
+            raise AssertionError("turn/start must not be called after cancel")
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    cancelled_error_raised = False
+    try:
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_123"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=_NeverCalledCodexClient(),  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        await asyncio.wait_for(sleep_started.wait(), timeout=5.0)
+        # Cancel the retry task (simulating supervise_forwarder shutdown).
+        tasks = list(state.capacity_retry_tasks)
+        assert tasks
+        for t in tasks:
+            t.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cancelled_error_raised = all(isinstance(r, asyncio.CancelledError) for r in results)
+        # One more yield for any follow-up.
+        await asyncio.sleep(0)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # The task propagated CancelledError.
+    assert cancelled_error_raised
+    # Original failure was posted exactly once.
+    assert len(client.posts) == 1
+    post_data = client.posts[0][1]["data"]
+    assert post_data["status"] == "failed"
+    assert post_data.get("response_id") == "codex_turn_123"
+    # Bridge state cleared.
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None
+    assert bridge.active_turn_id is None
+
+
+@pytest.mark.asyncio
+async def test_capacity_retry_turn_start_raises_surfaces_original_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(e) turn/start raising in the retry task surfaces the original failure."""
+    monkeypatch.setattr(fwd, "_capacity_retry_sleep", AsyncMock())
+    _seed_bridge(tmp_path, "turn_123")
+
+    class _RaisingCodexClient:
+        async def request(self, method: str, params: dict) -> dict:
+            raise ConnectionError("app-server gone")
+
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._maybe_handle_turn_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            method="error",
+            params=_capacity_error_params("turn_123"),
+            usage_coalescer=usage,
+            delta_coalescer=None,
+            elicitation_tracker=tracker,
+            codex_client=_RaisingCodexClient(),  # type: ignore[arg-type]
+            forwarder_state=state,
+        )
+        # No post yet.
+        assert client.posts == []
+        # Let the background task run.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        tasks = list(state.capacity_retry_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # One more yield for any follow-up coroutines.
+        await asyncio.sleep(0)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["data"]["status"] == "failed"
+    assert client.posts[0][1]["data"]["response_id"] == "codex_turn_123"
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_for_pending_retry_turn_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    """(f) turn/completed for a turn with a pending retry is suppressed."""
+    _seed_bridge(tmp_path, "turn_123")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    # Mark turn_123 as having a pending retry.
+    state.capacity_retry_suppressed_turns.add("turn_123")
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread_123",
+                    "turn": {
+                        "id": "turn_123",
+                        "status": "failed",
+                        "error": {"message": "Selected model is at capacity."},
+                    },
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # No status edge published — the pending retry owns the terminal boundary.
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_with_capacity_turn_error_surfaces_failure_no_retry(
+    tmp_path: Path,
+) -> None:
+    """Capacity error carried only on turn/completed is surfaced immediately without retry.
+
+    When the ``error`` notification never arrives (or the failure only appears as
+    ``turn.error`` inside ``turn/completed``), the normal ``turn/completed`` path in
+    ``_terminal_turn_status_edge`` detects it and posts a failed edge. No capacity
+    retry should be scheduled from this path.
+    """
+    _seed_bridge(tmp_path, "turn_123")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread_123",
+                    "turn": {
+                        "id": "turn_123",
+                        "status": "failed",
+                        "error": {
+                            "message": "Selected model is at capacity.",
+                            "codexErrorInfo": "server_overloaded",
+                        },
+                    },
+                },
+            },
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # Failure surfaced immediately via the turn/completed path.
+    assert len(client.posts) == 1
+    post_data = client.posts[0][1]["data"]
+    assert post_data["status"] == "failed"
+    assert post_data["response_id"] == "codex_turn_123"
+    # No capacity retry was scheduled.
+    assert state.capacity_retry_tasks == set()
+    assert state.capacity_retry_suppressed_turns == set()

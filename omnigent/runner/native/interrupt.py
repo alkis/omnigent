@@ -557,13 +557,18 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import (
+            CodexAppServerResponseError,
+            client_for_transport,
+        )
         from omnigent.harnesses.codex_native.bridge import (
             CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             cancel_pending_mcp_startup,
+            clear_active_turn_id_if_matches,
             read_mcp_startup,
         )
+        from omnigent.inner.codex_native_executor import _is_no_active_turn_to_interrupt
 
         state = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
@@ -622,13 +627,27 @@ class NativeInterruptRunner:
                         exc_info=True,
                     )
             if state.active_turn_id is not None:
-                await codex_client.request(
-                    "turn/interrupt",
-                    {
-                        "threadId": state.thread_id,
-                        "turnId": state.active_turn_id,
-                    },
-                )
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": state.thread_id,
+                            "turnId": state.active_turn_id,
+                        },
+                    )
+                except CodexAppServerResponseError as error:
+                    # The recorded turn already finished (capacity retry keeps it
+                    # recorded during the backoff): clear the stale record and
+                    # publish idle so the session stops showing "running".
+                    if not _is_no_active_turn_to_interrupt(error):
+                        raise
+                    clear_active_turn_id_if_matches(bridge_dir, state.active_turn_id)
+                    self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+                    self._logger.info(
+                        "Codex-native interrupt: recorded turn %s already finished (%s)",
+                        state.active_turn_id,
+                        error.message,
+                    )
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
