@@ -275,4 +275,42 @@ describe("useComposerAttachments", () => {
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledWith([file]);
   });
+
+  it("invokes the latest onRemoved through the stable removeFile action", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ cb }: { cb: () => void }) =>
+        useComposerAttachments({ initialFiles: [textFile()], onRemoved: cb }),
+      { initialProps: { cb: first } },
+    );
+    rerender({ cb: second });
+
+    act(() => result.current.removeFile(0));
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not invoke onAccepted when a batch rejects every file", () => {
+    const onAccepted = vi.fn();
+    const { result } = renderHook(() => useComposerAttachments({ onAccepted }));
+
+    act(() => result.current.addFiles([videoFile(), videoFile("clip2.mp4")]));
+
+    expect(result.current.files).toEqual([]);
+    expect(result.current.attachmentError).not.toBeNull();
+    expect(onAccepted).not.toHaveBeenCalled();
+  });
+
+  it("applies initialFiles at mount only, ignoring later prop changes", () => {
+    const { result, rerender } = renderHook(
+      ({ initial }: { initial: File[] }) => useComposerAttachments({ initialFiles: initial }),
+      { initialProps: { initial: [textFile()] } },
+    );
+
+    rerender({ initial: [pngFile(), videoFile()] });
+
+    expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
+  });
 });

@@ -7,7 +7,11 @@ export interface UseComposerAttachmentsOptions {
    * so nothing the composer already accepted can be silently dropped.
    */
   initialFiles?: File[];
-  /** Runs after a batch appends at least one file; receives the accepted files. */
+  /**
+   * Fires synchronously inside addFiles when a batch accepts at least one
+   * file — before React commits the append, so readers still see the prior
+   * list. Receives the accepted files.
+   */
   onAccepted?: (accepted: File[]) => void;
   /** Runs after a removal. */
   onRemoved?: () => void;
