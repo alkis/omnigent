@@ -102,7 +102,7 @@ def test_cli_missing_highlights_uses_grouped_fallback(tmp_path: Path) -> None:
     credits = tmp_path / "credits.json"
     credits.write_text(json.dumps(CREDITS))
     out = tmp_path / "notes.md"
-    subprocess.run(
+    result = subprocess.run(
         [
             sys.executable,
             str(SCRIPT),
@@ -116,5 +116,41 @@ def test_cli_missing_highlights_uses_grouped_fallback(tmp_path: Path) -> None:
             str(out),
         ],
         check=True,
+        capture_output=True,
+        text=True,
     )
     assert out.read_text() == compose_notes("", CREDITS, REPO)
+    assert (
+        "::warning::Release highlights omitted: drafter output is empty or unavailable"
+        in result.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        ("Agent failed", "RELEASE_NOTES markers are missing"),
+        (_raw(""), "the RELEASE_NOTES block is empty"),
+        (_raw("## Highlights\n- Fix (#1)"), "highlight headings"),
+        (_raw("## Bug fixes\n- Fixed (#1)\n  wrapped text"), "highlight line 3"),
+        (
+            _raw("## Bug fixes\n- Fixed (#1) with more text"),
+            "must be a bullet ending in PR citations",
+        ),
+        (_raw("## Bug fixes\n- Fixed (#999)"), "cites a PR outside the release"),
+        (_raw("## Bug fixes"), "contains no highlight bullets"),
+    ],
+)
+def test_fallback_warning_explains_reason_and_preserves_credits(raw, reason, capsys) -> None:
+    notes = compose_notes(raw, CREDITS, REPO, warn_on_fallback=True)
+    assert notes == compose_notes("", CREDITS, REPO)
+    warning = capsys.readouterr().err
+    assert "::warning::Release highlights omitted:" in warning
+    assert reason in warning
+    assert "Keeping complete contributor groups" in warning
+
+
+def test_valid_highlights_and_intentional_fallback_do_not_warn(capsys) -> None:
+    compose_notes(_raw("## Bug fixes\n- Fixed (#1)"), CREDITS, REPO, warn_on_fallback=True)
+    compose_notes("", CREDITS, REPO)
+    assert capsys.readouterr().err == ""

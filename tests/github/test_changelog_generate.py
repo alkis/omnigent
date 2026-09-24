@@ -437,3 +437,76 @@ def test_github_failure_does_not_silently_drop_credits(monkeypatch) -> None:
     monkeypatch.setattr(gen.subprocess, "run", fail)
     with pytest.raises(subprocess.CalledProcessError):
         gen.collect("v1.0.0", _REPO)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Bad Gateway (HTTP 502)",
+        "gh: Too Many Requests (HTTP 429)",
+        "gh: API rate limit exceeded (HTTP 403)",
+        "read: connection reset by peer",
+        None,
+    ],
+)
+def test_transient_metadata_failures_retry_then_recover(monkeypatch, capsys, stderr) -> None:
+    calls = []
+    sleeps = []
+    metadata = {"body": "", "author": {"login": "alice"}}
+
+    def flaky(command, **kwargs):
+        calls.append(command)
+        assert kwargs["timeout"] == 30
+        if len(calls) < 3:
+            if stderr is None:
+                raise subprocess.TimeoutExpired(command, 30)
+            raise subprocess.CalledProcessError(1, command, stderr=stderr)
+        return subprocess.CompletedProcess(command, 0, json.dumps(metadata))
+
+    monkeypatch.setattr(gen.subprocess, "run", flaky)
+    monkeypatch.setattr(gen.time, "sleep", sleeps.append)
+    assert gen._gh_pr(_REPO, 123) == metadata
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
+    warnings = capsys.readouterr().err
+    assert warnings.count("::warning::") == 2
+    assert "PR #123" in warnings
+    assert "attempt 3/3" in warnings
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_permanent_metadata_errors_do_not_retry(monkeypatch, status) -> None:
+    calls = []
+    sleeps = []
+
+    def fail(command, **kwargs):
+        calls.append(command)
+        raise subprocess.CalledProcessError(
+            1, command, stderr=f"gh: Request failed (HTTP {status})"
+        )
+
+    monkeypatch.setattr(gen.subprocess, "run", fail)
+    monkeypatch.setattr(gen.time, "sleep", sleeps.append)
+    with pytest.raises(subprocess.CalledProcessError):
+        gen._gh_pr(_REPO, 123)
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_exhausted_metadata_retries_still_fail_the_harvest(monkeypatch) -> None:
+    _stub_io(monkeypatch, subjects=["docs: typo (#123)"], all_tags=[])
+    calls = []
+    sleeps = []
+
+    def fail(command, **kwargs):
+        calls.append(command)
+        raise subprocess.CalledProcessError(
+            1, command, stderr="gh: Service unavailable (HTTP 503)"
+        )
+
+    monkeypatch.setattr(gen.subprocess, "run", fail)
+    monkeypatch.setattr(gen.time, "sleep", sleeps.append)
+    with pytest.raises(subprocess.CalledProcessError):
+        gen.collect("v1.0.0", _REPO)
+    assert len(calls) == 3
+    assert sleeps == [1, 2]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 SECTIONS = ["## Major new features", "## Breaking changes", "## Bug fixes"]
@@ -21,17 +22,23 @@ def _author_link(credit: dict) -> str:
 
 
 def _highlights(raw: str, credits: list[dict], repo: str) -> tuple[str, set[int]]:
+    if not raw.strip():
+        raise ValueError("drafter output is empty or unavailable")
     match = re.search(
         r"<!--\s*RELEASE_NOTES\s*-->(.*?)<!--\s*/RELEASE_NOTES\s*-->", raw, re.DOTALL
     )
-    highlights = match.group(1).strip() if match else ""
+    if not match:
+        raise ValueError("RELEASE_NOTES markers are missing")
+    highlights = match.group(1).strip()
+    if not highlights:
+        raise ValueError("the RELEASE_NOTES block is empty")
     headings = re.findall(r"(?m)^## .+$", highlights)
     if not headings or headings != [section for section in SECTIONS if section in headings]:
-        return "", set()
+        raise ValueError("highlight headings are missing, duplicated, or out of order")
     by_pr = {credit["pr"]: credit for credit in credits}
     cited: set[int] = set()
     lines = []
-    for line in highlights.splitlines():
+    for line_number, line in enumerate(highlights.splitlines(), start=1):
         if not line.strip() or line in SECTIONS:
             lines.append(line)
             continue
@@ -41,18 +48,35 @@ def _highlights(raw: str, credits: list[dict], repo: str) -> tuple[str, set[int]
             if bullet
             else []
         )
-        if not prs or not set(prs) <= by_pr.keys():
-            return "", set()
+        if not prs:
+            raise ValueError(
+                f"highlight line {line_number} must be a bullet ending in PR citations"
+            )
+        if not set(prs) <= by_pr.keys():
+            raise ValueError(f"highlight line {line_number} cites a PR outside the release")
         # Credits come from GitHub metadata, even if the model omits or guesses handles.
         refs = [_pr_link(pr, repo) for pr in prs]
         refs.extend(dict.fromkeys(_author_link(by_pr[pr]) for pr in prs if by_pr[pr]["author"]))
         lines.append(f"{bullet[1]} ({', '.join(refs)})")
         cited.update(prs)
-    return ("\n".join(lines), cited) if cited else ("", set())
+    if not cited:
+        raise ValueError("the RELEASE_NOTES block contains no highlight bullets")
+    return "\n".join(lines), cited
 
 
-def compose_notes(raw: str, credits: list[dict], repo: str) -> str:
-    highlights, cited = _highlights(raw, credits, repo)
+def compose_notes(
+    raw: str, credits: list[dict], repo: str, *, warn_on_fallback: bool = False
+) -> str:
+    try:
+        highlights, cited = _highlights(raw, credits, repo)
+    except ValueError as error:
+        if warn_on_fallback:
+            print(
+                f"::warning::Release highlights omitted: {error}. "
+                "Keeping complete contributor groups.",
+                file=sys.stderr,
+            )
+        highlights, cited = "", set()
     groups: dict[str, list[dict]] = {}
     for credit in sorted(credits, key=lambda credit: credit["pr"]):
         if credit["pr"] not in cited:
@@ -79,7 +103,9 @@ def main() -> None:
     args = parser.parse_args()
     raw = args.highlights.read_text(encoding="utf-8") if args.highlights.is_file() else ""
     credits = json.loads(args.credits.read_text(encoding="utf-8"))
-    args.out.write_text(compose_notes(raw, credits, args.repo), encoding="utf-8")
+    args.out.write_text(
+        compose_notes(raw, credits, args.repo, warn_on_fallback=True), encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":

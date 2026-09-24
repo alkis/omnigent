@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from compose_notes import compose_notes
@@ -276,14 +277,53 @@ def _tag_date(tag: str) -> str:
     return _git("log", "-1", "--format=%cs", tag)
 
 
-def _gh_pr(repo: str, pr: int) -> dict:
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}/pulls/{pr}", "--jq", "{body, author: .user}"],
-        capture_output=True,
-        text=True,
-        check=True,
+def _retryable_gh_error(error: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> bool:
+    if isinstance(error, subprocess.TimeoutExpired):
+        return True
+    message = (error.stderr or "").lower()
+    status = re.search(r"\bhttp (\d{3})\b", message)
+    if status:
+        code = int(status[1])
+        return code in (408, 429) or 500 <= code < 600 or (code == 403 and "rate limit" in message)
+    return any(
+        marker in message
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "unexpected eof",
+            "tls handshake",
+            "temporary failure",
+            "no such host",
+        )
     )
-    return json.loads(proc.stdout)
+
+
+def _gh_pr(repo: str, pr: int) -> dict:
+    attempt = 1
+    while True:
+        try:
+            proc = subprocess.run(
+                ["gh", "api", f"repos/{repo}/pulls/{pr}", "--jq", "{body, author: .user}"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            if attempt >= 3 or not _retryable_gh_error(error):
+                raise
+            delay = 2 ** (attempt - 1)
+            print(
+                f"::warning::Transient GitHub metadata failure for PR #{pr}; "
+                f"retrying in {delay}s (attempt {attempt + 1}/3).",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            attempt += 1
+        else:
+            return json.loads(proc.stdout)
 
 
 def collect(
