@@ -14,11 +14,7 @@ spec = importlib.util.spec_from_file_location("changelog_generate", SCRIPT)
 assert spec and spec.loader
 gen = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = gen
-sys.path.insert(0, str(SCRIPT.parent))
-try:
-    spec.loader.exec_module(gen)
-finally:
-    sys.path.pop(0)
+spec.loader.exec_module(gen)
 
 
 # --- previous_final_tag ------------------------------------------------------
@@ -446,6 +442,7 @@ def test_github_failure_does_not_silently_drop_credits(monkeypatch) -> None:
         "gh: Too Many Requests (HTTP 429)",
         "gh: API rate limit exceeded (HTTP 403)",
         "read: connection reset by peer",
+        "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
         None,
     ],
 )
@@ -493,16 +490,21 @@ def test_permanent_metadata_errors_do_not_retry(monkeypatch, status) -> None:
     assert sleeps == []
 
 
-def test_exhausted_metadata_retries_still_fail_the_harvest(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "gh: Service unavailable (HTTP 503)",
+        "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+    ],
+)
+def test_exhausted_metadata_retries_still_fail_the_harvest(monkeypatch, stderr) -> None:
     _stub_io(monkeypatch, subjects=["docs: typo (#123)"], all_tags=[])
     calls = []
     sleeps = []
 
     def fail(command, **kwargs):
         calls.append(command)
-        raise subprocess.CalledProcessError(
-            1, command, stderr="gh: Service unavailable (HTTP 503)"
-        )
+        raise subprocess.CalledProcessError(1, command, stderr=stderr)
 
     monkeypatch.setattr(gen.subprocess, "run", fail)
     monkeypatch.setattr(gen.time, "sleep", sleeps.append)
@@ -510,3 +512,73 @@ def test_exhausted_metadata_retries_still_fail_the_harvest(monkeypatch) -> None:
         gen.collect("v1.0.0", _REPO)
     assert len(calls) == 3
     assert sleeps == [1, 2]
+
+
+def test_collect_skips_verified_issue_references(monkeypatch, capsys) -> None:
+    _stub_io(monkeypatch, subjects=["Fix issue (#1)", "Merged PR (#2)"], all_tags=[])
+    endpoints = []
+
+    def fake_run(command, **kwargs):
+        endpoint = command[2]
+        endpoints.append(endpoint)
+        if endpoint.endswith("/pulls/1"):
+            raise subprocess.CalledProcessError(1, command, stderr="gh: Not Found (HTTP 404)")
+        payload = (
+            {"number": 1, "pull_request": None}
+            if endpoint.endswith("/issues/1")
+            else {"body": "", "author": {"login": "alice"}}
+        )
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload))
+
+    monkeypatch.setattr(gen.subprocess, "run", fake_run)
+    section, results, _ = gen.collect("v1.0.0", _REPO)
+    assert [result.pr for result in results] == [2]
+    assert "[#1]" not in section
+    assert "[@alice]" in section
+    assert endpoints == [f"repos/{_REPO}/{path}" for path in ("pulls/1", "issues/1", "pulls/2")]
+    assert "it is an issue, not a PR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("issue_exists", [True, False])
+def test_collect_does_not_hide_unverified_404s(monkeypatch, issue_exists) -> None:
+    _stub_io(monkeypatch, subjects=["Merged PR (#1)"], all_tags=[])
+
+    def fake_run(command, **kwargs):
+        if command[2].endswith("/issues/1") and issue_exists:
+            payload = {
+                "number": 1,
+                "pull_request": {"url": "https://api.github.com/repos/o/o/pulls/1"},
+            }
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload))
+        raise subprocess.CalledProcessError(1, command, stderr="gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(gen.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        gen.collect("v1.0.0", _REPO)
+
+
+def test_import_generator_outside_script_directory(tmp_path) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import runpy, sys; runpy.run_path(sys.argv[1])",
+            str(SCRIPT),
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+
+
+def test_prompt_truncation_keeps_complete_utf8_lines() -> None:
+    first = "#1: café\n"
+    text = first + "#2345: another feature\n"
+    for limit in range(len(first.encode("utf-8")), len(text.encode("utf-8"))):
+        assert gen.truncate_pr_list(text, limit) == first.rstrip("\n")
+    assert gen.truncate_pr_list(text, len(text.encode("utf-8"))) == text
+    assert gen.truncate_pr_list(text, len(first.encode("utf-8")) - 2) == ""
+
+
+def test_prompt_truncation_omits_overlong_first_line() -> None:
+    assert gen.truncate_pr_list("#1234: " + "a" * 100, 4) == ""

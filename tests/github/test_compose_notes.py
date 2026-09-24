@@ -26,10 +26,10 @@ def _raw(highlights: str) -> str:
     "highlights",
     [
         "## Major new features\n\n- New feature (#3, @carol)\n\n"
-        "## Breaking changes\n\n- Renamed flag (#4, @dave)\n\n"
-        "## Bug fixes\n\n- Fixed crashes (#1, @alice)",
+        + "## Breaking changes\n\n- Renamed flag (#4, @dave)\n\n"
+        + "## Bug fixes\n\n- Fixed crashes (#1, @alice)",
         "## Major new features\n\n- New feature (#3, @carol)\n\n"
-        "## Bug fixes\n\n- Fixed crashes (#1, @alice)",
+        + "## Bug fixes\n\n- Fixed crashes (#1, @alice)",
         "## Bug fixes\n\n- Fixed crashes (#1, @alice)",
     ],
 )
@@ -154,3 +154,38 @@ def test_valid_highlights_and_intentional_fallback_do_not_warn(capsys) -> None:
     compose_notes(_raw("## Bug fixes\n- Fixed (#1)"), CREDITS, REPO, warn_on_fallback=True)
     compose_notes("", CREDITS, REPO)
     assert capsys.readouterr().err == ""
+
+
+def test_repeated_pr_across_highlights_falls_back_with_reason(capsys) -> None:
+    raw = _raw("## Major new features\n- Feature (#1)\n## Bug fixes\n- Fix (#1)")
+    assert compose_notes(raw, CREDITS, REPO, warn_on_fallback=True) == compose_notes(
+        "", CREDITS, REPO
+    )
+    assert "repeats an already-cited PR" in capsys.readouterr().err
+
+
+def test_cli_invalid_utf8_preserves_complete_fallback(tmp_path: Path) -> None:
+    credits = tmp_path / "credits.json"
+    credits.write_text(json.dumps(CREDITS))
+    highlights = tmp_path / "highlights.txt"
+    highlights.write_bytes(b"\xff")
+    out = tmp_path / "notes.md"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--highlights",
+            str(highlights),
+            "--credits",
+            str(credits),
+            "--repo",
+            REPO,
+            "--out",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "RELEASE_NOTES markers are missing" in result.stderr
+    assert out.read_text() == compose_notes("", CREDITS, REPO)

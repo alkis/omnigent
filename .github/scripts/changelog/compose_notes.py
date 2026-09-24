@@ -54,6 +54,8 @@ def _highlights(raw: str, credits: list[dict], repo: str) -> tuple[str, set[int]
             )
         if not set(prs) <= by_pr.keys():
             raise ValueError(f"highlight line {line_number} cites a PR outside the release")
+        if cited.intersection(prs):
+            raise ValueError(f"highlight line {line_number} repeats an already-cited PR")
         # Credits come from GitHub metadata, even if the model omits or guesses handles.
         refs = [_pr_link(pr, repo) for pr in prs]
         refs.extend(dict.fromkeys(_author_link(by_pr[pr]) for pr in prs if by_pr[pr]["author"]))
@@ -101,7 +103,11 @@ def main() -> None:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
-    raw = args.highlights.read_text(encoding="utf-8") if args.highlights.is_file() else ""
+    raw = (
+        args.highlights.read_text(encoding="utf-8", errors="replace")
+        if args.highlights.is_file()
+        else ""
+    )
     credits = json.loads(args.credits.read_text(encoding="utf-8"))
     args.out.write_text(
         compose_notes(raw, credits, args.repo, warn_on_fallback=True), encoding="utf-8"

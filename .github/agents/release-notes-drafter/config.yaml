@@ -80,9 +80,13 @@ prompt: |
   - Cite every PR behind a highlight and credit its author using the provided
     handle: `(#123, @alice; #456, @bob)`. If the author is unavailable, cite only
     the PR. Never guess handles or cite a PR absent from the input.
+  - Keep each bullet on one line, ending with the parenthetical PR citations and
+    nothing after them. Do not wrap bullets, add sub-bullets, or add a period after
+    the citations. Cite each PR in at most one bullet across all sections.
   - Keep Omnigent's voice: crisp, concrete, lightly technical. A tasteful leading
     emoji is fine. Never invent facts, versions, or flag names.
   - Keep the section order: Major new features, Breaking changes, Bug fixes.
+    Reproduce the section headings exactly as shown in Output shape.
     Do not add an Other contributions section or Full Changelog footer; the workflow
     supplies those.
 

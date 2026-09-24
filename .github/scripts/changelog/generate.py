@@ -29,10 +29,10 @@ import sys
 import time
 from pathlib import Path
 
-from compose_notes import compose_notes
 from packaging.version import InvalidVersion, Version
 
 # Reuse the exact section + checkbox parsing the merge gate uses.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pr-template"))
 from _md import (
     TYPE_TAGS,
@@ -41,6 +41,7 @@ from _md import (
     section_text,
     type_tag,
 )
+from compose_notes import compose_notes
 
 # The "Type of change" checkbox labels, in the order they appear in the template
 # (mirrors validate.TYPE_LABELS). Kept here so the harvester needn't import the
@@ -194,6 +195,14 @@ def render_draft_notes(results: list[HarvestResult], repo: str) -> str:
     return compose_notes("", credit_records(results), repo)
 
 
+def truncate_pr_list(text: str, max_bytes: int) -> str:
+    """Keep complete UTF-8 lines within the prompt's byte budget."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].rpartition(b"\n")[0].decode("utf-8")
+
+
 def render_pr_list(results: list[HarvestResult]) -> str:
     """Render the PR material fed to the release-notes-drafter agent.
 
@@ -296,16 +305,17 @@ def _retryable_gh_error(error: subprocess.CalledProcessError | subprocess.Timeou
             "tls handshake",
             "temporary failure",
             "no such host",
+            "error connecting to ",
         )
     )
 
 
-def _gh_pr(repo: str, pr: int) -> dict:
+def _gh_json(endpoint: str, query: str, context: str) -> dict:
     attempt = 1
     while True:
         try:
             proc = subprocess.run(
-                ["gh", "api", f"repos/{repo}/pulls/{pr}", "--jq", "{body, author: .user}"],
+                ["gh", "api", endpoint, "--jq", query],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -316,7 +326,7 @@ def _gh_pr(repo: str, pr: int) -> dict:
                 raise
             delay = 2 ** (attempt - 1)
             print(
-                f"::warning::Transient GitHub metadata failure for PR #{pr}; "
+                f"::warning::Transient GitHub metadata failure for {context}; "
                 f"retrying in {delay}s (attempt {attempt + 1}/3).",
                 file=sys.stderr,
             )
@@ -324,6 +334,10 @@ def _gh_pr(repo: str, pr: int) -> dict:
             attempt += 1
         else:
             return json.loads(proc.stdout)
+
+
+def _gh_pr(repo: str, pr: int) -> dict:
+    return _gh_json(f"repos/{repo}/pulls/{pr}", "{body, author: .user}", f"PR #{pr}")
 
 
 def collect(
@@ -340,7 +354,20 @@ def collect(
     titles = pr_titles_from_subjects(subjects)
     results = []
     for pr, title in titles.items():
-        metadata = _gh_pr(repo, pr)
+        try:
+            metadata = _gh_pr(repo, pr)
+        except subprocess.CalledProcessError as error:
+            if re.search(r"\bHTTP 404\b", error.stderr or "", re.IGNORECASE):
+                issue = _gh_json(
+                    f"repos/{repo}/issues/{pr}", "{number, pull_request}", f"issue #{pr}"
+                )
+                if issue.get("number") == pr and not issue.get("pull_request"):
+                    print(
+                        f"::warning::Skipping commit reference #{pr}: it is an issue, not a PR.",
+                        file=sys.stderr,
+                    )
+                    continue
+            raise
         author = metadata.get("author") or {}
         result = harvest_pr(pr, metadata.get("body"), title, author.get("login", ""))
         result.author_url = author.get("html_url") or result.author_url

@@ -207,7 +207,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
-          import os, pathlib
+          import os, pathlib, sys
+          sys.path.insert(0, str(pathlib.Path(".github/scripts/changelog").resolve()))
+          from generate import truncate_pr_list
           tag = os.environ["TAG"]
           # The agent is tools-less, so its input must be inline — but `omnigent run
           # -p` passes the whole prompt as one argv string, capped at ~128 KiB on
@@ -215,9 +217,8 @@ jobs:
           # contribution list is appended separately and is never truncated.
           MAX = 100_000
           pr_list = pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")
-          encoded = pr_list.encode("utf-8")
-          truncated = len(encoded) > MAX
-          pr_list = encoded[:MAX].decode("utf-8", errors="ignore")
+          truncated = len(pr_list.encode("utf-8")) > MAX
+          pr_list = truncate_pr_list(pr_list, MAX)
           note = ("\n> NOTE: the PR list was truncated. Summarize visible highlights; "
                   "the workflow preserves the full contribution list separately.\n" if truncated else "")
           prompt = f"""Draft the release highlights for {tag}.
@@ -248,11 +249,16 @@ jobs:
       - name: Combine curated highlights and contributor groups
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         run: |
-          python3 .github/scripts/changelog/compose_notes.py \
+          if python3 .github/scripts/changelog/compose_notes.py \
             --highlights /tmp/draft_out.txt \
             --credits /tmp/pr_credits.json \
             --repo "$SOURCE_REPO" \
-            --out /tmp/release_notes.md
+            --out /tmp/composed_notes.md \
+            && mv /tmp/composed_notes.md /tmp/release_notes.md; then
+            echo "Composed release notes."
+          else
+            echo "::warning::Release-note composition failed; keeping the complete contributor groups."
+          fi
 
       # --- 3) Mint the write-token — ONLY now, after the agent has run ---
       - name: Mint App token (omnigent)
