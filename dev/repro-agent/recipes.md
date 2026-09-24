@@ -6,6 +6,15 @@ runner, real native CLIs, and mock model described in
 [repro_env](../repro_env/README.md). Prepare only what this journey additionally
 needs; a generic successful conversation is not a prerequisite for reproduction.
 
+For a coordinated preparation-only turn, the workflow runs Doctor around this
+procedure. Select comparisons in the accepted plan's `preparation` object:
+`{"host_id": null, "checks": [{"requirement_id": "environment-1", "fact": "shell.os", "expected": "Darwin"}]}`.
+Use the actual requirement IDs and reported expectations; leave unknown checks
+out. Set `host_id` when the required host is already known. Otherwise report the
+selected ID in the preparation-complete signal so the second observation checks
+that host. Receiving an execution continuation means observations were collected,
+not that all prerequisites match or that the plan's interpretation is correct.
+
 1. **Inspect.** Read `.omnigent/ci-worktree-bootstrap.json` when present and the
    prepared runtime's `environment.json`. For each environment/setup requirement,
    compare its reported value, source, and proposed method with what is available.
@@ -58,7 +67,7 @@ plan. The command never executes the plan's method text or installs software.
 | Facts | What they establish |
 | --- | --- |
 | `shell.os`, `shell.arch` | This shell's platform, not a remote device or browser surface. |
-| `shell.claude.installed/version`, `shell.codex.installed/version`, `shell.openai-agents.installed/version` | Current tool availability in this sandbox. Refreshed after installation; not proof of a session's process. |
+| `shell.claude.installed/version`, `shell.codex.installed/version`, `shell.pi.installed/version`, `shell.node.installed/version`, `shell.tmux.installed/version`, `shell.openai-agents.installed/version` | Current tool availability in this sandbox. Refreshed after installation; not proof of a session's process. |
 | `runtime.launch_commit`, `runtime.launch_dirty` | Checkout recorded at supervisor startup. Older runtimes may lack it; SPA provenance and later changes remain unverified. |
 | `runtime.status`, `runtime.lease_active`, `runtime.runner_online` | Saved lifecycle state plus a live query of the prepared runner. |
 | `runtime.model_backend` | Configured backend, not proof of effective session routing or live-provider fidelity. |
@@ -79,6 +88,7 @@ actual routing/configuration conflicts in the supported sandbox.
 | --- | --- | --- |
 | Claude-native chat/terminal | `native_claude_mock_session`; `tests/e2e_ui/messages/test_native_claude_render_parity.py` | Real Claude CLI; drive the reported composer or terminal action. A synthetic hook is not native tool execution. |
 | Codex-native chat/terminal | `native_codex_mock_session`; `tests/e2e_ui/messages/test_native_codex_render_parity.py` | Real Codex CLI; native slash commands must be typed into the terminal. An SDK call does not exercise that path. |
+| Pi-native terminal | Product session terminal resources; existing Terminal-view helpers in `tests/e2e_ui/messages/test_native_claude_render_parity.py`; Pi discovery in `omnigent/harnesses/pi_native/main.py` | Adapt browser navigation/typing to the actual Pi session. CLI/fixture absence or a failed local socket search does not establish that the web terminal is unavailable. |
 | OpenAI Agents web journey | `custom_agent_session`; `tests/e2e_ui/messages/test_message_render_parity.py` | Real web composer and executor; a direct Python helper bypasses the user journey. |
 
 Adapt the relevant driver to the ticket; these existing tests are references,
@@ -92,3 +102,28 @@ IDs and evidence before mock resets/session deletion, and follow
 [recording-lanes](../recording-lanes.md). Keep failed/incomplete turns when they
 show the reported symptom. The existing workflow owns shutdown and bundling.
 Independent execution collection and claim verification remain separate work.
+
+## Pi terminal discovery and driving
+
+Use the existing session and host from the reported setup. Inspect
+`GET /v1/sessions/{session_id}/resources/terminals` and the matching resource's
+`metadata.running`, `metadata.tmux_socket`, and `metadata.tmux_target`; follow
+the Pi native CLI's resource lookup instead of scanning local socket directories.
+The socket belongs to the runner and may not be visible in this shell.
+
+For a web-terminal journey, open that session in the real SPA, switch via the
+`view-mode-toggle` to Terminal, and wait for `[data-testid="terminal-view"]`
+to have `data-state="connected"`. Focus its `.xterm-helper-textarea` and type
+the reported keys, following the existing native render-parity helpers. The SPA
+attaches through `/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach`
+over WebSocket; it does not need the runner's tmux socket mounted locally.
+Capture the rendered terminal outcome, including autocomplete before Enter when
+that is the reported symptom. Do not send slash commands through chat-message
+APIs and treat them as terminal input. Leave relevant responses and terminal
+traffic unstubbed.
+
+For a CLI journey, use `omnigent pi --server <prepared-server-url> --resume <id>`
+in a PTY when the runner's socket is reachable. A web-terminal alternative is a
+different entry point and needs a disclosed plan revision. If resource lookup
+or attachment fails, keep the exact response/connection diagnostic and mark the
+interaction unverified; a generated `models.json` does not prove `/model` ran.

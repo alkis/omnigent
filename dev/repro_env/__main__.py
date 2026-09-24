@@ -54,6 +54,7 @@ def main() -> int:
     check = commands.add_parser("doctor")
     check.add_argument("--plan", type=Path, required=True)
     check.add_argument("--host", help="Exact host ID required by the journey")
+    check.add_argument("--json", action="store_true", help="Emit only the observation JSON")
     check.add_argument(
         "--check",
         nargs=3,
@@ -74,7 +75,7 @@ def main() -> int:
     if args.action == "doctor":
         from .doctor import doctor
 
-        doctor(output, args.plan, args.check, args.host)
+        doctor(output, args.plan, args.check, args.host, json_only=args.json)
         return 0
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:

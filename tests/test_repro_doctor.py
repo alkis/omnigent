@@ -225,6 +225,29 @@ def test_unavailable_launch_identity_is_unknown(tmp_path, monkeypatch):
     assert result["dirty"] is None
 
 
+def test_json_mode_is_parseable_and_missing_runtime_keeps_selected_host(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    plan = plan_file(tmp_path)
+    destination = doctor.doctor(tmp_path / "output", plan, [], "selected", json_only=True)
+    result = json.loads(capsys.readouterr().out)
+    assert result == json.loads(destination.read_text())
+    assert result["facts"]["host.id"] == "selected"
+    assert result["facts"]["host.online"] is None
+    assert result["facts"]["runtime.status"] == "not_provisioned"
+
+
+def test_native_tool_observations_use_tmux_version_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/tools/{name}")
+    command = Mock(return_value="version")
+    monkeypatch.setattr(doctor, "_command", command)
+    facts, _ = doctor.observe(tmp_path, None)
+    assert facts["shell.pi.installed"] is True
+    assert facts["shell.tmux.version"] == "version"
+    assert ["/tools/tmux", "-V"] in [call.args[0] for call in command.call_args_list]
+
+
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 def test_undecodable_command_output_is_unknown(tmp_path, stream):
     result = doctor._command(

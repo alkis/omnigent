@@ -37,12 +37,16 @@ def launch_observations(root: Path) -> dict:
 def observe(output: Path, host_id: str | None) -> tuple[dict, list[str]]:
     """Refresh shell tools after installation; distinguish them from runtime observations."""
     facts = {"shell.os": platform.system(), "shell.arch": platform.machine()}
+    if host_id:
+        facts.update({"host.id": host_id, "host.registered": None, "host.online": None})
     errors = []
-    for binary in ("claude", "codex"):
+    for binary in ("claude", "codex", "pi", "node", "tmux"):
         path = shutil.which(binary)
         facts[f"shell.{binary}.installed"] = path is not None
         facts[f"shell.{binary}.version"] = (
-            _command([path, "--version"], Path.cwd()) if path else None
+            _command([path, "-V" if binary == "tmux" else "--version"], Path.cwd())
+            if path
+            else None
         )
     try:
         facts["shell.openai-agents.version"] = importlib.metadata.version("openai-agents")
@@ -75,8 +79,6 @@ def observe(output: Path, host_id: str | None) -> tuple[dict, list[str]]:
                 "runtime.launch_captured_at": launch.get("captured_at"),
             }
         )
-    if host_id:
-        facts.update({"host.id": host_id, "host.registered": None, "host.online": None})
     if state.get("status") != "ready" or not facts["runtime.lease_active"]:
         return facts, [
             "Prepared runtime is stopped, expired, or starting; inspect its diagnostics."
@@ -144,7 +146,9 @@ def compare(requirements: list[dict], checks: list[tuple], facts: dict) -> list[
     return list(results.values())
 
 
-def doctor(output: Path, plan_path: Path, checks: list[list[str]], host_id: str | None) -> Path:
+def doctor(
+    output: Path, plan_path: Path, checks: list[list[str]], host_id: str | None, *, json_only=False
+) -> Path:
     raw = plan_path.read_bytes()
     plan = json.loads(raw)
     requirements = plan["requirements"]
@@ -178,5 +182,6 @@ def doctor(output: Path, plan_path: Path, checks: list[list[str]], host_id: str 
     destination = output / f"environment-check-{time.time_ns()}.json"
     write_json(destination, report)
     print(json.dumps(report, indent=2), flush=True)
-    print(f"Saved environment observations: {destination}", flush=True)
+    if not json_only:
+        print(f"Saved environment observations: {destination}", flush=True)
     return destination
