@@ -300,7 +300,7 @@ describe("useSlashCompletion Tab/Enter completion", () => {
 });
 
 describe("useSlashCompletion loading swallow", () => {
-  it("reports pendingCompletion only while open, loading, and matchless", () => {
+  it("reports pendingCompletion for a lone command token while loading and matchless", () => {
     const { view, props } = setup({ text: "/review", commands: {}, status: "loading" });
     expect(view.result.current.pendingCompletion).toBe(true);
     view.rerender({ ...props, status: "ready" });
@@ -308,6 +308,17 @@ describe("useSlashCompletion loading swallow", () => {
     view.rerender({ ...props, status: "loading", commands: COMMANDS });
     expect(view.result.current.matches.length).toBeGreaterThan(0);
     expect(view.result.current.pendingCompletion).toBe(false);
+  });
+
+  it("keeps reporting pendingCompletion while allowOpen closes the menu", () => {
+    // Submit blocking keys off pendingCompletion even when the composer is
+    // not focused, so it must not flip with the menu's open state.
+    const { view, props } = setup({ text: "/review", commands: {}, status: "loading" });
+    expect(view.result.current.pendingCompletion).toBe(true);
+    view.rerender({ ...props, allowOpen: false });
+    expect(view.result.current.open).toBe(false);
+    expect(view.result.current.matches).toEqual([]);
+    expect(view.result.current.pendingCompletion).toBe(true);
   });
 
   it.each(["Tab", "Enter"])("swallows %s while skills load with no completion yet", (key) => {

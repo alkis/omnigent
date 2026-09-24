@@ -7304,6 +7304,24 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
   });
 
+  it("keeps Create disabled with the loading reason when the composer blurs mid-discovery", async () => {
+    // A lone partial token typed while skills are still loading keeps
+    // Create blocked even after the textarea loses focus — the pending
+    // completion is a property of the draft, not of the open menu.
+    mockSkills({ skillsStatus: "loading" });
+    renderLanding();
+    typeMessage("/review");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    fireEvent.blur(screen.getByTestId("new-chat-landing-input"));
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+    expect(tooltip).toHaveTextContent("Loading skills…");
+  });
+
   it("hides the cached host catalog when the host disconnects", () => {
     mockAgents([skilledAgent()]);
     mockSkills({ skills: [{ name: "host-only", description: "Host-only skill" }] });

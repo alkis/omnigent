@@ -66,7 +66,11 @@ export interface UseSlashCompletionResult {
   matches: string[];
   /** Highlighted row index, -1 when nothing is highlighted. */
   index: number;
-  /** Open + discovery in flight + nothing to complete yet. */
+  /**
+   * The draft reads as a lone command token, discovery is in flight, and
+   * there is nothing to complete yet. Not gated on the menu being open —
+   * submit blocking keys off it even while the composer is blurred.
+   */
   pendingCompletion: boolean;
   /**
    * Handles one textarea keydown, returning true when the menu consumed it.
@@ -96,11 +100,16 @@ export function useSlashCompletion({
   // Suggest names until a space starts the arguments; exclude file paths.
   const baseOpen = hasCommandPrefix && !trimmed.slice(1).includes("/") && !trimmed.includes(" ");
   const open = allowOpen && baseOpen;
-  const query = open ? trimmed.slice(1) : "";
+  // Ranked on the token shape alone: a pending completion still reports
+  // while the menu is blurred closed, since submit gating keys off it.
+  // The returned query/matches stay gated on open.
+  const baseQuery = baseOpen ? trimmed.slice(1) : "";
   // Kept in sync with what the menu renders so keyboard nav indexes into
   // the same list.
-  const matches = open ? rankedSlashCommandNames(commands, query) : [];
-  const pendingCompletion = open && status === "loading" && matches.length === 0;
+  const baseMatches = baseOpen ? rankedSlashCommandNames(commands, baseQuery) : [];
+  const query = open ? baseQuery : "";
+  const matches = open ? baseMatches : [];
+  const pendingCompletion = baseOpen && status === "loading" && baseMatches.length === 0;
 
   const [index, setIndex] = useState(-1);
   // New queries select the first match; asynchronous arrivals retain the
