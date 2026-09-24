@@ -413,6 +413,25 @@ describe("CanvasPage", () => {
     expect(screen.getByTestId("flow-node-conv_other")).toHaveAttribute("data-selected", "false");
   });
 
+  it("keeps the clicked card's selection through Reset layout", () => {
+    const rows = [conversation("conv_keep", 2), conversation("conv_other", 1)];
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(sessionsStub(rows));
+    renderPage();
+
+    const onNodesChange = flowProps.current?.onNodesChange as (
+      changes: { id: string; type: "select"; selected: boolean }[],
+    ) => void;
+    act(() => {
+      onNodesChange([{ id: "conv_keep", type: "select", selected: true }]);
+    });
+    expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
+
+    expect(screen.getByTestId("flow-node-conv_keep")).toHaveAttribute("data-selected", "true");
+    expect(screen.getByTestId("flow-node-conv_other")).toHaveAttribute("data-selected", "false");
+  });
+
   it("saves every card's spot once complete, so a moved card leaves the others in place", async () => {
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 2), conversation("conv_2", 1)]),
