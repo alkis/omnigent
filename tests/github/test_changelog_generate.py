@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,7 +14,11 @@ spec = importlib.util.spec_from_file_location("changelog_generate", SCRIPT)
 assert spec and spec.loader
 gen = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = gen
-spec.loader.exec_module(gen)
+sys.path.insert(0, str(SCRIPT.parent))
+try:
+    spec.loader.exec_module(gen)
+finally:
+    sys.path.pop(0)
 
 
 # --- previous_final_tag ------------------------------------------------------
@@ -56,7 +62,6 @@ def _stub_io(monkeypatch, *, subjects: list[str], all_tags: list[str], date: str
     monkeypatch.setattr(gen, "_all_tags", lambda: all_tags)
     monkeypatch.setattr(gen, "_range_subjects", fake_range_subjects)
     monkeypatch.setattr(gen, "_tag_date", lambda tag: date)
-    monkeypatch.setattr(gen, "_gh_pr_body", lambda repo, pr: None)
     _stub_io.seen = seen
 
 
@@ -183,38 +188,54 @@ def test_render_section_flat_list_with_tags_sorted_by_pr() -> None:
         _result(5, "another thing", ["Feature"]),
         _result(10, "watch flag", ["UI / frontend change"]),
     ]
-    section = gen.render_section("v0.3.0", "2026-06-27", results)
+    section = gen.render_section("v0.3.0", "2026-06-27", results, _REPO)
     assert section.startswith("## [v0.3.0] — 2026-06-27")
     # Flat list, sorted by PR number, each with its bracket tag.
-    assert section.index("another thing (#5)") < section.index("watch flag (#10)")
-    assert section.index("watch flag (#10)") < section.index("a crash fix (#20)")
-    assert "- [UI] watch flag (#10)" in section
-    assert "- [Bug fix] a crash fix (#20)" in section
+    assert section.index(
+        "another thing ([#5](https://github.com/omnigent-ai/omnigent/pull/5))"
+    ) < section.index("watch flag ([#10](https://github.com/omnigent-ai/omnigent/pull/10))")
+    assert section.index(
+        "watch flag ([#10](https://github.com/omnigent-ai/omnigent/pull/10))"
+    ) < section.index("a crash fix ([#20](https://github.com/omnigent-ai/omnigent/pull/20))")
+    assert "- [UI] watch flag ([#10](https://github.com/omnigent-ai/omnigent/pull/10))" in section
+    assert (
+        "- [Bug fix] a crash fix ([#20](https://github.com/omnigent-ai/omnigent/pull/20))"
+        in section
+    )
     # No category sub-headings.
     assert "### " not in section
 
 
 def test_render_section_multiple_tags_join() -> None:
     section = gen.render_section(
-        "v0.3.0", "2026-06-27", [_result(7, "did a thing", ["UI / frontend change", "Bug fix"])]
+        "v0.3.0",
+        "2026-06-27",
+        [_result(7, "did a thing", ["UI / frontend change", "Bug fix"])],
+        _REPO,
     )
-    assert "- [UI / Bug fix] did a thing (#7)" in section
+    assert (
+        "- [UI / Bug fix] did a thing ([#7](https://github.com/omnigent-ai/omnigent/pull/7))"
+        in section
+    )
 
 
 def test_render_section_untagged_entry_has_no_bracket() -> None:
-    section = gen.render_section("v0.3.0", "2026-06-27", [_result(7, "did a thing", [])])
-    assert "- did a thing (#7)" in section
+    section = gen.render_section("v0.3.0", "2026-06-27", [_result(7, "did a thing", [])], _REPO)
+    assert "- did a thing ([#7](https://github.com/omnigent-ai/omnigent/pull/7))" in section
 
 
-def test_render_section_omits_undocumented_prs() -> None:
+def test_render_section_includes_undocumented_prs() -> None:
     results = [_result(10, "documented", ["Bug fix"]), _result(20, "", [])]
-    section = gen.render_section("v0.3.0", "2026-06-27", results)
-    assert "(#10)" in section and "(#20)" not in section
+    section = gen.render_section("v0.3.0", "2026-06-27", results, _REPO)
+    assert (
+        "([#10](https://github.com/omnigent-ai/omnigent/pull/10))" in section
+        and "([#20](https://github.com/omnigent-ai/omnigent/pull/20))" in section
+    )
 
 
 def test_render_section_no_entries() -> None:
-    section = gen.render_section("v0.3.0", "2026-06-27", [])
-    assert "_No user-facing changes._" in section
+    section = gen.render_section("v0.3.0", "2026-06-27", [], _REPO)
+    assert "_No pull requests in this release._" in section
 
 
 # --- insert_section ----------------------------------------------------------
@@ -280,31 +301,6 @@ def test_insert_dev_tag_idempotent() -> None:
 _REPO = "omnigent-ai/omnigent"
 
 
-def test_draft_notes_groups_into_sections_by_type() -> None:
-    results = [
-        _result(10, "a new capability", ["Feature"]),
-        _result(20, "moved a button", ["UI / frontend change"]),
-        _result(30, "a crash fix", ["Bug fix"]),
-        _result(40, "dropped a flag", ["Breaking change"]),
-    ]
-    notes = gen.render_draft_notes(results, _REPO)
-    assert "## Major new features" in notes
-    assert "## Breaking changes" in notes
-    assert "## Bug fixes" in notes
-    # Feature/UI land in features; Breaking and Bug fix each get their own section.
-    feat, rest = notes.split("## Breaking changes")
-    breaking, fixes = rest.split("## Bug fixes")
-    assert "a new capability (#10)" in feat and "moved a button (#20)" in feat
-    assert "dropped a flag (#40)" in breaking
-    assert "a crash fix (#30)" in fixes
-    # Sections appear in features → breaking → bug fixes order.
-    assert (
-        notes.index("## Major new features")
-        < notes.index("## Breaking changes")
-        < notes.index("## Bug fixes")
-    )
-
-
 def test_draft_notes_has_full_changelog_footer() -> None:
     notes = gen.render_draft_notes([_result(1, "x", ["Feature"])], _REPO)
     assert notes.rstrip().endswith(
@@ -312,21 +308,40 @@ def test_draft_notes_has_full_changelog_footer() -> None:
     )
 
 
-def test_draft_notes_empty_section_keeps_placeholder() -> None:
-    # Only a feature entry — the bug-fixes section should still appear with a hint.
-    notes = gen.render_draft_notes([_result(1, "x", ["Feature"])], _REPO)
-    assert "## Bug fixes" in notes
-    assert "no entries harvested" in notes
-
-
-def test_draft_notes_sorted_by_pr_within_section() -> None:
-    results = [
-        _result(30, "third", ["Feature"]),
-        _result(10, "first", ["Feature"]),
-        _result(20, "second", ["UI / frontend change"]),
+def test_cli_exports_credits_and_compact_fallback(monkeypatch, tmp_path) -> None:
+    result = gen.harvest_pr(1, _body("Fix typo"), "docs: typo", "alice")
+    monkeypatch.setattr(gen, "collect", lambda *args, **kwargs: ("section", [result], None))
+    credits = tmp_path / "credits.json"
+    notes = tmp_path / "notes.md"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate.py",
+            "--tag",
+            "v1.0.0",
+            "--repo",
+            _REPO,
+            "--credits-out",
+            str(credits),
+            "--draft-notes-out",
+            str(notes),
+            "--no-changelog-update",
+        ],
+    )
+    assert gen.main() == 0
+    assert json.loads(credits.read_text()) == [
+        {"pr": 1, "author": "alice", "author_url": "https://github.com/alice"}
     ]
-    notes = gen.render_draft_notes(results, _REPO)
-    assert notes.index("first (#10)") < notes.index("second (#20)") < notes.index("third (#30)")
+    assert "## Other contributions" in notes.read_text()
+    assert "Fix typo" not in notes.read_text()
+
+
+def test_draft_notes_omits_empty_sections() -> None:
+    # Empty categories do not need a placeholder in complete notes.
+    notes = gen.render_draft_notes([_result(1, "x", ["Feature"])], _REPO)
+    assert "## Bug fixes" not in notes
+    assert "no entries harvested" not in notes
 
 
 # --- render_pr_list (agent input) --------------------------------------------
@@ -356,3 +371,69 @@ def test_pr_list_includes_title_and_tagged_description() -> None:
 def test_pr_list_handles_missing_title() -> None:
     listing = gen.render_pr_list([_titled(5, "", "")])
     assert "#5: (no title)" in listing
+
+
+def test_all_contributions_have_linked_credits() -> None:
+    results = [
+        gen.harvest_pr(1, _body("Fix a crash"), "fix: crash", "alice"),
+        gen.harvest_pr(2, _body(None).replace("Bug fix", "Docs"), "docs: typo", "bob"),
+        gen.harvest_pr(3, "", "chore: update CI", "ci-bot[bot]"),
+        gen.harvest_pr(4, None, "Legacy PR", "alice"),
+    ]
+    notes = gen.render_draft_notes(results, _REPO)
+    section = gen.render_section("v1.0.0", "2026-09-24", results, _REPO)
+    for text in (notes, section):
+        for result in results:
+            assert text.count(f"[#{result.pr}](https://github.com/{_REPO}/pull/{result.pr})") == 1
+            assert f"[@{result.author}](https://github.com/{result.author})" in text
+    for description in ("docs: typo", "chore: update CI", "Legacy PR"):
+        assert description in section
+        assert description not in notes
+    assert "## Other contributions" in notes
+    assert "## Documentation updates" not in notes
+    assert "(@bob)" in gen.render_pr_list(results)
+
+
+def test_collect_reads_author_and_preserves_deleted_accounts(monkeypatch) -> None:
+    _stub_io(
+        monkeypatch,
+        subjects=["docs: typo (#1)", "fix: old (#2)", "chore: dependencies (#3)"],
+        all_tags=[],
+    )
+    responses = [
+        {"body": "", "author": {"login": "alice"}},
+        {"body": "", "author": None},
+        {
+            "body": "",
+            "author": {
+                "login": "dependabot[bot]",
+                "html_url": "https://github.com/apps/dependabot",
+            },
+        },
+    ]
+
+    def fake_run(command, **kwargs):
+        assert command[:2] == ["gh", "api"]
+        assert command[2].startswith(f"repos/{_REPO}/pulls/")
+        assert command[-1] == "{body, author: .user}"
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(command, 0, json.dumps(responses.pop(0)))
+
+    monkeypatch.setattr(gen.subprocess, "run", fake_run)
+    section, results, _ = gen.collect("v1.0.0", _REPO)
+    assert results[0].author == "alice"
+    assert results[1].author == ""
+    assert "[@alice](https://github.com/alice)" in section
+    assert "fix: old ([#2](https://github.com/omnigent-ai/omnigent/pull/2))" in section
+    assert "[@dependabot[bot]](https://github.com/apps/dependabot)" in section
+
+
+def test_github_failure_does_not_silently_drop_credits(monkeypatch) -> None:
+    _stub_io(monkeypatch, subjects=["docs: typo (#1)"], all_tags=[])
+
+    def fail(command, **kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(gen.subprocess, "run", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        gen.collect("v1.0.0", _REPO)
