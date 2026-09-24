@@ -256,9 +256,46 @@ describe("CanvasPage", () => {
     // viewport: the surface stays hidden until the fitted view is in place.
     expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
     expect(screen.getByTestId("canvas-flow")).toHaveClass("opacity-0");
+    expect(screen.getByTestId("canvas-flow")).toHaveAttribute("inert");
 
     await act(async () => applyFit(true));
     expect(screen.getByTestId("canvas-flow")).not.toHaveClass("opacity-0");
+    expect(screen.getByTestId("canvas-flow")).not.toHaveAttribute("inert");
+  });
+
+  it("keeps a not-yet-confirmed empty canvas hidden: late cards must not flash", async () => {
+    // A cached preview can look empty while the canonical list is still on
+    // the way; revealing now would paint the late cards under the default
+    // viewport.
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([], { loadingMore: true, complete: false, networkConfirmed: false }),
+    );
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("canvas-flow")).toHaveClass("opacity-0");
+
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 2)]),
+    );
+    rerender(pageTree());
+    await waitFor(() => expect(screen.getByTestId("canvas-flow")).not.toHaveClass("opacity-0"));
+    expect(flowFitView).toHaveBeenCalled();
+  });
+
+  it("keeps an empty canvas hidden while the project list is still loading", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(undefined));
+    renderPage();
+    expect(screen.getByTestId("canvas-flow")).toHaveClass("opacity-0");
+  });
+
+  it("reveals the canvas when the fit fails: worst case is a flash, not a blank page", async () => {
+    flowFitView.mockImplementationOnce(async () => {
+      throw new Error("no fit");
+    });
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 2)]),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("canvas-flow")).not.toHaveClass("opacity-0"));
   });
 
   it("shows an empty canvas right away: there is no layout to restore", () => {
