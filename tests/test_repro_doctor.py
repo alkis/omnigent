@@ -3,6 +3,7 @@
 import hashlib
 import json
 import subprocess
+import sys
 import time
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -222,3 +223,29 @@ def test_unavailable_launch_identity_is_unknown(tmp_path, monkeypatch):
     result = doctor.launch_observations(tmp_path)
     assert result["commit"] is None
     assert result["dirty"] is None
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_undecodable_command_output_is_unknown(tmp_path, stream):
+    result = doctor._command(
+        [sys.executable, "-c", f"import sys; sys.{stream}.buffer.write(b'\\xff')"], tmp_path
+    )
+    assert result is None
+
+
+def test_launch_observations_with_non_utf8_tracked_content(tmp_path):
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init")
+    readme = tmp_path / "README.md"
+    readme.write_text("Tracked text\n")
+    git("add", "README.md")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "base")
+    readme.write_bytes(readme.read_bytes() + b"\xe9\n")
+
+    result = doctor.launch_observations(tmp_path)
+    assert result["commit"] == git("rev-parse", "HEAD")
+    assert result["dirty"] is True

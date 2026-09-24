@@ -21,7 +21,7 @@ def _command(args: list[str], root: Path) -> str | None:
     try:
         result = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=5)
         return result.stdout.strip() if result.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return None
 
 
