@@ -10,6 +10,7 @@ import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CURSOR_LEFT_CSI,
+  CURSOR_LEFT_SS3,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
@@ -261,41 +262,55 @@ describe("terminalKeyEventPayload", () => {
 
 describe("imeInsertRealignment", () => {
   it("realigns an auto-inserted pair that left the caret inside", () => {
-    // The touch keyboard wrote "()" in one IME keystroke, caret between the
-    // pair: one cursor-left re-joins the PTY insertion point to the caret
+    // The touch keyboard appended "()" in one IME keystroke, caret between
+    // the pair: one cell left re-joins the PTY insertion point to the caret
     // and the tail is unstaged so the next composition anchors correctly.
-    expect(imeInsertRealignment("()", 1, "()")).toEqual({
-      cursorLeft: CURSOR_LEFT_CSI,
+    expect(imeInsertRealignment("", "()", 1)).toEqual({
+      moveLeft: 1,
       stagedValue: "(",
+    });
+  });
+
+  it("realigns a pair appended after previously staged text", () => {
+    // Ownership is proven by the appended run "b)": the caret sits inside
+    // it, so only its tail ")" is unstaged.
+    expect(imeInsertRealignment("(", "(b)", 2)).toEqual({
+      moveLeft: 1,
+      stagedValue: "(b",
     });
   });
 
   it("is a no-op when the caret sits at the end of the value", () => {
     // The overwhelmingly common IME insert (direct commit at the end)
     // already satisfies CompositionHelper's caret==end assumption.
-    expect(imeInsertRealignment("你好", 2, "你好")).toBeNull();
+    expect(imeInsertRealignment("", "你好", 2)).toBeNull();
   });
 
   it("moves one cell per code point, not per UTF-16 unit", () => {
     // A tail of two astral-plane characters is four UTF-16 units but must
-    // yield exactly two cursor-lefts — line editors move per character.
-    expect(imeInsertRealignment("a😀😀", 1, "a😀😀")).toEqual({
-      cursorLeft: CURSOR_LEFT_CSI.repeat(2),
+    // yield exactly two cells left — line editors move per character.
+    expect(imeInsertRealignment("", "a😀😀", 1)).toEqual({
+      moveLeft: 2,
       stagedValue: "a",
     });
   });
 
-  it("refuses to unstage a tail the event did not insert", () => {
-    // Caret inside the value, but the tail ")" predates this event's own
-    // insert ("b"): it was already forwarded to the PTY, so unstaging it
-    // would desync xterm's bookkeeping.
-    expect(imeInsertRealignment("(b)", 2, "b")).toBeNull();
+  it("refuses a caret inside text staged before this event", () => {
+    // The caret sits inside "()" — text already forwarded to the PTY by an
+    // earlier event — so unstaging would desync xterm's bookkeeping.
+    expect(imeInsertRealignment("()", "()!", 1)).toBeNull();
   });
 
-  it("is a no-op without a caret position or inserted data", () => {
-    expect(imeInsertRealignment("()", null, "()")).toBeNull();
-    expect(imeInsertRealignment("()", 1, null)).toBeNull();
-    expect(imeInsertRealignment("()", 1, "")).toBeNull();
+  it("refuses changes that are not a pure append", () => {
+    // A replacement (or middle insert) is not the shape xterm's value diff
+    // forwards verbatim; the appended-run ownership proof does not hold.
+    expect(imeInsertRealignment("(a)", "(b)", 2)).toBeNull();
+    expect(imeInsertRealignment("()", "()", 1)).toBeNull();
+    expect(imeInsertRealignment("()", "(", 0)).toBeNull();
+  });
+
+  it("is a no-op without a caret position", () => {
+    expect(imeInsertRealignment("", "()", null)).toBeNull();
   });
 });
 
@@ -899,6 +914,95 @@ describe("TerminalSession", () => {
     // Pair first (already user-visible), then the realigning cursor-left,
     // then the committed candidate — a line editor renders `(你)`.
     expect(sentBytes).toBe(`()${CURSOR_LEFT_CSI}你`);
+    session.dispose();
+  });
+
+  it("realigns even when the auto-pair event reports only the typed character", async () => {
+    // WHY: some keyboards report the auto-pair's InputEvent.data as "("
+    // although the textarea gained "()". Realignment must be driven by the
+    // observed value change, not the event's claimed data.
+    const settle = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    const textarea = term.textarea!;
+    textarea.focus();
+
+    const fire229 = (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    };
+    fire229("keydown");
+    textarea.value = "()";
+    textarea.selectionStart = 1;
+    textarea.selectionEnd = 1;
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "(",
+        inputType: "insertText",
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    fire229("keyup");
+    await settle();
+
+    expect(textarea.value).toBe("(");
+    expect(textarea.selectionStart).toBe(1);
+    const sentBytes = socket.sent
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+    expect(sentBytes).toBe(`()${CURSOR_LEFT_CSI}`);
+    session.dispose();
+  });
+
+  it("encodes the realigning arrow per application-cursor-keys mode", async () => {
+    // WHY: with DECCKM enabled a full-screen app expects arrows as SS3
+    // (ESC O D); the normal-mode CSI form may be unbound or misread there.
+    const settle = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    const { socket, session } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?1h", resolve);
+    });
+    expect(term.modes.applicationCursorKeysMode).toBe(true);
+    const textarea = term.textarea!;
+    textarea.focus();
+
+    const fire229 = (type: string) => {
+      const ev = new KeyboardEvent(type, { key: "Process", bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "keyCode", { get: () => 229 });
+      textarea.dispatchEvent(ev);
+    };
+    fire229("keydown");
+    textarea.value = "()";
+    textarea.selectionStart = 1;
+    textarea.selectionEnd = 1;
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        data: "()",
+        inputType: "insertText",
+        bubbles: true,
+        composed: true,
+      }),
+    );
+    fire229("keyup");
+    await settle();
+
+    const sentBytes = socket.sent
+      .filter((frame) => typeof frame !== "string")
+      .map((frame) => new TextDecoder().decode(frame as Uint8Array))
+      .join("");
+    expect(sentBytes).toBe(`()${CURSOR_LEFT_SS3}`);
     session.dispose();
   });
 });

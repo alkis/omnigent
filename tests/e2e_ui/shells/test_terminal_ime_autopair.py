@@ -292,6 +292,20 @@ def test_autopair_then_composition_commits_candidate(
     # any caret movement, and the committed candidate may go up.
     assert b"ni" not in all_sent, f"unconfirmed preedit was sent to the PTY: {all_sent!r}"
 
+    # Order matters, not just presence: the PTY must get the pair, then a
+    # realigning cursor-left (CSI or SS3, per DECCKM), then the candidate —
+    # any other order cannot render (你) in a line editor.
+    pair_at = all_sent.find(b"()")
+    assert pair_at != -1, f"the pair was not sent intact: {all_sent!r}"
+    left_positions = [
+        pos for pos in (all_sent.find(seq, pair_at) for seq in (b"\x1b[D", b"\x1bOD")) if pos != -1
+    ]
+    assert left_positions, f"no realigning cursor-left followed the pair: {all_sent!r}"
+    assert all_sent.find(COMPOSED_CANDIDATE.encode("utf-8"), min(left_positions)) != -1, (
+        f"the candidate did not follow the cursor-left: {all_sent!r}"
+    )
+    assert b"())" not in all_sent, f"the corrupted '())' stream was sent: {all_sent!r}"
+
     # Hold the final pane state for a beat so a recorded run shows the
     # outcome the user sees.
     page.wait_for_timeout(1500)

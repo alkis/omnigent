@@ -221,12 +221,15 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
   return null;
 }
 
-/** CSI sequence that moves the terminal cursor one cell left. */
+/** CSI cursor-left, what terminals expect while DECCKM is off. */
 export const CURSOR_LEFT_CSI = "\x1b[D";
+
+/** SS3 cursor-left, what terminals expect while DECCKM is on. */
+export const CURSOR_LEFT_SS3 = "\x1bOD";
 
 /**
  * Compute the realignment needed after an IME-processed insert leaves the
- * caret *inside* the freshly inserted text.
+ * caret *inside* the text it appended.
  *
  * A mobile touch keyboard that auto-inserts a punctuation pair writes both
  * characters into xterm's helper textarea in one IME keystroke and parks
@@ -235,41 +238,42 @@ export const CURSOR_LEFT_CSI = "\x1b[D";
  * movement, and the next composition is anchored at the end of the value
  * instead of the caret, so the committed candidate arrives corrupted (the
  * terminal shows ``())`` where the user composed ``(你)``). Realignment
- * means sending one cursor-left per character of the tail — a line editor
- * then inserts the coming candidate between the pair, exactly as if the
- * user had pressed the left arrow — and unstaging the tail so the caret
- * sits at the end of the textarea value again, the invariant
- * CompositionHelper's composition anchor assumes.
+ * means moving the terminal cursor one cell left per character of the tail
+ * — a line editor then inserts the coming candidate between the pair,
+ * exactly as if the user had pressed the left arrow — and unstaging the
+ * tail so the caret sits at the end of the textarea value again, the
+ * invariant CompositionHelper's composition anchor assumes.
+ *
+ * Ownership of the tail is proven by the value pair, not by the event's
+ * ``data`` (some keyboards report only the typed character for an
+ * auto-pair): only a pure append of the previous value — the one shape
+ * xterm's own value diff forwards verbatim — with the caret inside the
+ * appended run qualifies. Replacements, middle inserts, deletions, and a
+ * caret inside previously staged text leave xterm's bookkeeping untouched.
  *
  * Pure helper — exported for direct unit testing; the session applies it
  * to the helper textarea's ``input`` events one macrotask after xterm's
  * own value diff has forwarded the insert.
  *
+ * :param previousValue: The textarea value before the insert, e.g. ``""``.
  * :param value: The textarea value after the insert, e.g. ``"()"``.
  * :param selectionStart: The caret position after the insert, or ``null``
  *     when the selection is unreadable.
- * :param insertedData: The ``InputEvent.data`` of the insert, e.g.
- *     ``"()"``.
- * :returns: The cursor-left bytes to send and the textarea value with the
- *     tail unstaged, or ``null`` when no realignment applies (caret at the
- *     end, or a tail this event did not itself insert).
+ * :returns: The number of cells to move left and the textarea value with
+ *     the tail unstaged, or ``null`` when no realignment applies.
  */
 export function imeInsertRealignment(
+  previousValue: string,
   value: string,
   selectionStart: number | null,
-  insertedData: string | null,
-): { cursorLeft: string; stagedValue: string } | null {
-  if (selectionStart === null || !insertedData) return null;
-  if (selectionStart < 0 || selectionStart >= value.length) return null;
-  const tail = value.slice(selectionStart);
-  // Only a tail this event itself inserted may be unstaged: any other tail
-  // was staged by earlier input whose bookkeeping must stay intact.
-  if (!insertedData.endsWith(tail)) return null;
+): { moveLeft: number; stagedValue: string } | null {
+  if (selectionStart === null) return null;
+  if (value.length <= previousValue.length || !value.startsWith(previousValue)) return null;
+  if (selectionStart < previousValue.length || selectionStart >= value.length) return null;
   // Line editors move one character per arrow key regardless of its column
   // width, so count code points, not UTF-16 units.
-  const chars = [...tail].length;
   return {
-    cursorLeft: CURSOR_LEFT_CSI.repeat(chars),
+    moveLeft: [...value.slice(selectionStart)].length,
     stagedValue: value.slice(0, selectionStart),
   };
 }
@@ -679,6 +683,18 @@ export class TerminalSession {
     const textarea = this.term.textarea;
     if (textarea) {
       let imeComposing = false;
+      // The pre-insert textarea value: the browser mutates the value between
+      // keydown and input, so a keydown-time snapshot is what the coming
+      // input event's append is measured against. Focus re-syncs after
+      // xterm's blur-time clear, and each input event rolls it forward for
+      // IME streams that fire no keydown. xterm's own listeners registered
+      // first (term.open above), so its keydown-time clears are seen here.
+      let valueBeforeInput = textarea.value;
+      const snapshotValue = () => {
+        valueBeforeInput = textarea.value;
+      };
+      textarea.addEventListener("focus", snapshotValue, { signal });
+      textarea.addEventListener("keydown", snapshotValue, { signal });
       textarea.addEventListener(
         "compositionstart",
         () => {
@@ -696,20 +712,40 @@ export class TerminalSession {
       textarea.addEventListener(
         "input",
         (ev) => {
-          const { isComposing, inputType, data } = ev as InputEvent;
+          const { isComposing, inputType } = ev as InputEvent;
+          const previousValue = valueBeforeInput;
+          valueBeforeInput = textarea.value;
           // A composition owns the textarea until it commits; its updates
           // (and the commit's own input event) must not be realigned.
           if (imeComposing || isComposing || inputType === "insertCompositionText") return;
+          // Decide at event time, against this event's own before/after
+          // values and caret.
+          const realign = imeInsertRealignment(
+            previousValue,
+            textarea.value,
+            textarea.selectionStart,
+          );
+          if (realign === null) return;
+          const decidedValue = textarea.value;
+          const decidedCaret = textarea.selectionStart;
           // Defer one macrotask so CompositionHelper's zero-delay textarea
           // diff forwards the inserted characters before the cursor moves.
           setTimeout(() => {
             if (imeComposing || this.disposed) return;
-            const realign = imeInsertRealignment(textarea.value, textarea.selectionStart, data);
-            if (realign === null) return;
+            // Anything that touched the textarea since the decision — a new
+            // keystroke, a composition, xterm's own clears — invalidates it.
+            if (textarea.value !== decidedValue || textarea.selectionStart !== decidedCaret) {
+              return;
+            }
             textarea.value = realign.stagedValue;
             textarea.selectionStart = realign.stagedValue.length;
             textarea.selectionEnd = realign.stagedValue.length;
-            this.term.input(realign.cursorLeft, true);
+            valueBeforeInput = realign.stagedValue;
+            // DECCKM picks the arrow encoding, as xterm's keyboard path does.
+            const cursorLeft = this.term.modes.applicationCursorKeysMode
+              ? CURSOR_LEFT_SS3
+              : CURSOR_LEFT_CSI;
+            this.term.input(cursorLeft.repeat(realign.moveLeft), true);
           }, 0);
         },
         { signal },
